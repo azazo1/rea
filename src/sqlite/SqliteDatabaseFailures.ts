@@ -1,4 +1,9 @@
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import {
+  ArtifactFileCleanupFailure,
+  bindArtifactFileCleanup,
+  artifactFileCancellationCause,
+} from "../artifacts/ArtifactFileOperation.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import {
   AnalysisError,
@@ -7,6 +12,7 @@ import {
 import {
   AnalysisAccessDeniedError,
   AnalysisArtifactChangedError,
+  AnalysisCapabilityUnavailableError,
   AnalysisCancelledError,
   AnalysisInputError,
   AnalysisOutputError,
@@ -29,6 +35,15 @@ export const capturedSqliteOutput = (
   truncated: snapshot.diagnosticTruncated === true,
 });
 
+/** The file-set member a filesystem error names, if it is the database, its WAL or its journal. */
+const busyMember = (cause: Error, path: string): string => {
+  const failed = "path" in cause ? cause.path : undefined;
+  return typeof failed === "string" &&
+    [path, `${path}-wal`, `${path}-journal`].includes(failed)
+    ? failed
+    : path;
+};
+
 /** Preserve artifact, caller, process, resource and output failure meanings. */
 export const sqliteDatabaseFailure = (
   cause: unknown,
@@ -39,25 +54,32 @@ export const sqliteDatabaseFailure = (
   const operation = "inspect_sqlite_database";
   if (cause instanceof AnalysisError) return cause;
   if (cause instanceof ArtifactReaderFailure) {
-    if (cause.cleanup !== undefined)
-      return new ProviderCleanupError(
+    if (cause.cleanup !== undefined) {
+      const physicalRead =
+        cause instanceof ArtifactFileCleanupFailure
+          ? cause.fileCleanupFailure.outcome
+          : undefined;
+      const previous =
+        physicalRead?.kind === "failed"
+          ? sqliteDatabaseFailure(physicalRead.cause, path, phase)
+          : signal?.aborted
+            ? new AnalysisCancelledError(operation, { cause: signal.reason })
+            : physicalRead?.kind === "completed" || cause.cause === undefined
+              ? undefined
+              : sqliteDatabaseFailure(cause.cause, path, phase);
+      const error = new ProviderCleanupError(
         SQLITE_PROVIDER_IDENTITY.id,
         cause.cleanup.resources,
         {
           reason: cause.cleanup.reason,
           previous_error:
-            cause.cause === undefined
-              ? null
-              : projectAnalysisError(
-                  signal?.aborted
-                    ? new AnalysisCancelledError(operation, {
-                        cause: cause.cause,
-                      })
-                    : sqliteDatabaseFailure(cause.cause, path, phase),
-                ),
+            previous === undefined ? null : projectAnalysisError(previous),
         },
         { operation, cause },
       );
+      bindArtifactFileCleanup(cause, error);
+      return error;
+    }
     if (cause.reason === "io" && cause.cause !== undefined)
       return sqliteDatabaseFailure(cause.cause, path, phase, signal);
     if (cause.reason === "integrity")
@@ -65,11 +87,13 @@ export const sqliteDatabaseFailure = (
         cause,
       });
     if (cause.reason === "cancelled")
-      return new AnalysisCancelledError(operation, { cause });
+      return new AnalysisCancelledError(operation, {
+        cause: artifactFileCancellationCause(cause),
+      });
     return new AnalysisInputError(operation, { cause }, [
       {
         path: ["path"],
-        reason: cause.reason === "limit" ? "out_of_range" : "invalid_format",
+        reason: "invalid_format",
         message: cause.message,
       },
     ]);
@@ -85,7 +109,27 @@ export const sqliteDatabaseFailure = (
       return new AnalysisAccessDeniedError(operation, path, cause.code, {
         cause,
       });
-    if (cause.code === "ENOENT" || cause.code === "ENOTDIR")
+    // Windows reports a sharing violation as EBUSY: another process holds the file without read
+    // sharing. The unchanged request succeeds once that process releases it. Name the member of the
+    // file set that was busy (the database, its WAL or its journal) when the error identifies it.
+    if (cause.code === "EBUSY")
+      return new AnalysisCapabilityUnavailableError(
+        SQLITE_PROVIDER_IDENTITY.id,
+        operation,
+        `Selected database file set is in use by another process (EBUSY): ${busyMember(cause, path)}`,
+        {
+          cause,
+          retryable: true,
+          userMessage:
+            "The selected SQLite database is held open by another process without read sharing. Close that application or inspect a copy, then retry.",
+        },
+      );
+    if (
+      cause.code === "ENOENT" ||
+      cause.code === "ENOTDIR" ||
+      cause.code === "ELOOP" ||
+      cause.code === "ENAMETOOLONG"
+    )
       return new AnalysisInputError(operation, { cause }, [
         {
           path: ["path"],

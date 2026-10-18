@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { parseConfig } from "../config/parseConfig.js";
 import type {
@@ -13,7 +13,7 @@ import { hopperLoaderArgsForTarget } from "../hopper/HopperAnalysisProfile.js";
 import { IdaProvider } from "../ida/IdaProvider.js";
 import { GhidraProvider } from "./GhidraProvider.js";
 import { ghidraRiscvLimitations } from "./GhidraRiscvProfile.js";
-import type { GhidraInstallationHost } from "./GhidraInstallation.js";
+import { ghidraProfileInstallationHost as host } from "./GhidraInstallation.fixture.js";
 import {
   ghidraPinnedLanguage,
   ghidraProfileLanguageOverride,
@@ -49,20 +49,6 @@ const RISCV_LDEFS = `<?xml version="1.0" encoding="UTF-8"?>
 </language_definitions>
 `;
 
-// Fake installation inspection tests admission/profile contracts, not Ghidra.
-const host: GhidraInstallationHost = {
-  platform: "linux",
-  architecture: "x64",
-  readText: () => "application.version=12.1.4\n",
-  executable: () => true,
-  probeJava: () => ({
-    version: "21.0.11",
-    major: 21,
-    home: "/jdk-21",
-    bits: 64,
-    runtime: "jdk",
-  }),
-};
 const configOf = (
   installDir: string,
   environment: Record<string, string> = {},
@@ -92,7 +78,14 @@ const target = (change: Partial<RiscvElfMetadata> = {}): BinaryTarget => ({
 
 let installDir = "";
 beforeAll(async () => {
-  installDir = await mkdtemp(join(tmpdir(), "rea-ghidra-riscv-languages-"));
+  const root =
+    process.platform === "win32" ? join(process.cwd(), "build") : tmpdir();
+  await mkdir(root, { recursive: true });
+  installDir = await mkdtemp(join(root, "rea-ghidra-riscv-languages-"));
+  // The simulated Linux host needs a POSIX absolute path. A current-drive root
+  // path also reaches this real fixture on Windows without changing admission.
+  if (process.platform === "win32")
+    installDir = `/${relative(parse(installDir).root, installDir).replaceAll("\\", "/")}`;
   const languages = join(installDir, "Ghidra/Processors/RISCV/data/languages");
   await mkdir(languages, { recursive: true });
   await writeFile(join(languages, "riscv.ldefs"), RISCV_LDEFS);

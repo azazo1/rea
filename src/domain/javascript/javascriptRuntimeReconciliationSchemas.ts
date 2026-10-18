@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
+import { logicalPathEscapesRoot } from "../artifactIdentity.js";
 import { evidenceSchema } from "../evidence.js";
 import { javascriptRuntimeUnresolvedLocationSchema } from "./javascriptRuntimeObservation.js";
 import { javascriptApplicationGraphSchema } from "./javascriptApplicationGraph.js";
@@ -16,8 +17,7 @@ const safePrefixSchema = z
   .refine(
     (value) =>
       value === "" ||
-      (!value.startsWith("/") &&
-        !value.includes("\\") &&
+      (!logicalPathEscapesRoot(value) &&
         value.split("/").every((part) => !["", ".", ".."].includes(part))),
     "Artifact prefix must be empty or a safe relative POSIX path",
   );
@@ -228,6 +228,7 @@ const staticLoadStateSchema = z.strictObject({
     "not-observed-in-bounded-capture",
     "layer-outside-runtime-scope",
     "static-or-runtime-coverage-incomplete",
+    "ambiguous-runtime-candidate",
   ]),
 });
 

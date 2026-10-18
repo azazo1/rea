@@ -9,6 +9,8 @@ import {
   type ManagedParseIssue,
 } from "../domain/managed/managedArtifact.js";
 import {
+  managedCli32BitRequirement,
+  managedCliIsMixedClrNative,
   readManagedPeLayout,
   type ManagedCliHeader,
   type ManagedPeLayout,
@@ -23,6 +25,7 @@ import {
   readManagedMetadataLayout,
   type ManagedMetadataLayout,
 } from "./ManagedMetadataLayout.js";
+import { readTypeMemberListFacts } from "./ManagedTypeMemberLists.js";
 import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
 
 const flagNames = (flags: number): string[] => {
@@ -157,6 +160,15 @@ interface RuntimeClassificationInput {
   readonly inventory: ManagedMetadataInventory;
 }
 
+const runtimeFamilyFromCliHeader = (
+  cli: ManagedCliHeader | null,
+): ManagedArtifactInspection["classification"]["runtime_family"] =>
+  cli?.readyToRunSignature === true
+    ? "modern-dotnet"
+    : cli !== null && managedCliIsMixedClrNative(cli)
+      ? "mixed-clr-native"
+      : "unknown";
+
 const runtimeFamilyFor = (
   cli: ManagedCliHeader,
   inventory: ManagedMetadataInventory,
@@ -179,7 +191,7 @@ const runtimeFamilyFor = (
   );
   let runtimeFamily: ManagedArtifactInspection["classification"]["runtime_family"] =
     "unknown";
-  if ((cli.flags & 1) === 0) {
+  if (runtimeFamilyFromCliHeader(cli) === "mixed-clr-native") {
     runtimeFamily = "mixed-clr-native";
     evidence.push({
       code: "cli-il-only-clear",
@@ -238,8 +250,8 @@ const implementationFor = (
   cli: ManagedCliHeader,
   metadata: ManagedMetadataLayout,
 ): ManagedArtifactInspection["classification"]["implementation"] => {
-  if ((cli.flags & 1) === 0) return "cpp-cli-mixed";
   if (cli.readyToRunSignature) return "cil-and-ready-to-run";
+  if ((cli.flags & 1) === 0) return "cpp-cli-mixed";
   return (metadata.rowCounts[6] ?? 0) === 0 ? "metadata-only" : "cil";
 };
 
@@ -249,9 +261,9 @@ const managedArchitectureFor = (
 ): ManagedArtifactInspection["classification"]["managed_architecture"] => {
   if (layout.architecture !== "x86" || (cli.flags & 1) === 0)
     return layout.architecture;
-  if ((cli.flags & 0x0000_0002) !== 0) return "x86";
-  if ((cli.flags & 0x0002_0000) !== 0) return "anycpu-prefer-32";
-  return "anycpu";
+  const requirement = managedCli32BitRequirement(cli.flags);
+  if (requirement === "required") return "x86";
+  return requirement === "preferred" ? "anycpu-prefer-32" : "anycpu";
 };
 
 const runtimeClassification = ({
@@ -302,8 +314,7 @@ const partialMetadataResult = ({
   classification: {
     status: issue.code === "resource-limit" ? "managed" : "malformed",
     container: "pe",
-    runtime_family:
-      (layout.cli?.flags ?? 1) & 1 ? "unknown" : "mixed-clr-native",
+    runtime_family: runtimeFamilyFromCliHeader(layout.cli),
     implementation: "unknown",
     managed_architecture: "unknown",
     evidence: [
@@ -373,10 +384,12 @@ export const inspectManagedArtifactBytes = (
     resourceIssues,
   );
   try {
+    const memberLists = readTypeMemberListFacts(bytes, metadata);
     const inventory = readManagedMetadataInventory(
       bytes,
       metadata,
       resourceDirectory,
+      memberLists,
     );
     const issues = [...resourceIssues, ...inventory.issues];
     const limitations = [

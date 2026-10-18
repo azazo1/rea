@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   completeReconstructionCoverageData,
+  completeReconstructionCoverageFixture,
   RECONSTRUCTION_COVERAGE_NOW,
   reconstructionCoverageEvidenceId,
 } from "./reconstructionCoverage.fixture.js";
@@ -12,6 +13,29 @@ import {
 } from "./reconstructionCoverage.js";
 
 const digest = (character: string): string => character.repeat(64);
+
+it("preserves duplicate coverage owners instead of overwriting them in shared indexes", () => {
+  const workspace = completeReconstructionCoverageData();
+  const owner = workspace.owners[0];
+  if (owner === undefined) throw new Error("Expected fixture owner");
+  const result = evaluateReconstructionClosure(
+    {
+      ...workspace,
+      owners: [owner, owner],
+    },
+    "replacement.cli",
+    RECONSTRUCTION_COVERAGE_NOW,
+  );
+  expect(result).toMatchObject({
+    status: "partial",
+    reasons: expect.arrayContaining([
+      expect.objectContaining({
+        code: "owner-duplicate",
+        subject_id: "cli.help",
+      }),
+    ]),
+  });
+});
 
 describe("reconstruction coverage closure", () => {
   it("returns ready only when ownership, verification, package, and authority closure pass", () => {
@@ -286,14 +310,15 @@ describe("reconstruction coverage verifier selection", () => {
   });
 });
 
-describe("reconstruction coverage verifier result ordering", () => {
-  it("preserves the first input result when verifier timestamps tie", () => {
-    const workspace = completeReconstructionCoverageData();
-    const result = workspace.verifier_results[0];
-    const boundary = workspace.boundaries[0];
-    if (result === undefined || boundary === undefined)
-      throw new Error("Expected complete reconstruction coverage fixture");
-    const failed = { ...result, status: "fail" as const };
+describe("reconstruction coverage conflicting latest verifier observations", () => {
+  it("keeps conflicting tied assessments unknown regardless of input order", () => {
+    const { workspace, result, boundary } =
+      completeReconstructionCoverageFixture();
+    const failed = {
+      ...result,
+      status: "fail" as const,
+      evidence_ids: [reconstructionCoverageEvidenceId("1")],
+    };
     const firstPass = createReconstructionCoverageData({
       ...workspace,
       verifier_results: [result, failed],
@@ -303,40 +328,113 @@ describe("reconstruction coverage verifier result ordering", () => {
       verifier_results: [failed, result],
     });
 
+    const firstPassResult = evaluateReconstructionClosure(
+      firstPass,
+      boundary.boundary_id,
+      RECONSTRUCTION_COVERAGE_NOW,
+    );
+    const firstFailResult = evaluateReconstructionClosure(
+      firstFail,
+      boundary.boundary_id,
+      RECONSTRUCTION_COVERAGE_NOW,
+    );
+    expect(firstPassResult).toEqual(firstFailResult);
+    expect(firstPassResult).toMatchObject({
+      status: "unknown",
+      reasons: [
+        expect.objectContaining({
+          code: "verifier-result-ambiguous",
+          subject_id: "claim.cli.help",
+        }),
+      ],
+    });
+    expect(firstPassResult.evidence_ids).toEqual(
+      expect.arrayContaining([
+        reconstructionCoverageEvidenceId("3"),
+        reconstructionCoverageEvidenceId("1"),
+      ]),
+    );
+  });
+});
+
+describe("reconstruction coverage equivalent latest verifier observations", () => {
+  it("coalesces equivalent equal-instant observations and retains all evidence", () => {
+    const { workspace, result, boundary } =
+      completeReconstructionCoverageFixture();
+    const first = {
+      ...result,
+      observed_at: "2026-07-16T11:00:00.123456789012345678900Z",
+    };
+    const equivalent = {
+      ...first,
+      observed_at: "2026-07-16T06:00:00.1234567890123456789-05:00",
+      covered_claim_ids: [...result.covered_claim_ids].reverse(),
+      covered_dimensions: [...result.covered_dimensions].reverse(),
+      artifact_sha256s: [...result.artifact_sha256s].reverse(),
+      owner_sha256s: [...result.owner_sha256s].reverse(),
+      evidence_ids: [reconstructionCoverageEvidenceId("1")],
+    };
+    const forward = createReconstructionCoverageData({
+      ...workspace,
+      verifier_results: [first, equivalent],
+    });
+    const reversed = createReconstructionCoverageData({
+      ...workspace,
+      verifier_results: [equivalent, first],
+    });
+    const forwardResult = evaluateReconstructionClosure(
+      forward,
+      boundary.boundary_id,
+      RECONSTRUCTION_COVERAGE_NOW,
+    );
+    const reversedResult = evaluateReconstructionClosure(
+      reversed,
+      boundary.boundary_id,
+      RECONSTRUCTION_COVERAGE_NOW,
+    );
+
+    expect(forwardResult).toEqual(reversedResult);
+    expect(forwardResult.status).toBe("ready");
+    expect(forwardResult.evidence_ids).toEqual(
+      expect.arrayContaining([
+        reconstructionCoverageEvidenceId("3"),
+        reconstructionCoverageEvidenceId("1"),
+      ]),
+    );
+  });
+});
+
+describe("reconstruction coverage verifier timestamp selection", () => {
+  it("lets a later unambiguous observation supersede an older tie", () => {
+    const { workspace, result, boundary } =
+      completeReconstructionCoverageFixture();
+    const failed = { ...result, status: "fail" as const };
+    const latestPass = {
+      ...result,
+      observed_at: "2026-07-16T11:30:00.000Z",
+    };
+    const changed = createReconstructionCoverageData({
+      ...workspace,
+      verifier_results: [result, failed, latestPass],
+    });
+
     expect(
       evaluateReconstructionClosure(
-        firstPass,
-        boundary.boundary_id,
-        RECONSTRUCTION_COVERAGE_NOW,
-      ).status,
-    ).toBe("ready");
-    expect(
-      evaluateReconstructionClosure(
-        firstFail,
+        changed,
         boundary.boundary_id,
         RECONSTRUCTION_COVERAGE_NOW,
       ),
-    ).toMatchObject({
-      status: "failed",
-      reasons: [expect.objectContaining({ code: "verifier-failed" })],
-    });
+    ).toMatchObject({ status: "ready", reasons: [] });
   });
 
-  it("orders offset-bearing verifier timestamps chronologically", () => {
-    const workspace = completeReconstructionCoverageData();
-    const result = workspace.verifier_results[0];
-    if (result === undefined)
-      throw new Error("Expected fixture verifier result");
-    const semantic = workspace;
+  /** Evaluate a workspace whose newest verifier observation fails the closure. */
+  const expectNewestObservationFails = (passedAt: string, failedAt: string) => {
+    const { workspace, result } = completeReconstructionCoverageFixture();
     const changed = createReconstructionCoverageData({
-      ...semantic,
+      ...workspace,
       verifier_results: [
-        { ...result, observed_at: "2026-07-16T08:00:00.000Z" },
-        {
-          ...result,
-          observed_at: "2026-07-16T04:00:00.000-05:00",
-          status: "fail",
-        },
+        { ...result, observed_at: passedAt },
+        { ...result, observed_at: failedAt, status: "fail" },
       ],
     });
 
@@ -350,13 +448,54 @@ describe("reconstruction coverage verifier result ordering", () => {
       status: "failed",
       reasons: [expect.objectContaining({ code: "verifier-failed" })],
     });
+  };
+
+  it("orders offset-bearing verifier timestamps chronologically", () => {
+    expectNewestObservationFails(
+      "2026-07-16T08:00:00.000Z",
+      "2026-07-16T04:00:00.000-05:00",
+    );
+  });
+
+  it("selects the later result when timestamps differ below millisecond precision", () => {
+    expectNewestObservationFails(
+      "2026-07-16T11:00:00.1231Z",
+      "2026-07-16T11:00:00.1239Z",
+    );
+  });
+});
+
+describe("reconstruction coverage verifier future timestamps", () => {
+  it("treats an observation beyond millisecond-precision now as future", () => {
+    const { workspace, result } = completeReconstructionCoverageFixture();
+    const changed = createReconstructionCoverageData({
+      ...workspace,
+      verifier_results: [
+        { ...result, observed_at: "2026-07-16T12:00:00.1239Z" },
+      ],
+    });
+
+    expect(
+      evaluateReconstructionClosure(
+        changed,
+        "replacement.cli",
+        Date.parse("2026-07-16T12:00:00.123Z") + 0.5,
+      ),
+    ).toMatchObject({
+      status: "unknown",
+      reasons: [expect.objectContaining({ code: "verifier-result-stale" })],
+    });
+  });
+
+  it("rejects a non-finite evaluation clock", () => {
+    const workspace = completeReconstructionCoverageData();
+    expect(() =>
+      evaluateReconstructionClosure(workspace, "replacement.cli", Number.NaN),
+    ).toThrow("Expected finite epoch milliseconds.");
   });
 
   it("rejects verifier observations from the future", () => {
-    const workspace = completeReconstructionCoverageData();
-    const result = workspace.verifier_results[0];
-    if (result === undefined)
-      throw new Error("Expected fixture verifier result");
+    const { workspace, result } = completeReconstructionCoverageFixture();
     const semantic = workspace;
     const changed = createReconstructionCoverageData({
       ...semantic,

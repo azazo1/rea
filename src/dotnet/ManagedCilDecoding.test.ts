@@ -7,6 +7,7 @@ import {
   buildManagedPeFixture,
   managedPeFixtureTarget,
 } from "./ManagedPe.fixture.js";
+import { parseExceptionRegions } from "./ManagedMemberInstructionDecoder.js";
 
 const managedBodyWithSections = (...sections: Buffer[]) => {
   const header = Buffer.alloc(12);
@@ -65,6 +66,30 @@ const managedBodyWithRegion = ({
   });
   return inspectManagedMembersBytes(bytes, managedPeFixtureTarget(bytes))
     .methods[0]?.body;
+};
+
+const fatBody = (il: Buffer) => {
+  const header = Buffer.alloc(12);
+  header.writeUInt16LE(0x3013, 0);
+  header.writeUInt16LE(8, 2);
+  header.writeUInt32LE(il.length, 4);
+  const bytes = buildManagedPeFixture({
+    ilBody: Buffer.concat([header, il]),
+  });
+  return inspectManagedMembersBytes(bytes, managedPeFixtureTarget(bytes))
+    .methods[0]?.body;
+};
+
+/** Build a tiny method body whose declared IL extent matches its supplied bytes. */
+const tinyBody = (il: readonly number[]) => {
+  const bytes = buildManagedPeFixture({
+    ilBody: Buffer.from([(il.length << 2) | 0x02, ...il]),
+  });
+  const inspection = inspectManagedMembersBytes(
+    bytes,
+    managedPeFixtureTarget(bytes),
+  );
+  return { body: inspection.methods[0]?.body, coverage: inspection.coverage };
 };
 
 describe("managed CIL decoding", () => {
@@ -221,6 +246,189 @@ describe("managed CIL decoding", () => {
   });
 });
 
+describe("managed operand extent diagnostics", () => {
+  it.each([
+    [[0x20], 0, "Instruction ldc.i4 at IL offset 0 leaves method body"],
+    [
+      [0x00, 0x20, 0x01],
+      1,
+      "Instruction ldc.i4 at IL offset 1 leaves method body",
+    ],
+    [[0x2b], 0, "Instruction br.s at IL offset 0 leaves method body"],
+    [[0x45, 0x02], 0, "Instruction switch at IL offset 0 leaves method body"],
+    [
+      [0xfe, 0x09, 0x00],
+      0,
+      "Instruction ldarg at IL offset 0 leaves method body",
+    ],
+    [[0x00, 0xfe], 1, "Two-byte CIL opcode at IL offset 1 leaves method body"],
+  ] as const)(
+    "reports the instruction and IL offset for tiny IL %j",
+    (il, decoded, issue) => {
+      const { body, coverage } = tinyBody(il);
+      expect(body).toMatchObject({
+        status: "malformed",
+        header_format: "tiny",
+        il_size: il.length,
+        decoded_instruction_count: decoded,
+        normalized_il_sha256: null,
+        issue,
+      });
+      expect(coverage.state).toBe("partial");
+    },
+  );
+
+  it.each([
+    ["short variable", Buffer.from([0x0e]), "ldarg.s"],
+    ["wide variable", Buffer.from([0xfe, 0x09]), "ldarg"],
+    ["int32 constant", Buffer.from([0x20]), "ldc.i4"],
+    ["int64 constant", Buffer.from([0x21]), "ldc.i8"],
+    ["float32 constant", Buffer.from([0x22]), "ldc.r4"],
+    ["float64 constant", Buffer.from([0x23]), "ldc.r8"],
+    ["short branch", Buffer.from([0x2b]), "br.s"],
+    ["long branch", Buffer.from([0x38]), "br"],
+    ["prefixed short constant", Buffer.from([0xfe, 0x12]), "unaligned."],
+    ["string token", Buffer.from([0x72]), "ldstr"],
+    ["type token", Buffer.from([0x71]), "ldobj"],
+    ["field token", Buffer.from([0x7b]), "ldfld"],
+    ["method token", Buffer.from([0x28]), "call"],
+  ] as const)(
+    "reports a truncated %s operand at its own instruction",
+    (_label, il, name) => {
+      expect(fatBody(il)).toMatchObject({
+        status: "malformed",
+        decoded_instruction_count: 0,
+        normalized_il_sha256: null,
+        issue: `Instruction ${name} at IL offset 0 leaves method body`,
+      });
+    },
+  );
+
+  // A width declared too small still passes the extent check when no operand
+  // bytes are present, so the zero-byte cases above cannot catch it. Supplying
+  // one byte less than the real width makes a wrong width let the read run,
+  // which surfaces as the raw Buffer error rather than the diagnostic.
+  it.each([
+    ["wide variable", Buffer.from([0xfe, 0x09]), 2, "ldarg"],
+    ["int32 constant", Buffer.from([0x20]), 4, "ldc.i4"],
+    ["int64 constant", Buffer.from([0x21]), 8, "ldc.i8"],
+    ["float32 constant", Buffer.from([0x22]), 4, "ldc.r4"],
+    ["float64 constant", Buffer.from([0x23]), 8, "ldc.r8"],
+    ["long branch", Buffer.from([0x38]), 4, "br"],
+    ["method token", Buffer.from([0x28]), 4, "call"],
+    ["type token", Buffer.from([0x71]), 4, "ldobj"],
+    ["string token", Buffer.from([0x72]), 4, "ldstr"],
+    ["field token", Buffer.from([0x7b]), 4, "ldfld"],
+  ] as const)(
+    "rejects a %s operand one byte short of its declared width",
+    (_label, opcode, width, name) => {
+      expect(
+        fatBody(Buffer.concat([opcode, Buffer.alloc(width - 1)])),
+      ).toMatchObject({
+        status: "malformed",
+        decoded_instruction_count: 0,
+        normalized_il_sha256: null,
+        issue: `Instruction ${name} at IL offset 0 leaves method body`,
+      });
+    },
+  );
+});
+
+describe("managed complete operand decoding", () => {
+  // The extent check must also reject nothing that fits, so every multi-byte
+  // width is exercised at exactly its own size with a known value. Each body
+  // ends at its operand, so a width declared too large turns a valid operand
+  // into the leaves-method-body diagnostic and these value assertions catch it.
+  // The -0 constants keep the floating-point sign fix covered through this same
+  // path.
+  it.each([
+    ["wide variable", [0xfe, 0x09], [0x01, 0x00], "variable", "1"],
+    ["int32 constant", [0x20], [0x01, 0x00, 0x00, 0x00], "constant", "1"],
+    [
+      "int64 constant",
+      [0x21],
+      [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+      "constant",
+      "1",
+    ],
+    ["float32 constant", [0x22], [0x00, 0x00, 0x00, 0x80], "constant", "-0"],
+    [
+      "float64 constant",
+      [0x23],
+      [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80],
+      "constant",
+      "-0",
+    ],
+    ["long branch", [0x38], [0x00, 0x00, 0x00, 0x00], "branch", "5"],
+    ["method token", [0x28], [0x01, 0x00, 0x00, 0x00], "method", "0x00000001"],
+    ["type token", [0x71], [0x02, 0x00, 0x00, 0x00], "type", "0x00000002"],
+    ["string token", [0x72], [0x03, 0x00, 0x00, 0x00], "string", "0x00000003"],
+    ["field token", [0x7b], [0x04, 0x00, 0x00, 0x00], "field", "0x00000004"],
+  ] as const)(
+    "decodes a %s operand at exactly its declared width",
+    (_label, opcode, operand, operandKind, value) => {
+      expect(fatBody(Buffer.from([...opcode, ...operand]))).toMatchObject({
+        status: "present",
+        issue: null,
+        decoded_instruction_count: 1,
+        anchors: [{ il_offset: 0, operand_kind: operandKind, operand: value }],
+      });
+    },
+  );
+
+  it("reports a switch whose target table is missing", () => {
+    expect(
+      fatBody(Buffer.from([0x00, 0x45, 0x02, 0x00, 0x00, 0x00])),
+    ).toMatchObject({
+      status: "malformed",
+      decoded_instruction_count: 1,
+      opcode_counts: { nop: 1 },
+      issue: "Instruction switch at IL offset 1 leaves method body",
+    });
+  });
+
+  it("reports a switch whose target count is itself truncated", () => {
+    expect(fatBody(Buffer.from([0x45, 0x02]))).toMatchObject({
+      status: "malformed",
+      decoded_instruction_count: 0,
+      issue: "Instruction switch at IL offset 0 leaves method body",
+    });
+  });
+
+  it("preserves instructions decoded before a truncated operand", () => {
+    expect(fatBody(Buffer.from([0x00, 0x20]))).toMatchObject({
+      status: "malformed",
+      il_size: 2,
+      decoded_instruction_count: 1,
+      opcode_counts: { nop: 1 },
+      issue: "Instruction ldc.i4 at IL offset 1 leaves method body",
+    });
+  });
+
+  it("keeps a complete operand-bearing body decodable", () => {
+    expect(
+      fatBody(Buffer.from([0x00, 0x20, 0x01, 0x00, 0x00, 0x00, 0x2a])),
+    ).toMatchObject({
+      status: "present",
+      decoded_instruction_count: 3,
+      opcode_counts: { nop: 1, "ldc.i4": 1, ret: 1 },
+      issue: null,
+    });
+  });
+
+  it("still decodes a switch whose targets fit", () => {
+    const il = Buffer.from([
+      0x00, 0x45, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a,
+    ]);
+    expect(fatBody(il)).toMatchObject({
+      status: "present",
+      il_size: il.length,
+      opcode_counts: { nop: 1, switch: 1, ret: 1 },
+      issue: null,
+    });
+  });
+});
+
 describe("managed exception region bounds", () => {
   it("marks out-of-method ranges malformed and preserves the raw EH clause", () => {
     expect(
@@ -345,6 +553,31 @@ describe("managed exception region prefix boundaries", () => {
     });
   });
 
+  it("decodes the no. prefix and keeps it with its opcode", () => {
+    // ldarg.0; no. nullcheck; ldfld 0x04000001; pop; ret
+    const il = Buffer.from([2, 0xfe, 0x19, 4, 0x7b, 1, 0, 0, 4, 0x26, 0x2a]);
+    expect(
+      managedBodyWithRegion({ il, tryLength: 10, handlerOffset: 10 }),
+    ).toMatchObject({
+      status: "present",
+      issue: null,
+      decoded_instruction_count: 5,
+      opcode_counts: { "ldarg.0": 1, "no.": 1, ldfld: 1, pop: 1, ret: 1 },
+    });
+    expect(
+      managedBodyWithRegion({
+        il,
+        tryOffset: 4,
+        tryLength: 5,
+        handlerOffset: 10,
+      }),
+    ).toMatchObject({
+      status: "malformed",
+      issue:
+        "Exception clause try range does not align with CIL instruction boundaries",
+    });
+  });
+
   it.each([
     ["start", { tryOffset: 5, tryLength: 1, handlerOffset: 6 }],
     [
@@ -434,6 +667,59 @@ describe("managed exception region flags and filters", () => {
 });
 
 describe("managed exception section decoding", () => {
+  it("reads legacy small EH DataSize without counting its header", () => {
+    const section = Buffer.alloc(16);
+    section[0] = 0x01;
+    section[1] = 12;
+
+    expect(managedBodyWithSections(section)).toMatchObject({
+      status: "present",
+      issue: null,
+      exception_regions: [expect.any(Object)],
+      normalized_il_sha256: expect.any(String),
+    });
+  });
+
+  it("advances a chained legacy section by its physical size", () => {
+    const legacy = Buffer.alloc(16);
+    legacy[0] = 0x81;
+    legacy[1] = 12;
+    const conformant = Buffer.alloc(16);
+    conformant[0] = 0x01;
+    conformant[1] = 16;
+
+    expect(managedBodyWithSections(legacy, conformant)).toMatchObject({
+      status: "present",
+      issue: null,
+      exception_regions: [expect.any(Object), expect.any(Object)],
+      normalized_il_sha256: expect.any(String),
+    });
+  });
+
+  it("rejects a legacy-sized clause whose physical bytes leave the artifact", () => {
+    const section = Buffer.alloc(12);
+    section[0] = 0x01;
+    section[1] = 12;
+
+    expect(parseExceptionRegions(section, 0, section.length)).toMatchObject({
+      status: "malformed",
+      regions: [],
+      issue: "Exception section size leaves artifact",
+    });
+  });
+
+  it("still rejects a small EH DataSize that matches neither layout", () => {
+    const section = Buffer.alloc(17);
+    section[0] = 0x01;
+    section[1] = 13;
+
+    expect(managedBodyWithSections(section)).toMatchObject({
+      status: "malformed",
+      exception_regions: [],
+      issue: "Exception section size does not contain whole clauses",
+    });
+  });
+
   it("marks an exception section with a partial clause as malformed", () => {
     const section = Buffer.alloc(17);
     section[0] = 0x01;
@@ -460,6 +746,19 @@ describe("managed exception section decoding", () => {
         { flags: 0, try_offset: 0, try_length: 0, handler_offset: 0 },
         { flags: 0, try_offset: 0, try_length: 0, handler_offset: 0 },
       ],
+    });
+  });
+
+  it("keeps small section reserved bytes invalid", () => {
+    const section = Buffer.alloc(16);
+    section[0] = 0x01;
+    section[1] = 16;
+    section[2] = 1;
+
+    expect(managedBodyWithSections(section)).toMatchObject({
+      status: "malformed",
+      exception_regions: [],
+      issue: "Small exception section reserved bytes are nonzero",
     });
   });
 

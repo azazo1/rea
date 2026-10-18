@@ -10,41 +10,119 @@ import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import {
   compareInventory,
   runProductionMcpDoctor,
+  runProductionMcpDoctorCli,
 } from "../../../src/mcpDoctor.js";
-import { CATALOG_IDENTITY } from "../../../src/catalogIdentity.js";
+import {
+  CATALOG_IDENTITY,
+  createCatalogIdentity,
+} from "../../../src/catalogIdentity.js";
+import { compactPresentationForMcpInputSchemaProfile } from "../../../src/config/mcpInputSchemaProfile.js";
+import { MCP_STARTUP_POLICY } from "../../../src/mcpStartupPolicy.js";
 
 afterEach(() => vi.useRealTimers());
 
 describe("production MCP doctor", () => {
-  it("connects to the production stdio child and verifies the canonical catalog", async () => {
-    const result = await runProductionMcpDoctor({
-      command: process.execPath,
-      args: [resolve("scripts/rea.mjs"), "mcp"],
-      cwd: process.cwd(),
-      environment: process.env,
-    });
-
-    expect(result).toMatchObject({
-      healthy: true,
-      adapter: "production-stdio",
-      inventory: {
-        tools: {
-          expected: expect.any(Number),
-          observed: expect.any(Number),
-          missing: [],
-          unexpected: [],
-        },
+  it("preserves the full-output envelope for startup failures", async () => {
+    const result = await runProductionMcpDoctorCli(
+      ["--json", "--full-output"],
+      {
+        dispatcherPath: resolve("tests/fixtures/mcpDoctorExit.mjs"),
+        packageRoot: process.cwd(),
       },
-      request_flow: { tool: "binary_session", ok: true },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.output)).toMatchObject({
+      ok: false,
+      error: {
+        healthy: false,
+        checks: [{ name: "transport", ok: false }],
+      },
+      meta: {
+        command: "rea mcp doctor",
+        duration: expect.stringMatching(/^\d+ms$/u),
+      },
     });
-    expect(result.inventory?.tools.expected).toBe(
-      result.inventory?.tools.observed,
-    );
-    expect(result.inventory?.tools.expected).toBe(
-      CATALOG_IDENTITY.counts.mcp_tools,
-    );
-  }, 30_000);
+  });
 
+  it.each([
+    {
+      name: "full",
+      environment: {
+        REA_MCP_INPUT_SCHEMA_PROFILE: "full",
+        REA_MCP_OUTPUT_SCHEMA_PROFILE: "full",
+      },
+      identity: CATALOG_IDENTITY,
+    },
+    {
+      name: "compact",
+      environment: {
+        REA_MCP_INPUT_SCHEMA_PROFILE: "compact",
+        REA_MCP_OUTPUT_SCHEMA_PROFILE: "full",
+      },
+      identity: createCatalogIdentity(
+        compactPresentationForMcpInputSchemaProfile("compact"),
+      ),
+    },
+    {
+      name: "output schemas off",
+      environment: {
+        REA_MCP_INPUT_SCHEMA_PROFILE: "full",
+        REA_MCP_OUTPUT_SCHEMA_PROFILE: "off",
+      },
+      identity: createCatalogIdentity(undefined, "off"),
+    },
+    {
+      name: "compact input and output schemas off",
+      environment: {
+        REA_MCP_INPUT_SCHEMA_PROFILE: "compact",
+        REA_MCP_OUTPUT_SCHEMA_PROFILE: "off",
+      },
+      identity: createCatalogIdentity(
+        compactPresentationForMcpInputSchemaProfile("compact"),
+        "off",
+      ),
+    },
+  ])(
+    "connects to the production stdio child and verifies the $name catalog",
+    async ({ environment, identity }) => {
+      const result = await runProductionMcpDoctor({
+        command: process.execPath,
+        args: [resolve("scripts/rea.mjs"), "mcp"],
+        cwd: process.cwd(),
+        environment: { ...process.env, ...environment },
+      });
+
+      expect(result).toMatchObject({
+        healthy: true,
+        adapter: "production-stdio",
+        inventory: {
+          tools: {
+            expected: expect.any(Number),
+            observed: expect.any(Number),
+            missing: [],
+            unexpected: [],
+          },
+        },
+        request_flow: { tool: "binary_session", ok: true },
+      });
+      expect(result.inventory?.tools.expected).toBe(
+        result.inventory?.tools.observed,
+      );
+      expect(result.inventory?.tools.expected).toBe(
+        CATALOG_IDENTITY.counts.mcp_tools,
+      );
+      expect(result.identity?.expected_catalog_digest).toBe(
+        identity.digests.combined_sha256,
+      );
+      expect(result.identity?.observed_catalog_digest).toBe(
+        identity.digests.combined_sha256,
+      );
+    },
+    30_000,
+  );
+});
+
+describe("production MCP doctor probe validation", () => {
   it("rejects a schema-invalid probe while retaining the discovered inventory", async () => {
     const root = await createTestTempDirectory("rea-mcp-doctor-reply-");
     const snapshotPath = join(root, "reply.json");
@@ -127,7 +205,9 @@ describe("production MCP doctor", () => {
       duplicates: ["c"],
     });
   });
+});
 
+describe("production MCP doctor child lifecycle", () => {
   it("captures startup exit diagnostics", async () => {
     const result = await runProductionMcpDoctor({
       command: process.execPath,
@@ -140,6 +220,66 @@ describe("production MCP doctor", () => {
       healthy: false,
       checks: [{ name: "transport", ok: false }],
       diagnostics: { stderr: expect.stringContaining("startup exit") },
+    });
+  });
+
+  it("retains only the stderr prefix while draining and counting the full child stream", async () => {
+    const result = await runNoisyDoctorChild(`
+      for (let index = 0; index < 64; index += 1) {
+        await new Promise((resolve, reject) => {
+          process.stderr.write(Buffer.alloc(65_536, 0x78), (error) =>
+            error ? reject(error) : resolve(),
+          );
+        });
+      }
+      process.exitCode = 1;
+    `);
+
+    expect(result.healthy).toBe(false);
+    expect(result.diagnostics).toEqual({
+      stderr: "x".repeat(MCP_STARTUP_POLICY.doctorStderrBytes),
+      stderr_bytes: 4 * 1024 * 1024,
+      stderr_truncated: true,
+    });
+  }, 10_000);
+
+  it("does not manufacture a replacement character when the retained prefix ends inside UTF-8", async () => {
+    const prefixBytes = MCP_STARTUP_POLICY.doctorStderrBytes - 1;
+    const result = await runNoisyDoctorChild(`
+      for (const chunk of [
+        Buffer.alloc(${prefixBytes}, 0x78),
+        Buffer.from([0xe2, 0x82, 0xac]),
+      ]) {
+        await new Promise((resolve, reject) => {
+          process.stderr.write(chunk, (error) =>
+            error ? reject(error) : resolve(),
+          );
+        });
+      }
+      process.exitCode = 1;
+    `);
+
+    expect(result.diagnostics).toEqual({
+      stderr: "x".repeat(prefixBytes),
+      stderr_bytes: prefixBytes + 3,
+      stderr_truncated: true,
+    });
+  });
+
+  it("preserves replacement decoding for malformed UTF-8 within an untruncated stream", async () => {
+    const result = await runNoisyDoctorChild(`
+      await new Promise((resolve, reject) => {
+        process.stderr.write(Buffer.from([0xff]), (error) =>
+          error ? reject(error) : resolve(),
+        );
+      });
+      process.exitCode = 1;
+    `);
+
+    expect(result.diagnostics).toEqual({
+      stderr: "�",
+      stderr_bytes: 1,
+      stderr_truncated: false,
     });
   });
 
@@ -172,6 +312,19 @@ describe("production MCP doctor", () => {
     await expect(waitForExit(pid)).resolves.toBeUndefined();
   }, 10_000);
 });
+
+const runNoisyDoctorChild = async (body: string) => {
+  const root = await createTestTempDirectory("rea-mcp-doctor-stderr-");
+  const scriptPath = join(root, "noisy.mjs");
+  await writeFile(scriptPath, body);
+  return runProductionMcpDoctor({
+    command: process.execPath,
+    args: [scriptPath],
+    cwd: root,
+    environment: process.env,
+    deadlineMs: 5_000,
+  });
+};
 
 const waitForExit = async (pid: number): Promise<void> => {
   for (let attempt = 0; attempt < 50; attempt += 1) {

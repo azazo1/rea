@@ -11,8 +11,7 @@ import { AnalysisCancelledError } from "./analysisErrorCore.js";
 /** A bounded passive browser observation failed at its CDP boundary. */
 export class BrowserObservationError extends AnalysisError {
   readonly _tag = "BrowserObservationError";
-  override readonly cleanupIncomplete: boolean;
-  override readonly cleanupResources: readonly string[];
+  override cleanupIncomplete: boolean;
   override readonly userCategory: "cancelled" | undefined;
   override readonly userMessage: string | undefined;
 
@@ -26,9 +25,10 @@ export class BrowserObservationError extends AnalysisError {
       options?.detail ?? observationFailureMessage(operation, reason);
     this.cleanupIncomplete =
       this.cleanup !== undefined || reason === "cleanup_failed";
-    this.cleanupResources =
+    this.setCleanupResources(
       this.cleanup?.resources ??
-      (reason === "cleanup_failed" ? ["browser_transport"] : []);
+        (reason === "cleanup_failed" ? ["browser_transport"] : []),
+    );
     this.userCategory =
       reason === "cancelled" ||
       options?.cause instanceof AnalysisCancelledError ||
@@ -51,6 +51,8 @@ const observationFailureMessage = (
     return `${operation} could not reach the selected loopback debugging endpoint. Verify that the target process is running with debugging enabled and that the endpoint's port matches it, then retry.`;
   if (reason === "target_not_found")
     return `${operation} could not find the selected target at the debugging endpoint. Refresh target discovery for that endpoint and retry with a returned target ID.`;
+  if (reason === "service_worker_blocked")
+    return `${operation} refused the selected page because it is controlled by or has a registered service worker while the service-worker policy is block. Set environment.service_workers to allow to permit observation, or remove the service worker registration through the browser.`;
   if (reason === "disconnected")
     return `${operation} lost its debugging connection. Verify that the target process is still running, refresh target discovery, and retry the observation.`;
   return undefined;

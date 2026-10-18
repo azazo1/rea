@@ -235,6 +235,204 @@
         },
         "immutable_scope": "Published Hardhat artifact does not record an immutable-reference map; absence is unknown, not proof of no immutables. Runtime template bytes remain exact."
       }
+    },
+    {
+      "id": "localsend-arm64.apk",
+      "file": "LocalSend-1.18.2-android-arm64v8.apk",
+      "bytes": 46558706,
+      "sha256": "82ec3568fba2aa5295b9aae8b76f701d7a4703d86b9f8bad749472038fbaeab3",
+      "provenance": {
+        "project": "LocalSend",
+        "version": "1.18.2",
+        "upstreamFile": "LocalSend-1.18.2-android-arm64v8.apk",
+        "url": "https://github.com/localsend/localsend/releases/download/v1.18.2/LocalSend-1.18.2-android-arm64v8.apk",
+        "transport_sha256": "82ec3568fba2aa5295b9aae8b76f701d7a4703d86b9f8bad749472038fbaeab3",
+        "transport_bytes": 46558706,
+        "derivation": "Official arm64 release APK, compared with GitHub release asset digest; byte-only analysis without execution"
+      }
+    },
+    {
+      "id": "qgis-world-map.gpkg",
+      "file": "qgis-world-map.gpkg",
+      "bytes": 12914688,
+      "sha256": "01d293159d1b77bd9212b5252587853f61aa9e25b2387135f34afaba8d057190",
+      "provenance": {
+        "project": "QGIS bundled world map",
+        "source_commit": "e1223b8e9e71fc50ee995ed556f711c54ccc101b",
+        "git_blob_sha1": "c9ff80228dff0de93c9acdef16a97545ba360244",
+        "url": "https://raw.githubusercontent.com/qgis/QGIS/e1223b8e9e71fc50ee995ed556f711c54ccc101b/resources/data/world_map.gpkg",
+        "derivation": "unmodified official resource file; streaming Git blob and SHA-256 verification"
+      }
+    },
+    {
+      "id": "wireshark-http.cap",
+      "file": "http.cap",
+      "bytes": 25803,
+      "sha256": "25a72bdf10339f2c29916920c8b9501d294923108de8f29b19aba7cc001ab60d",
+      "provenance": {
+        "project": "Wireshark public sample captures",
+        "source_page": "https://wiki.wireshark.org/SampleCaptures",
+        "url": "https://wiki.wireshark.org/uploads/27707187aeb30df68e70c8fb9d614981/http.cap",
+        "resolved_url": "https://gitlab.com/wireshark/wireshark/-/wikis/uploads/27707187aeb30df68e70c8fb9d614981/http.cap",
+        "upstream_expected_digest": null,
+        "derivation": "Unmodified capture published by official Wireshark wiki. Local digest pins downloaded bytes; no independently published upstream digest is claimed."
+      }
+    },
+    {
+      "id": "wireshark-http_redirects.pcapng",
+      "file": "http_redirects.pcapng",
+      "bytes": 47804,
+      "sha256": "ff432a6b71d06cd20720f7763e584014edd0a43c3b55981c682d1b7640207abc",
+      "provenance": {
+        "project": "Wireshark public sample captures",
+        "source_page": "https://wiki.wireshark.org/SampleCaptures",
+        "url": "https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/http_redirects.pcapng",
+        "resolved_url": "https://gitlab.com/wireshark/wireshark/-/wikis/uploads/__moin_import__/attachments/SampleCaptures/http_redirects.pcapng",
+        "upstream_expected_digest": null,
+        "derivation": "Unmodified capture published by official Wireshark wiki. Local digest pins downloaded bytes; no independently published upstream digest is claimed."
+      }
+    },
+    {
+      "id": "wireshark-pgsql-jdbc.pcap",
+      "file": "pgsql-jdbc.pcap",
+      "bytes": 4906316,
+      "sha256": "6e68b8b792a0f4336092f98856abc7de8c54b55a29112854d28d676f9093c16b",
+      "provenance": {
+        "project": "Wireshark public sample captures",
+        "source_page": "https://wiki.wireshark.org/SampleCaptures",
+        "url": "https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/pgsql-jdbc.pcap.gz",
+        "resolved_url": "https://gitlab.com/wireshark/wireshark/-/wikis/uploads/__moin_import__/attachments/SampleCaptures/pgsql-jdbc.pcap.gz",
+        "upstream_expected_digest": null,
+        "license": "not stated in inspected upstream catalogue",
+        "derivation": "Unmodified official saved sample; decompressed gzip where indicated. Local digest pins acquired bytes, not an upstream-published digest.",
+        "compressed_source": {
+          "name": "pgsql-jdbc.pcap.gz",
+          "bytes": 590093,
+          "sha256": "15b51bb4cc197753c1ac6b7dc3cf5697f22a81e3bb5d2e1d24d15de469c3a06b"
+        }
+      }
+    },
+    {
+      "id": "wireshark-dns.cap",
+      "file": "dns.cap",
+      "bytes": 4338,
+      "sha256": "041eeb6f98bb398f1ee8b09651b5b5a84f6a62639f95bf226f9e7b77355d9f28",
+      "provenance": {
+        "project": "Wireshark public sample captures",
+        "source_page": "https://wiki.wireshark.org/SampleCaptures",
+        "url": "https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/dns.cap",
+        "resolved_url": "https://gitlab.com/wireshark/wireshark/-/wikis/uploads/__moin_import__/attachments/SampleCaptures/dns.cap",
+        "upstream_expected_digest": null,
+        "license": "not stated in inspected upstream catalogue",
+        "derivation": "Unmodified official saved sample; decompressed gzip where indicated. Local digest pins acquired bytes, not an upstream-published digest.",
+        "compressed_source": null
+      }
+    },
+    {
+      "id": "wireshark-dhcp.pcap",
+      "file": "dhcp.pcap",
+      "bytes": 1400,
+      "sha256": "2471b5420bdac826eecf8f61a2bbb4a3eb20dbfab7c02ff2be502f349f368214",
+      "provenance": {
+        "project": "Wireshark public sample captures",
+        "source_page": "https://wiki.wireshark.org/SampleCaptures",
+        "url": "https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/dhcp.pcap",
+        "resolved_url": "https://gitlab.com/wireshark/wireshark/-/wikis/uploads/__moin_import__/attachments/SampleCaptures/dhcp.pcap",
+        "upstream_expected_digest": null,
+        "license": "not stated in inspected upstream catalogue",
+        "derivation": "Unmodified official saved sample; decompressed gzip where indicated. Local digest pins acquired bytes, not an upstream-published digest.",
+        "compressed_source": null
+      }
+    },
+    {
+      "id": "sigrok-uart-max3232e.sr",
+      "file": "uart-max3232e.sr",
+      "bytes": 12742,
+      "sha256": "f797d60d6b8e12d2a1549b9a5a499ef389f44cb9e870e8610af26b57c3b2be76",
+      "provenance": {
+        "project": "sigrok-dumps",
+        "version": "0ad13477abc959d37fc9a5acbd23901c371c9c76",
+        "upstreamFile": "uart/maxim_max3232e/max3232e_hello_world_57600_8n1.sr",
+        "url": "https://raw.githubusercontent.com/sigrokproject/sigrok-dumps/0ad13477abc959d37fc9a5acbd23901c371c9c76/uart/maxim_max3232e/max3232e_hello_world_57600_8n1.sr",
+        "git_blob_sha1": "52e47b3014819471a2f348a0d8c7694fe304e052",
+        "reference": "https://raw.githubusercontent.com/sigrokproject/sigrok-dumps/0ad13477abc959d37fc9a5acbd23901c371c9c76/uart/maxim_max3232e/README",
+        "license_scope": "Repository README declares dumps public domain unless otherwise noted; selected READMEs state no exception; decoder software licensing is separate."
+      }
+    },
+    {
+      "id": "sigrok-i2c-nunchuk.sr",
+      "file": "i2c-nunchuk.sr",
+      "bytes": 20373,
+      "sha256": "0fa6adb8297d7f3fe5ba19c94ee655c9b0f952a8b5e48a17aaa499a2f6d10d70",
+      "provenance": {
+        "project": "sigrok-dumps",
+        "version": "0ad13477abc959d37fc9a5acbd23901c371c9c76",
+        "upstreamFile": "i2c/wii_nunchuk/wii_nunchuk_init_reg_3xdata.sr",
+        "url": "https://raw.githubusercontent.com/sigrokproject/sigrok-dumps/0ad13477abc959d37fc9a5acbd23901c371c9c76/i2c/wii_nunchuk/wii_nunchuk_init_reg_3xdata.sr",
+        "git_blob_sha1": "a7232fce7b54e68e2be44e15946c90a3c756e8e9",
+        "reference": "https://raw.githubusercontent.com/sigrokproject/sigrok-dumps/0ad13477abc959d37fc9a5acbd23901c371c9c76/i2c/wii_nunchuk/README",
+        "license_scope": "Repository README declares dumps public domain unless otherwise noted; selected READMEs state no exception; decoder software licensing is separate."
+      }
+    },
+    {
+      "id": "xbox-clear_nomp.saz",
+      "file": "clear_nomp.saz",
+      "bytes": 43515,
+      "sha256": "3e808663a99cbb9160186f7419633248200fbc6863d2c897f5d4d9972dde0375",
+      "provenance": {
+        "project": "Microsoft Xbox Live Trace Analyzer",
+        "version": "ad880ff00b26c4cae5e3c8864d3df438a03890ba",
+        "url": "https://raw.githubusercontent.com/microsoft/xbox-live-trace-analyzer/ad880ff00b26c4cae5e3c8864d3df438a03890ba/Source/TestData/CertWarnings/clear_nomp.saz",
+        "git_blob": "2f1ba66dacb8f8bac290cab59dff8fe750a46ce7",
+        "license": "MIT; upstream LICENSE.md",
+        "producer_archive_comment": "Fiddler (v4.5.1.2) Session Archive. See http://fiddler2.com"
+      },
+      "saz_question": {
+        "record_ordinals": [12, 0, 6],
+        "total_records": 13,
+        "members": 42,
+        "expanded_bytes": 62609
+      }
+    },
+    {
+      "id": "xbox-clear_mp_cs10.saz",
+      "file": "clear_mp_cs10.saz",
+      "bytes": 5223519,
+      "sha256": "4021b201848e4feea3402c380fda5d2df43fd0bf1c72ea550e60f2da3b3d5b44",
+      "provenance": {
+        "project": "Microsoft Xbox Live Trace Analyzer",
+        "version": "ad880ff00b26c4cae5e3c8864d3df438a03890ba",
+        "url": "https://raw.githubusercontent.com/microsoft/xbox-live-trace-analyzer/ad880ff00b26c4cae5e3c8864d3df438a03890ba/Source/TestData/CertWarnings/clear_mp_cs10.saz",
+        "git_blob": "dac534d625594c7a1d57b0b12ed12ea9c6cb6a5b",
+        "license": "MIT; upstream LICENSE.md",
+        "producer_archive_comment": "Fiddler (v4.6.2.0) Session Archive. See https://fiddler2.com"
+      },
+      "saz_question": {
+        "record_ordinals": [1310, 0, 655],
+        "total_records": 1311,
+        "members": 3939,
+        "expanded_bytes": 9223820
+      }
+    },
+    {
+      "id": "xbox-x49_mp_cs21.saz",
+      "file": "x49_mp_cs21.saz",
+      "bytes": 572224,
+      "sha256": "97cdca8b0608e3f11995fd64b64390b9fd8d8e3efcac89f517f24b44968047f6",
+      "provenance": {
+        "project": "Microsoft Xbox Live Trace Analyzer",
+        "version": "ad880ff00b26c4cae5e3c8864d3df438a03890ba",
+        "url": "https://raw.githubusercontent.com/microsoft/xbox-live-trace-analyzer/ad880ff00b26c4cae5e3c8864d3df438a03890ba/Source/TestData/CertWarnings/x49_mp_cs21.saz",
+        "git_blob": "e7794c44892ca4fa1729fa012e698e8284337f15",
+        "license": "MIT; upstream LICENSE.md",
+        "producer_archive_comment": "Fiddler (v4.6.2.26757) Session Archive. See https://fiddler2.com"
+      },
+      "saz_question": {
+        "record_ordinals": [102, 0, 51],
+        "total_records": 103,
+        "members": 315,
+        "expanded_bytes": 1301927
+      }
     }
   ]
 }

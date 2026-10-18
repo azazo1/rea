@@ -12,7 +12,7 @@ export class GoBinaryFormatFailure extends Error {
 /** Resource boundary exceeded while decoding metadata or native container structure. */
 export class GoBinaryResourceFailure extends Error {
   constructor(
-    readonly boundary: "build-info" | "structure",
+    readonly boundary: "build-info" | "structure" | "search",
     readonly maximum_bytes: number,
     message: string,
   ) {
@@ -34,7 +34,17 @@ export interface GoZeroFillMapping {
   readonly size: bigint;
 }
 
-/** Native container facts and its producer-defined build-info search area. */
+/** One named file section. Invalid declared ranges stay visible with `file_backed: false`. */
+export interface GoImageSection {
+  readonly name: string;
+  readonly offset: number;
+  readonly size: number;
+  readonly file_backed: boolean;
+  readonly read_only: boolean;
+  readonly compressed: boolean;
+}
+
+/** Native container facts and its ordered producer-defined build-info search ranges. */
 export interface GoBinaryContainer {
   readonly format: "elf" | "pe" | "macho";
   readonly architecture: string;
@@ -42,7 +52,8 @@ export interface GoBinaryContainer {
   readonly byte_order: "little" | "big";
   readonly mappings: readonly GoFileMapping[];
   readonly zero_fills: readonly GoZeroFillMapping[];
-  readonly search: GoFileMapping | null;
+  readonly sections: readonly GoImageSection[];
+  readonly search: readonly GoFileMapping[];
 }
 
 /** Reader that checks every structural range before decoding numeric fields. */
@@ -109,6 +120,32 @@ export class GoBinaryReader {
     return this.fileRange(offset, size, label).offset;
   }
 }
+
+/** Admit a declared file span, or mark it unbacked when it leaves the file. */
+export const declaredFileRange = (
+  fileBytes: number,
+  offset: bigint,
+  size: bigint,
+): {
+  readonly offset: number;
+  readonly size: number;
+  readonly file_backed: boolean;
+} => {
+  if (
+    offset < 0n ||
+    size < 0n ||
+    offset > BigInt(Number.MAX_SAFE_INTEGER) ||
+    size > BigInt(Number.MAX_SAFE_INTEGER) ||
+    offset > BigInt(fileBytes) ||
+    size > BigInt(fileBytes) - offset
+  )
+    return { offset: 0, size: 0, file_backed: false };
+  return {
+    offset: Number(offset),
+    size: Number(size),
+    file_backed: size > 0n,
+  };
+};
 
 /** Map a virtual span without losing precision or selecting an ambiguous alias. */
 export const mappedFileOffset = (

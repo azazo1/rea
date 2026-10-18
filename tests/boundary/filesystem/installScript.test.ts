@@ -11,6 +11,7 @@ import {
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import { spawn as spawnPty } from "@lydell/node-pty";
 import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
@@ -185,6 +186,75 @@ describe("curl installer scenarios", { timeout: 20_000 }, () => {
   });
 });
 
+describe("installer reported version", { timeout: 20_000 }, () => {
+  it("rejects an empty version from a successful installed command", async () => {
+    const fixture = await createFixture();
+    await expect(
+      runInstaller(fixture, ["--version", "0.3.0"], { FAKE_REA_VERSION: "" }),
+    ).rejects.toMatchObject({
+      stderr:
+        "REA installation failed: the installed REA version could not be read. Reinstall the requested version, then retry.\n",
+    });
+  });
+});
+
+describe("installer TTY fallback", { timeout: 20_000 }, () => {
+  it("skips automatic setup when stderr is redirected", async () => {
+    const fixture = await createFixture();
+    const script = join(process.cwd(), "install.sh");
+    const wrapper = `
+      const { spawnSync } = require("node:child_process");
+      const { openSync, closeSync } = require("node:fs");
+      const stderr = openSync(process.argv[2], "w");
+      const child = spawnSync("/bin/bash", [process.argv[1], ...process.argv.slice(3)], {
+        stdio: ["inherit", "inherit", stderr],
+        env: process.env,
+      });
+      closeSync(stderr);
+      process.exit(child.status ?? 1);
+    `;
+    let output = "";
+    const terminal = spawnPty(
+      process.execPath,
+      ["-e", wrapper, script, fixture.installerStderrLog, "--version", "0.3.0"],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          ...installerEnvironment(fixture),
+          TERM: "xterm-256color",
+        },
+        name: "xterm-256color",
+        cols: 120,
+        rows: 40,
+      },
+    );
+    let timedOut = false;
+    const exitCode = await new Promise<number>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        terminal.kill();
+      }, 10_000);
+      terminal.onData((data) => {
+        output += data;
+      });
+      terminal.onExit(({ exitCode: code }) => {
+        clearTimeout(timeout);
+        if (timedOut)
+          reject(new Error(`Installer PTY timed out after output: ${output}`));
+        else resolve(code);
+      });
+    });
+
+    expect(exitCode).toBe(0);
+    expect(output).toContain(
+      `Run ${join(fixture.home, ".local/bin/rea")} setup to configure Hopper and agents.`,
+    );
+    expect(await readFile(fixture.reaLog, "utf8")).toBe("--version\n");
+    expect(await readFile(fixture.installerStderrLog, "utf8")).toBe("");
+  });
+});
+
 describe("truncated installer download", { timeout: 20_000 }, () => {
   it("runs nothing from a download truncated after the npm install line", async () => {
     const fixture = await createFixture();
@@ -334,6 +404,20 @@ describe("native macOS installer", { timeout: 20_000 }, () => {
 });
 
 describe("installer semantic version parsing", { timeout: 20_000 }, () => {
+  it("rejects an explicitly empty version instead of selecting latest", async () => {
+    const fixture = await createFixture();
+    await expect(
+      runInstaller(fixture, ["--version", "", "--dry-run"]),
+    ).rejects.toMatchObject({
+      stdout: "",
+      stderr:
+        "REA installation failed: version must be an exact semantic version.\n",
+    });
+    await expect(readFile(fixture.npmLog, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it.each([
     "1.2.3-01",
     "1.2.3-$(printf unexpected)",
@@ -433,6 +517,7 @@ interface InstallerFixture {
   readonly temporary: string;
   readonly npmLog: string;
   readonly reaLog: string;
+  readonly installerStderrLog: string;
 }
 
 const getProcessOutput = (
@@ -456,6 +541,7 @@ const createFixture = async (): Promise<InstallerFixture> => {
   const temporary = join(root, "tmp");
   const npmLog = join(root, "npm.log");
   const reaLog = join(root, "rea.log");
+  const installerStderrLog = join(root, "installer.stderr.log");
   await Promise.all([mkdir(home), mkdir(bin), mkdir(temporary)]);
   await Promise.all([
     executable(
@@ -499,7 +585,7 @@ if [ -n "\${FAKE_CURL_BODY:-}" ]; then printf '%s' "$FAKE_CURL_BODY"; else print
       `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_REA_LOG"
 [ "\${FAKE_REA_VERSION_FAIL:-}" = "1" ] && exit 1
-[ "$1" = "--version" ] && printf '%s\n' "\${FAKE_REA_VERSION:-0.3.0}"
+[ "$1" = "--version" ] && printf '%s\n' "\${FAKE_REA_VERSION-0.3.0}"
 exit 0
 `,
     ),
@@ -507,13 +593,26 @@ exit 0
       symlink(`/usr/bin/${command}`, join(bin, command)),
     ),
   ]);
-  return { home, bin, temporary, npmLog, reaLog };
+  return { home, bin, temporary, npmLog, reaLog, installerStderrLog };
 };
 
 const executable = async (path: string, source: string): Promise<void> => {
   await writeFile(path, source);
   await chmod(path, 0o755);
 };
+
+/** Fixture-owned installer environment shared by the exec, pipe and PTY runs. */
+const installerEnvironment = (
+  fixture: InstallerFixture,
+): Record<string, string> => ({
+  HOME: fixture.home,
+  TMPDIR: fixture.temporary,
+  PATH: `${fixture.bin}:/usr/bin:/bin`,
+  FAKE_NPM_LOG: fixture.npmLog,
+  FAKE_REA_LOG: fixture.reaLog,
+  FAKE_REA_SOURCE: join(fixture.bin, "rea-source"),
+  FAKE_NPM_PREFIX: join(fixture.home, ".npm-global"),
+});
 
 const runInstaller = async (
   fixture: InstallerFixture,
@@ -524,13 +623,7 @@ const runInstaller = async (
   execFileAsync("/bin/bash", [script, ...args], {
     env: {
       ...process.env,
-      HOME: fixture.home,
-      TMPDIR: fixture.temporary,
-      PATH: `${fixture.bin}:/usr/bin:/bin`,
-      FAKE_NPM_LOG: fixture.npmLog,
-      FAKE_REA_LOG: fixture.reaLog,
-      FAKE_REA_SOURCE: join(fixture.bin, "rea-source"),
-      FAKE_NPM_PREFIX: join(fixture.home, ".npm-global"),
+      ...installerEnvironment(fixture),
       ...overrides,
     },
   });
@@ -552,13 +645,7 @@ const runPipedInstaller = async (
   new Promise((resolve, reject) => {
     const child = spawn("/bin/bash", ["-s", "--", ...args], {
       env: {
-        HOME: fixture.home,
-        TMPDIR: fixture.temporary,
-        PATH: `${fixture.bin}:/usr/bin:/bin`,
-        FAKE_NPM_LOG: fixture.npmLog,
-        FAKE_REA_LOG: fixture.reaLog,
-        FAKE_REA_SOURCE: join(fixture.bin, "rea-source"),
-        FAKE_NPM_PREFIX: join(fixture.home, ".npm-global"),
+        ...installerEnvironment(fixture),
         ...overrides,
       },
       stdio: ["pipe", "pipe", "pipe"],

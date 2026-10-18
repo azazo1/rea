@@ -12,8 +12,16 @@ export const COMPACT_INPUT_SCHEMA_BUDGET_BYTES = 13 * 1024;
 
 export const mcpInputSchemaProfileSchema = z.enum(["full", "compact"]);
 
+/** Select the exact compact presentation budget shared by registration and identity. */
+export const compactPresentationForMcpInputSchemaProfile = (
+  profile: "full" | "compact" | undefined,
+): { readonly budgetBytes: number } | undefined =>
+  profile === "compact"
+    ? { budgetBytes: COMPACT_INPUT_SCHEMA_BUDGET_BYTES }
+    : undefined;
+
 const profileConstraint =
-  'REA_MCP_INPUT_SCHEMA_PROFILE must be "full" (default) or "compact". The compact profile advertises input schemas without nested annotation prose for providers that cap each tool schema\'s serialized size.';
+  'REA_MCP_INPUT_SCHEMA_PROFILE must be "full" (default) or "compact". The compact profile advertises bounded input schemas with fewer nested annotations for providers with schema compatibility constraints.';
 
 export type McpInputSchemaProfile = z.infer<typeof mcpInputSchemaProfileSchema>;
 

@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, it, onTestFinished } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 import { HistoricalCaptureDecoder } from "../../../src/browser/history/HistoricalCaptureDecoder.js";
 import { MitmproxyCaptureAdapter } from "../../../src/browser/history/MitmproxyCaptureAdapter.js";
 import { HAR_CAPTURE_PROVIDER_IDENTITY } from "../../../src/browser/history/CaptureRelease.js";
@@ -22,6 +22,7 @@ import {
 import { historicalHar } from "../../fixtures/historicalHar.js";
 import { decodeHarCapture } from "../../../src/browser/history/HarCapture.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
 
 const linux = it.skipIf(process.platform !== "linux");
 
@@ -136,6 +137,66 @@ it("classifies an oversized selected capture before creating an owned decoder", 
       ],
     },
   });
+});
+
+it("retains a failed capture reader and retries it before a fresh load", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rea-capture-reader-close-"));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "input.har");
+  await writeFile(path, JSON.stringify(historicalHar()));
+  const originalClose = OwnedFileHandle.prototype.close;
+  const close = vi.spyOn(OwnedFileHandle.prototype, "close");
+  let allowClose = false;
+  let closeAttempts = 0;
+  close.mockImplementation(async function (this: OwnedFileHandle) {
+    closeAttempts += 1;
+    if (!allowClose) throw new Error("injected capture reader close failure");
+    await originalClose.call(this);
+  });
+  let decoderCalls = 0;
+  const decoder = new HistoricalCaptureDecoder(
+    [
+      {
+        format: "har",
+        identity: HAR_CAPTURE_PROVIDER_IDENTITY,
+        command: async () => {
+          decoderCalls += 1;
+          return {
+            command: process.execPath,
+            arguments: ["-e", "process.exit(0)"],
+          };
+        },
+      },
+    ],
+    process.env,
+  );
+  const input = inspectWebNetworkCaptureInputSchema.parse({
+    capture_path: path,
+    format: "har",
+  });
+  try {
+    const first = await decoder.inspect(input);
+    expect(first.ok).toBe(false);
+    if (first.ok) throw new Error("Reader close failure must fail inspection");
+    expect(first.error.cleanupResources).toContain(path);
+    expect(decoderCalls).toBe(0);
+
+    const refused = await decoder.inspect(input);
+    expect(refused.ok).toBe(false);
+    if (refused.ok) throw new Error("Fresh read must wait for owner cleanup");
+    expect(refused.error.cleanupIncomplete).toBe(true);
+    expect(refused.error.cleanupResources).toContain(path);
+    expect(decoderCalls).toBe(0);
+    expect(closeAttempts).toBe(2);
+
+    allowClose = true;
+    await decoder.close();
+    expect(closeAttempts).toBe(3);
+  } finally {
+    allowClose = true;
+    await decoder.close().catch(() => undefined);
+    close.mockRestore();
+  }
 });
 
 it("does not misclassify decoder filesystem failures as missing selected input", async () => {
@@ -304,6 +365,7 @@ it("cancels after snapshot acquisition before launch and removes private input d
 
 it.each([
   { reason: "input-limit", tag: "AnalysisInputError" },
+  { reason: "expanded-limit", tag: "AnalysisInputError" },
   { reason: "resource-limit", tag: "AnalysisResourceConstraintError" },
   { reason: "decoder", tag: "ProviderAdapterError" },
   { reason: "limit", tag: "AnalysisOutputError" },
@@ -359,6 +421,22 @@ it.each([
               reason: "out_of_range",
               expected: {
                 maximum_capture_nesting: WEB_NETWORK_CAPTURE_LIMITS.depth,
+              },
+            },
+          ],
+        },
+      });
+    } else if (reason === "expanded-limit") {
+      expect(projected).toMatchObject({
+        category: "invalid_input",
+        details: {
+          issues: [
+            {
+              path: ["capture_path", "/extension/child"],
+              reason: "out_of_range",
+              expected: {
+                maximum_expanded_capture_bytes:
+                  WEB_NETWORK_CAPTURE_LIMITS.inputBytes,
               },
             },
           ],

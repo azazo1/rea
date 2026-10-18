@@ -35,27 +35,47 @@ const validPng = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jv4sAAAAASUVORK5CYII=",
   "base64",
 );
+
+/** Screenshot payload as the native helper reports one PNG buffer. */
+const screenshotOf = (bytes: Buffer) => ({
+  mime_type: "image/png",
+  base64: bytes.toString("base64"),
+  sha256: createHash("sha256").update(bytes).digest("hex"),
+  width: bytes.readUInt32BE(16),
+  height: bytes.readUInt32BE(20),
+});
+
+/** Observe the fixture snapshot carrying one screenshot payload. */
+const observeWithScreenshot = (screenshot: Record<string, unknown>) =>
+  observeNativeUi(
+    target,
+    "observe_native_ui",
+    { ...scope, screenshot: true },
+    {
+      environment: {},
+      invoke: async () => ({ ok: true, result: { ...snapshot, screenshot } }),
+    },
+  );
+
+it.each([
+  { offset: 8, value: 12 },
+  { offset: 16, value: 0x8000_0000 },
+  { offset: 20, value: 0x8000_0000 },
+])(
+  "rejects invalid IHDR metadata with a matching digest",
+  async ({ offset, value }) => {
+    const bytes = Buffer.from(validPng);
+    bytes.writeUInt32BE(value, offset);
+    const result = await observeWithScreenshot(screenshotOf(bytes));
+    expect(result.ok).toBe(false);
+  },
+);
 describe("native UI screenshot validation", () => {
   it("rejects malformed or mismatched screenshot bytes from the helper", async () => {
-    const screenshot = {
-      mime_type: "image/png",
-      base64: validPng.toString("base64"),
+    const result = await observeWithScreenshot({
+      ...screenshotOf(validPng),
       sha256: "0".repeat(64),
-      width: 1,
-      height: 1,
-    };
-    const result = await observeNativeUi(
-      target,
-      "observe_native_ui",
-      { ...scope, screenshot: true },
-      {
-        environment: {},
-        invoke: async () => ({
-          ok: true,
-          result: { ...snapshot, screenshot },
-        }),
-      },
-    );
+    });
     expect(result.ok).toBe(false);
   });
 
@@ -66,26 +86,10 @@ describe("native UI screenshot validation", () => {
   ])(
     "rejects invalid screenshot field variants from the helper",
     async (change) => {
-      const screenshot = {
-        mime_type: "image/png",
-        base64: validPng.toString("base64"),
-        sha256: createHash("sha256").update(validPng).digest("hex"),
-        width: 1,
-        height: 1,
+      const result = await observeWithScreenshot({
+        ...screenshotOf(validPng),
         ...change,
-      };
-      const result = await observeNativeUi(
-        target,
-        "observe_native_ui",
-        { ...scope, screenshot: true },
-        {
-          environment: {},
-          invoke: async () => ({
-            ok: true,
-            result: { ...snapshot, screenshot },
-          }),
-        },
-      );
+      });
       expect(result.ok).toBe(false);
     },
   );
@@ -95,49 +99,12 @@ describe("native UI screenshot validation", () => {
     const type = bytes.subarray(12, 16);
     type[0] = (type[0] ?? 0) | 0x80;
     expect(type.toString("ascii")).toBe("IHDR");
-    const screenshot = {
-      mime_type: "image/png",
-      base64: bytes.toString("base64"),
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      width: 1,
-      height: 1,
-    };
-    const result = await observeNativeUi(
-      target,
-      "observe_native_ui",
-      { ...scope, screenshot: true },
-      {
-        environment: {},
-        invoke: async () => ({
-          ok: true,
-          result: { ...snapshot, screenshot },
-        }),
-      },
-    );
+    const result = await observeWithScreenshot(screenshotOf(bytes));
     expect(result.ok).toBe(false);
   });
 
   it("accepts a self-consistent PNG screenshot from the helper", async () => {
-    const bytes = validPng;
-    const screenshot = {
-      mime_type: "image/png",
-      base64: bytes.toString("base64"),
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      width: 1,
-      height: 1,
-    };
-    const result = await observeNativeUi(
-      target,
-      "observe_native_ui",
-      { ...scope, screenshot: true },
-      {
-        environment: {},
-        invoke: async () => ({
-          ok: true,
-          result: { ...snapshot, screenshot },
-        }),
-      },
-    );
+    const result = await observeWithScreenshot(screenshotOf(validPng));
     expect(result.ok).toBe(true);
   });
 
@@ -260,12 +227,14 @@ describe("native UI capture selection and budgets", () => {
         },
       },
     );
-    expect(result.ok).toBe(true);
-    if (result.ok)
-      expect(result.value.steps[0]).toMatchObject({
-        kind: "wait",
-        outcome: "cancelled",
-      });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected scenario cancellation");
+    expect(result.error._tag).toBe("AnalysisCancelledError");
+    expect(result.error.cause).toBe(controller.signal.reason);
+    expect(result.error.partialObservation).toMatchObject({
+      initial: snapshot,
+      steps: [{ kind: "wait", outcome: "cancelled" }],
+    });
   });
   it("reports aggregate output exhaustion after individually valid captures", async () => {
     const largeSnapshot = {
@@ -284,12 +253,18 @@ describe("native UI capture selection and budgets", () => {
         invoke: async () => ({ ok: true, result: largeSnapshot }),
       },
     );
-    expect(result.ok).toBe(true);
-    if (result.ok)
-      expect(result.value.steps[0]).toMatchObject({
-        outcome: "failed",
-        reason: expect.stringContaining("64 MiB output budget"),
-      });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected scenario output limit failure");
+    expect(result.error._tag).toBe("AnalysisCapabilityUnavailableError");
+    expect(result.error.partialObservation).toMatchObject({
+      initial: largeSnapshot,
+      steps: [
+        {
+          outcome: "failed",
+          reason: expect.stringContaining("64 MiB output budget"),
+        },
+      ],
+    });
   });
 });
 
@@ -360,11 +335,13 @@ describe("native UI target and cancellation failures", () => {
       launch_time: 1,
       action: { kind: "scroll", path: [1] },
     });
-    expect(result.ok).toBe(true);
-    if (result.ok)
-      expect(result.value.steps).toMatchObject([
-        { index: 0, outcome: "failed", before: snapshot, after: null },
-      ]);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected failed action");
+    expect(result.error._tag).toBe("AnalysisCapabilityUnavailableError");
+    expect(result.error.partialObservation).toMatchObject({
+      initial: snapshot,
+      steps: [{ index: 0, outcome: "failed", before: snapshot, after: null }],
+    });
   });
   it("rejects target replacement and stops subsequent actions after cancellation", async () => {
     const controller = new AbortController();
@@ -390,8 +367,14 @@ describe("native UI target and cancellation failures", () => {
       },
     );
     expect(calls).toBe(1);
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.steps[0]?.outcome).toBe("cancelled");
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected scenario cancellation");
+    expect(result.error._tag).toBe("AnalysisCancelledError");
+    expect(result.error.cause).toBe(controller.signal.reason);
+    expect(result.error.partialObservation).toMatchObject({
+      initial: snapshot,
+      steps: [{ outcome: "cancelled" }],
+    });
     const replaced = await observeNativeUi(target, "observe_native_ui", scope, {
       environment: {},
       invoke: async () => ({

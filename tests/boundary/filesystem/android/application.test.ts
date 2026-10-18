@@ -205,6 +205,42 @@ describe("APK family without a root manifest", () => {
   });
 });
 
+it("retains encrypted native library paths as unknown component evidence", async () => {
+  const root = await createTestTempDirectory("rea-android-encrypted-");
+  const path = join(root, "Encrypted.apk");
+  const writer = new ZipWriter(new Uint8ArrayWriter());
+  await writer.add(
+    "lib/arm64-v8a/libentry.so",
+    new TextReader("encrypted native library"),
+    { password: "fixture-only" },
+  );
+  await writeFile(path, await writer.close());
+  const inventory = parseEvidence(
+    await runProviderAnalysis(path, "inventory_artifact", {}),
+  );
+  const projection = androidApplicationProjectionResultSchema.parse(
+    requireSuccessfulProjection(
+      projectAndroidApplicationEvidence({ inventory_evidence: [inventory] }),
+    ).normalized_result,
+  );
+
+  expect(projection.unavailable_components).toContainEqual(
+    expect.objectContaining({
+      path: "lib/arm64-v8a/libentry.so",
+      artifact_id: null,
+      sha256: null,
+      encrypted: true,
+    }),
+  );
+  expect(projection.coverage).toMatchObject({
+    status: "partial",
+    inventory_complete: true,
+  });
+  expect(projection.limitations).toContainEqual(
+    expect.stringContaining("component absence is unknown"),
+  );
+});
+
 describe("case-distinct APK resource names", () => {
   it("inventories and projects an APK whose resource names differ only in case", async () => {
     const root = await createTestTempDirectory("rea-android-case-");
@@ -228,7 +264,7 @@ describe("case-distinct APK resource names", () => {
       await runProviderAnalysis(path, "inventory_artifact", {}),
     );
     expect(inventory.normalized_result).toMatchObject({
-      coverage_status: "partial",
+      coverage: { scope: "container-entries", status: "complete" },
     });
     const result = projectAndroidApplicationEvidence({
       inventory_evidence: [inventory],
@@ -238,11 +274,11 @@ describe("case-distinct APK resource names", () => {
     );
     expect(projection.root_format).toBe("apk");
     expect(projection.coverage).toEqual({
-      status: "partial",
+      status: "complete-within-inventory",
       inventory_complete: true,
     });
-    expect(projection.limitations).toContain(
-      "Source inventory coverage is partial; absence is unknown.",
+    expect(projection.limitations.join(" ")).toContain(
+      "case-insensitive destination",
     );
     expect(projection.components.manifests).toHaveLength(1);
     expect(projection.components.dex).toHaveLength(1);

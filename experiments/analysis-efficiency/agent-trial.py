@@ -94,6 +94,9 @@ def main():
     if undeclared:
         raise ValueError('Declare inherited provider settings explicitly in --providers: '
                          + ', '.join(undeclared) + '. Values are not logged.')
+    source_auth_home = (Path(os.environ['CODEX_HOME']) if 'CODEX_HOME' in os.environ
+                        else Path.home() / '.codex')
+    source_auth = source_auth_home / 'auth.json'
     args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
     runtime_files, runtime_digest = runtime_fingerprint(repository)
     (args.output / 'runtime-files.json').write_text(json.dumps(runtime_files))
@@ -103,7 +106,6 @@ def main():
     workspace = profile / 'workspace'
     for directory in [trial_codex_home, account, workspace]:
         directory.mkdir(mode=0o700)
-    source_auth = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'auth.json'
     auth = trial_codex_home / 'auth.json'
     started = time.monotonic()
     timeout = False
@@ -178,9 +180,14 @@ def main():
                  'inspect_android_package', 'search_android_classes',
                  'inspect_android_class', 'inspect_android_method',
                  'inspect_firmware_regions', 'inspect_managed_artifact',
+                 'inspect_sqlite_database', 'inspect_pcap_capture',
+                 'inspect_web_network_capture',
+                 'inspect_packet_capture', 'inspect_packet_fields',
+                 'decode_signal_recording', 'inspect_signal_decoders',
                  'inspect_managed_members', 'inspect_managed_native_boundaries',
                  'inspect_artifact', 'inspect_wasm_artifact',
                  'inspect_evm_interface', 'get_evidence_bundle', 'export_evidence_bundle',
+                 'import_evidence_bundle', 'list_unknowns', 'verify_unknown_resolution',
                  'capture_browser_scenario',
                  'resolve_containing_procedure', 'analyze_function', 'close_binary']:
         config += '[mcp_servers.rea.tools.' + tool + ']\napproval_mode = "approve"\n'

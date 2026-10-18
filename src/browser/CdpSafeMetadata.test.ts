@@ -4,6 +4,71 @@ import { safeResponseMetadata } from "./CdpSafeMetadata.js";
 
 const origin = "https://app.example.test";
 
+describe("structured COOP and COEP declarations", () => {
+  it.each([
+    ["same-origin", "same-origin"],
+    ['same-origin; report-to="coop"', "same-origin"],
+    ['require-corp; report-to="coep"', "require-corp"],
+    ['credentialless; report-to="a; b, c"', "credentialless"],
+    [String.raw`same-origin; report-to="a\"b\\c"`, "same-origin"],
+    [
+      "same-origin; enabled; n=-999999999999999; f=999999999999.999",
+      "same-origin",
+    ],
+    ["same-origin; flag=?0; bin=:YQ:; date=@123", "same-origin"],
+    ['same-origin; label=%"%c3%a9"', "same-origin"],
+    ["same-origin; value=one; value=two", "same-origin"],
+    ['  same-origin;  report-to="coop"  ', "same-origin"],
+    ["FuturePolicy", "FuturePolicy"],
+    ['same-origin; report-to="unterminated', null],
+    [String.raw`same-origin; report-to="bad\q"`, null],
+    ["same-origin; Report-To=endpoint", null],
+    ["same-origin ; report-to=endpoint", null],
+    ["same-origin; report-to =endpoint", null],
+    ["same-origin; report-to= endpoint", null],
+    ["same-origin; report-to=", null],
+    ["same-origin;", null],
+    ["same-origin, require-corp", null],
+    ["same-origin\nrequire-corp", null],
+    ['"same-origin"; report-to="coop"', null],
+    ["same-origin; n=1000000000000000", null],
+    ["same-origin; f=1.1234", null],
+    ["same-origin; b=?2", null],
+    ["same-origin; bin=:a:", null],
+    ["same-origin; bin=:YQ=:", null],
+    ['same-origin; label=%"%ff"', null],
+    ['same-origin; label=%"%C3%A9"', null],
+    ['same-origin; label="é"', null],
+    ["same-origin\t", null],
+    ["", null],
+    [undefined, null],
+  ] as const)(
+    "parses the complete structured token item %j",
+    (value, expected) => {
+      const captured = safeResponseMetadata(
+        "policies",
+        `${origin}/page`,
+        {
+          headers: {
+            "Cross-Origin-Opener-Policy": value,
+            "Cross-Origin-Embedder-Policy": value,
+            "Cross-Origin-Resource-Policy":
+              'same-origin; report-to="not-structured"',
+            "X-Content-Type-Options": 'nosniff; report-to="not-structured"',
+          },
+        },
+        new Set([origin]),
+      );
+      expect(captured.response.policies).toMatchObject({
+        coop: expected,
+        coep: expected,
+        corp: null,
+        x_content_type_options: null,
+      });
+    },
+  );
+});
+
 describe("safe CDP response metadata", () => {
   it("drops credential headers and preserves complete local link URLs", () => {
     const captured = safeResponseMetadata(
@@ -202,6 +267,53 @@ describe("Link header value delimiters", () => {
       new Set(["https://owned.test"]),
     ).response.links;
 
+  it.each([", ", "\n", "\r\n"])(
+    "preserves repeated field declarations and agent hints joined by %j",
+    (separator) => {
+      const captured = safeResponseMetadata(
+        "document-response",
+        `${origin}/page`,
+        {
+          headers: {
+            Link: [
+              '</assets/red,blue.js>; rel="preload"; type="text/javascript; charset=utf-8"; title="a,b"',
+              '</agent?selected=keep>; rel="mcp service-desc"',
+            ].join(separator),
+          },
+        },
+        new Set([origin]),
+      );
+      expect(captured.response.links).toMatchObject([
+        {
+          href: `${origin}/assets/red,blue.js`,
+          rel: ["preload"],
+          type: "text/javascript; charset=utf-8",
+        },
+        {
+          href: `${origin}/agent?selected=keep`,
+          rel: ["mcp", "service-desc"],
+        },
+      ]);
+      expect(captured.agentHints).toContainEqual({
+        mechanism: "link_rel",
+        declaration: "mcp service-desc",
+        url: `${origin}/agent?selected=keep`,
+        trust: "page-declared-untrusted",
+      });
+    },
+  );
+
+  it("keeps delimiters scoped to each CDP field line", () => {
+    const links = captureLinks(
+      '</first>; title="unterminated\n</agent>; rel=mcp',
+    );
+    expect(links.map(({ href }) => href)).toEqual([
+      "https://owned.test/first",
+      "https://owned.test/agent",
+    ]);
+    expect(links[1]?.rel).toEqual(["mcp"]);
+  });
+
   it("preserves commas in URI references and separates later links", () => {
     const links = captureLinks(
       '</assets/red,blue.js>; rel="preload"; as=script, </ordinary.js>; rel="modulepreload"',
@@ -288,5 +400,26 @@ describe("safe CDP response metadata referrer policy", () => {
     );
     expect(captured.response.policies.referrer_policy).toBe(expected);
     expect(captured.response.policies.coop).toBe("same-origin");
+  });
+
+  it.each<[string | number | undefined, number | null]>([
+    ["100", 100],
+    [" 0 ", 0],
+    [100, 100],
+    ["-5", null],
+    ["+12", null],
+    ["0x10", null],
+    ["1e3", null],
+    ["9007199254740991", 9007199254740991],
+    ["9007199254740992", null],
+    [undefined, null],
+  ])("declares Content-Length %j only for decimal digits", (raw, expected) => {
+    const captured = safeResponseMetadata(
+      "request-length",
+      `${origin}/api`,
+      { headers: raw === undefined ? {} : { "Content-Length": raw } },
+      new Set([origin]),
+    );
+    expect(captured.response.content_length).toBe(expected);
   });
 });

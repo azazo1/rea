@@ -90,6 +90,185 @@ const expectPeInputFailuresAcrossAdapters = async (input: {
     });
 };
 
+const contract = toolContract("inspect_pe_resources");
+
+const expectPeMappingOwnershipAcrossAdapters = async (
+  cli: TestCli,
+  client: Client,
+  root: string,
+): Promise<void> => {
+  for (const { name, payloadRva, payloadBytes, section, expectedOffset } of [
+    {
+      name: "empty-header",
+      payloadRva: 0x300,
+      payloadBytes: 0,
+      section: null,
+      expectedOffset: 0x300,
+    },
+    {
+      name: "header-section-collision",
+      payloadRva: 0x300,
+      payloadBytes: 0,
+      section: { rva: 0x300, bytes: 4 },
+      expectedOffset: null,
+    },
+    {
+      name: "empty-section-in-header",
+      payloadRva: 0x300,
+      payloadBytes: 4,
+      section: { rva: 0x301, bytes: 0 },
+      expectedOffset: 0x300,
+    },
+    {
+      name: "empty-section-in-resources",
+      payloadRva: null,
+      payloadBytes: 4,
+      section: { rva: 0x2001, bytes: 0 },
+      expectedOffset: "original",
+    },
+  ]) {
+    const fixture = peResourceFixture(false, [
+      { type: 10, name: 1, language: 1033, payload: Buffer.from("DATA") },
+    ]);
+    const data = fixture.dataOffsets[0] ?? 0;
+    let bytes = fixture.bytes;
+    const originalPayloadOffset = bytes.readUInt32LE(data) - 0x1c00;
+    if (payloadRva !== null) bytes.writeUInt32LE(payloadRva, data);
+    bytes.writeUInt32LE(payloadBytes, data + 4);
+    if (section !== null) {
+      bytes.writeUInt16LE(2, 0x86);
+      const at = fixture.sectionAt + 40;
+      bytes.writeUInt32LE(section.bytes, at + 8);
+      bytes.writeUInt32LE(section.rva, at + 12);
+      bytes.writeUInt32LE(section.bytes, at + 16);
+      bytes.writeUInt32LE(bytes.length, at + 20);
+      bytes = Buffer.concat([bytes, Buffer.alloc(section.bytes)]);
+    }
+    const path = join(root, `${name}.exe`);
+    await writeFile(path, bytes);
+    if (expectedOffset === null) {
+      await expectPeInputFailureAcrossAdapters({
+        cli,
+        client,
+        toolName: contract.name,
+        path,
+        reason: "invalid_format",
+      });
+      continue;
+    }
+    const result = await cli.run({
+      arguments: ["inspect-pe-resources", path, "--json"],
+    });
+    expect(result.exitCode, name).toBe(0);
+    const evidence = contract.outputSchema.parse(result.json);
+    const response = await client.callTool({
+      name: contract.name,
+      arguments: { path },
+    });
+    expect(response.isError, name).not.toBe(true);
+    const mcp = contract.outputSchema.parse(response.structuredContent);
+    expect(mcp.subject).toEqual(evidence.subject);
+    expect(mcp.evidence_id).toBe(evidence.evidence_id);
+    expect(mcp.normalized_result).toEqual(evidence.normalized_result);
+    expect(evidence.normalized_result).toMatchObject({
+      coverage: { status: "complete", resources: 1 },
+      resources: [
+        {
+          payload: {
+            location: {
+              offset:
+                expectedOffset === "original"
+                  ? originalPayloadOffset
+                  : expectedOffset,
+              bytes: payloadBytes,
+            },
+          },
+        },
+      ],
+    });
+    expect(await readFile(path)).toEqual(bytes);
+  }
+};
+
+const expectPeInventoriesAcrossAdapters = async (
+  cli: TestCli,
+  client: Client,
+  root: string,
+): Promise<void> => {
+  for (const [plus, empty] of [
+    [false, false],
+    [true, false],
+    [false, true],
+    [true, true],
+  ]) {
+    const fixture = peResourceFixture(plus);
+    const virtualSize = fixture.bytes.readUInt32LE(fixture.sectionAt + 8);
+    if (empty) {
+      fixture.bytes.writeUInt32LE(0x2000 + virtualSize, fixture.dataOffsets[0]);
+      fixture.bytes.writeUInt32LE(0, (fixture.dataOffsets[0] ?? 0) + 4);
+    }
+    const path = join(
+      root,
+      `resource${plus ? "64" : "32"}${empty ? "-empty" : ""}.exe`,
+    );
+    await writeFile(path, fixture.bytes);
+    const result = await cli.run({
+      arguments: ["inspect-pe-resources", path, "--json"],
+    });
+    expect(result.exitCode).toBe(0);
+    const evidence = contract.outputSchema.parse(result.json);
+    const report = peResourcesSchema.parse(evidence.normalized_result);
+    expect(evidence.subject?.digest).toMatchObject({
+      sha256: createHash("sha256").update(fixture.bytes).digest("hex"),
+    });
+    expect(evidence.subject?.architecture).toBe(plus ? "x86_64" : "x86");
+    expect(report.coverage).toMatchObject({
+      status: "complete",
+      resources: 5,
+    });
+    expect(report.resources[0]?.payload.sha256).toBe(
+      createHash("sha256")
+        .update(empty ? "" : "ICON")
+        .digest("hex"),
+    );
+    if (empty)
+      expect(report.resources[0]?.payload.location).toEqual({
+        offset: 0x400 + virtualSize,
+        bytes: 0,
+      });
+    expect(
+      report.resources.find(({ name }) => name.kind === "name")?.name,
+    ).toMatchObject({ kind: "name", name: "7", utf16le_hex: "3700" });
+    expect(report.icon_groups[0]?.images).toMatchObject([
+      {
+        resource_id: 1,
+        candidate_resource_indices: [0, 1],
+        same_language_resource_index: 0,
+      },
+      {
+        resource_id: 99,
+        candidate_resource_indices: [],
+        same_language_resource_index: null,
+      },
+    ]);
+    const response = await client.callTool({
+      name: contract.name,
+      arguments: { path },
+    });
+    expect(response.isError).not.toBe(true);
+    const mcp = contract.outputSchema.parse(response.structuredContent);
+    expect(mcp.subject).toEqual(evidence.subject);
+    expect(mcp.evidence_id).toBe(evidence.evidence_id);
+    expect(mcp.normalized_result).toEqual(evidence.normalized_result);
+    const text = response.content.find(({ type }) => type === "text");
+    if (text?.type !== "text") throw new Error("Missing MCP text Evidence");
+    expect(contract.outputSchema.parse(JSON.parse(text.text)).evidence_id).toBe(
+      evidence.evidence_id,
+    );
+    expect(await readFile(path)).toEqual(fixture.bytes);
+  }
+};
+
 cliTest(
   "inspects PE32/PE32+ resources through compiled CLI and real stdio MCP without an active target",
   async ({ cli }) => {
@@ -102,7 +281,6 @@ cliTest(
       stderr: "pipe",
     });
     const client = new Client({ name: "pe-resource-acceptance", version: "1" });
-    const contract = toolContract("inspect_pe_resources");
     try {
       await client.connect(transport);
       const inventory = await client.listTools();
@@ -122,56 +300,8 @@ cliTest(
       expect(JSON.stringify(session.structuredContent)).toContain(
         "inspect_pe_resources",
       );
-      for (const plus of [false, true]) {
-        const fixture = peResourceFixture(plus);
-        const path = join(root, plus ? "resource64.exe" : "resource32.exe");
-        await writeFile(path, fixture.bytes);
-        const result = await cli.run({
-          arguments: ["inspect-pe-resources", path, "--json"],
-        });
-        expect(result.exitCode).toBe(0);
-        const evidence = contract.outputSchema.parse(result.json);
-        const report = peResourcesSchema.parse(evidence.normalized_result);
-        expect(evidence.subject?.digest).toMatchObject({
-          sha256: createHash("sha256").update(fixture.bytes).digest("hex"),
-        });
-        expect(report.coverage).toMatchObject({
-          status: "complete",
-          resources: 5,
-        });
-        expect(report.resources[0]?.payload.sha256).toBe(
-          createHash("sha256").update("ICON").digest("hex"),
-        );
-        expect(
-          report.resources.find(({ name }) => name.kind === "name")?.name,
-        ).toMatchObject({ kind: "name", name: "7", utf16le_hex: "3700" });
-        expect(report.icon_groups[0]?.images).toMatchObject([
-          {
-            resource_id: 1,
-            candidate_resource_indices: [0, 1],
-            same_language_resource_index: 0,
-          },
-          {
-            resource_id: 99,
-            candidate_resource_indices: [],
-            same_language_resource_index: null,
-          },
-        ]);
-        const response = await client.callTool({
-          name: contract.name,
-          arguments: { path },
-        });
-        expect(response.isError).not.toBe(true);
-        const mcp = contract.outputSchema.parse(response.structuredContent);
-        expect(mcp.evidence_id).toBe(evidence.evidence_id);
-        expect(mcp.normalized_result).toEqual(evidence.normalized_result);
-        const text = response.content.find(({ type }) => type === "text");
-        if (text?.type !== "text") throw new Error("Missing MCP text Evidence");
-        expect(
-          contract.outputSchema.parse(JSON.parse(text.text)).evidence_id,
-        ).toBe(evidence.evidence_id);
-        expect(await readFile(path)).toEqual(fixture.bytes);
-      }
+      await expectPeInventoriesAcrossAdapters(cli, client, root);
+      await expectPeMappingOwnershipAcrossAdapters(cli, client, root);
       await expectPePaddingFailureAcrossAdapters({
         cli,
         client,

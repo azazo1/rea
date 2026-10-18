@@ -19,7 +19,7 @@ behavior, and complete CI evidence before merging.
 | `npm run test:boundary`           | Boundary, CLI boundary, MCP boundary, process boundary, and process-global projects                                     |
 | `npm run test:mcp`                | MCP boundary project                                                                                                    |
 | `npm run test:acceptance`         | Complete compiled CLI and MCP acceptance workflows                                                                      |
-| `npm run test:python`             | LLDB producer retention and launch contracts with a fake LLDB API; no native debugger required                          |
+| `npm run test:python`             | LLDB and mitmproxy producer contracts plus analysis-efficiency checks; no real debugger or proxy required               |
 | `npm run test:watch`              | Dirty source tests in watch mode, without build                                                                         |
 | `npm run test:watch:all`          | Changed tests from every project; builds at startup, so rebuild after production edits before relying on compiled tests |
 | `npm run check:changed`           | Cached typecheck/lint and branch-related source feedback                                                                |
@@ -98,9 +98,26 @@ isolated filesystem boundary tests because it loads both source and compiled
 module graphs. Adapter, other boundary, acceptance, and process-global projects
 retain per-file isolation. See `vitest.config.ts` for current settings.
 
-The reused CLI boundary workers cap V8 old space at 384 MiB, based on their
-profiled allocation and cleanup behavior. This encourages collection between
-files; spawned REA processes retain their own heap settings.
+Inject producer faults through scoped dependencies in shared workers: a module
+mock cannot replace a consumer that was imported earlier. Check these tests
+with the consumer preloaded as well as alone. For simulated protocol traces,
+use an acknowledged event barrier before asserting complete observations;
+a zero-duration capture does not guarantee queued events have arrived.
+
+Check advertised schemas after SDK conversion for every supported schema
+profile. Meta-schema validity does not establish client acceptance or useful
+rendered declarations. Keep canonical rejection checks separate from the
+intentionally reduced compact advertisement, and probe actual client renderers
+when changing schema representations.
+
+The reused CLI boundary workers cap V8 old space at 384 MiB for ordinary runs
+and 512 MiB with coverage enabled. Covered ADB fixtures exhaust the ordinary
+384 MiB budget; those fixtures also complete with the shared CLI graph preloaded
+at 512 MiB. This is a measured capacity control, not a suite-wide speedup claim.
+Both profiles keep the
+same bounded worker count, and spawned REA processes retain their own heap
+settings. Explicitly disabling coverage retains the ordinary profile; coverage
+provider options alone do not enable instrumentation.
 
 Vitest worker limits do not bound subprocesses launched within a test. Bound
 those batches separately so repeated CLI validation cannot oversubscribe the
@@ -187,6 +204,121 @@ Measure slow cases before pruning capacity coverage. Retain inputs beyond the
 formerly failing size/depth and distinguish cold runs, warm builds, coverage,
 and toolchain conditions when comparing timings.
 
+## Lifecycle regressions
+
+For changes to resource acquisition, readiness, cancellation, or cleanup, select
+the affected owners and applicable scenarios below. Include temporary snapshots
+and one-shot commands. Use public CLI/MCP workflows where practical and a
+controlled production seam for interleavings that cannot be reproduced reliably.
+
+| Scenario                                                                                | Assertion and control                                                                                                                                                                                                          |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Target admitted; startup still pending                                                  | Status preserves the readiness distinction and observed startup activity; readiness requires the provider's documented proof.                                                                                                  |
+| First handshake is late, absent, invalid, or recovered during close                     | Initial and recovery paths retain the same authenticated identity facts. Foreign run/token controls cannot authorize cleanup; authenticated idle/native work survives the unauthenticated listener deadline.                   |
+| Launch returns an error with a valid process handle                                     | Cover already-exited and still-live owned processes. Verify observed exit separately from creation; failed termination or unavailable identity remains unresolved.                                                             |
+| Cancellation arrives after workload exit, during result reads or temporary-root removal | Return typed cancellation with available partial observations and actual cleanup status. The non-aborted control succeeds; existing primary/cleanup failures keep their precedence.                                            |
+| Children have mixed health or cleanup outcomes                                          | Missing peer health does not erase an observed failure or activity. Idle plus unknown stays unknown. Retry a failed child without closing a successful peer again, including after a close-option change.                      |
+| Cleanup fails after success or primary failure                                          | Public output retains the completed observation or primary diagnostic, remaining resources, and owner recovery action. Restore the denied resource and verify the owning cleanup retry.                                        |
+| Target exits without an acknowledgement, or transport disappears while it stays alive   | Positive owned exit proof resolves target lifetime; other resources still need cleanup. Lost transport alone does not prove exit. Verify unrelated/attached targets survive and same-connection recovery works when supported. |
+
+Shared process-supervision controls separate leader exit from output closure.
+Cover output during held or failed cleanup, bounded retention and drain timeout,
+retry, and borrowed stream authority. The POSIX inherited-stderr control uses a
+separate pipe as a release barrier after leader exit; it does not establish
+native Windows Job Object behavior.
+
+Synchronize cancellation with the finalization boundary being tested; a fixed
+delay after dispatch does not establish that phase. Use markers, barriers, or
+owned cleanup seams while preserving real cleanup where feasible. Check server
+settlement and retained resources even if the MCP SDK rejects the client promise
+before the handler finishes. A cancellation during active execution does not
+cover cancellation during final cleanup.
+Use explicit abort reasons and assert their identity at admission and after
+provider completion, alongside retained observations and cleanup state.
+
+Electron fuse regressions cover actual descriptor close denial and retry through
+the built CLI, same-connection MCP recovery, mixed descriptor outcomes, and
+server shutdown. Controlled seams cover cancellation during final close and
+after reader finalization, plus active-provider shutdown during preflight.
+They preserve real filesystem cleanup where possible; mocked launch boundaries
+do not establish real Electron teardown or naturally occurring OS failures.
+
+Active Electron cleanup controls retain independent transport and process-family
+owners, block replacement captures until recovery, and retry only unresolved
+owners. Cover late close acknowledgement and rejection after a wait deadline,
+opaque rejection reasons, cancellation during failed finalization, and missing
+lineage followed by a confirmed passive family census. Windows controls require
+a fresh lineage observation and do not signal cached descendant PIDs after root
+termination. Simulated Windows controls do not establish native Windows behavior.
+
+For atomic writes, exercise cancellation on both sides of the documented commit
+point and preserve any publication receipt. A late interruption does not prove
+that no output was published.
+
+For successful provider reports, test cancellation immediately before the report
+reaches the application workflow as well as during provider cleanup. Validate
+the report before classifying completion: a valid report must retain its Evidence
+on cancellation, and an invalid report must keep its output error. Exercise both
+the provider boundary and the shared CLI/MCP workflow; a downstream guard does
+not repair the provider's own completion contract. When callers share startup,
+cancel each waiter independently and verify that the last departure awaits owned
+cleanup while interested peers can still reach readiness. Repeat the same
+shutdown event after a cleanup failure to verify that its listener can retry.
+Exercise non-default lifecycle deadlines through queued requests and their
+consumers; default-only controls cannot detect dropped request options.
+
+For descriptor-backed reads, inject a close failure after a successful read and
+after a primary read or cancellation failure. Verify that the exact descriptor
+remains owned, both failures survive, and a later close retries it. Repeat
+admission attempts while close still fails: no additional descriptor or
+native command should start. Restore close and verify that the exact owner
+resolves the originating cleanup marker and allows later work, while the earlier
+failure remains available as a diagnostic. Retain errors returned by multiple
+failed retries, including admission and shutdown aggregates, and assert that
+each becomes complete after recovery. For an aggregate with multiple owners,
+release one owner while another still fails and assert that it remains incomplete.
+Cover recovery before the
+caller-specific error is bound to its retained owner, as
+another request can retry cleanup concurrently. Confirm that an already released
+owner resolves a later binding too. Include
+admission failure after opening the descriptor. If caller cancellation returns
+before an inspection settles, gate its final read or close and verify that
+session shutdown waits for the owned work and reports any retained resources.
+Gate a later read in a multi-read inspection, not only its first read. Overlap
+operations so one retains a failed descriptor while another reaches its next
+read; both the operation and shutdown must settle without nested-admission
+deadlock. Deny child close and verify its containing root survives until retry.
+
+Exercise publication on filesystems without hard links using an unsupported-link
+seam. Check exclusive destination creation, stat/write/close failures, completed
+output receipts, and cancellation at the documented cutoff. A streamed fallback
+has different visibility from an atomic hard-link commit and must report it
+accurately. For Windows command supervision, keep a descendant writing after its
+leader exits, deny cleanup observation, and verify a competing writer remains
+excluded until the exact Job Object closes. Portable doubles cover retry logic;
+the native Windows lane must establish actual process-tree behavior.
+
+Supervisor tests must observe process exit, output-pipe closure, and IPC
+disconnection separately. In the pinned Node runtime, a parent-initiated IPC
+disconnect can omit the aggregate `ChildProcess` close event. Join the actual
+resource observations before reporting completion; process exit alone does not
+establish pipe or process-tree release.
+
+When changing an internal helper contract, check its JavaScript verifier and
+subprocess-script consumers alongside TypeScript references. Source typecheck
+does not check those calls; run their orchestration tests against the built
+modules, including the verifier's failure and cleanup paths.
+
+Representative regressions include
+[process cleanup-time SIGINT](https://github.com/morluto/rea/blob/e78455338fe2d06c4cd03d59cbf33473d754998b/tests/boundary/process/processCaptureCancellationAdapters.test.ts),
+[late authenticated cleanup](https://github.com/morluto/rea/blob/e78455338fe2d06c4cd03d59cbf33473d754998b/tests/boundary/providers/hopper/hopperClient.handshakeRecovery.test.ts),
+[LLDB launch and finalization](https://github.com/morluto/rea/blob/e78455338fe2d06c4cd03d59cbf33473d754998b/tests/boundary/providers/native/lldbCallTracerFailures.test.ts),
+[composed child ownership](https://github.com/morluto/rea/blob/e78455338fe2d06c4cd03d59cbf33473d754998b/src/application/binary/CompositeProvider.test.ts),
+and [public CLI cleanup denial](https://github.com/morluto/rea/blob/e78455338fe2d06c4cd03d59cbf33473d754998b/tests/boundary/cli/wasmCleanupCli.test.ts).
+These controlled probes do not replace the matching real-provider lane. Record
+the base failure, passing control, exact host/provider, verified cleanup, and
+unavailable coverage; a missing engine is not a pass.
+
 ## Behavioral depths
 
 | Depth        | Location                | What it proves                                                                                        |
@@ -222,6 +354,11 @@ remain under `tests/fixtures/**`.
 The process-global Vitest configuration contract rejects new direct temporary-root
 creation outside the workspace seam and its narrowly documented boundary/package
 exceptions.
+
+The shared temporary-directory and workspace helpers preserve caller labels
+under an owned `rea-` prefix when needed. `npm run verify:test-temp-hygiene`
+uses the same ownership rule to find retained fixtures under a private temporary
+root. Third-party caches remain outside that ownership rule.
 
 Real Hopper, Ghidra, IDA, browser, package, and managed-code claims belong to their
 explicit `npm run verify:*` lanes. The reconstruction-readiness lane also
@@ -262,21 +399,142 @@ CI owns coverage; aggregate and domain/contract thresholds are maintained in
 `vitest.config.ts`. They are glob-specific and never updated automatically.
 Coverage does not replace named boundary or real-provider scenarios.
 
-CI runs six native Vitest shards without retries. Each shard emits a blob
-report; the merge job produces aggregate coverage plus JUnit and JSON timing
+The `reverse-tools` commands run the focused tests and report coverage and
+mutation results without an additional percentage requirement. Test failures,
+invalid mutation configuration, and runner failures still fail the check.
+Mutation targets cover reviewed production behavior, including signal-terminated
+commands, Cutter descriptor identity, debugger cleanup ownership, GDB command
+exit and cancellation, and Rizin startup, timeout Evidence, and process exit.
+A second exhaustive pass runs the focused Cutter and Rizin timeout semantics tests against every compilable
+selected mutant to avoid relying on per-test mutation coverage associations;
+Stryker reports compile-error mutants separately because those cannot execute
+tests. Both passes resolve named syntax owners, scoped declarations, guards,
+callbacks, and reviewed expressions from the current TypeScript source; no
+hand-maintained line ranges select mutations. Missing, ambiguous, or malformed
+source targets stop configuration before mutation generation. The selections
+retain their review scope rather than expanding to whole source files. The
+focused suite also exercises affected MCP routes and the Python Cutter bridge.
+Contract, integration, and real-provider lanes complement these focused tests;
+simulated providers do not establish real-provider behavior.
+
+Required CI retains fresh reverse-tools coverage and preflights both canonical
+Stryker configurations with `--dryRunOnly`. These preflights resolve the owned
+targets, instrument the source, and execute the real initial tests. Invalid
+configuration, target resolution, and initial test failures still fail the job.
+Preflights execute no mutants and produce no mutation-outcome report. Both fast
+feedback and full qualification, including exact-revision release qualification,
+require coverage and both preflights. A failed, canceled, skipped or missing
+selected quality job still fails the required gate.
+
+The separate **Mutation sweep** workflow runs both complete configurations daily
+and on manual dispatch, in two isolated jobs. It is a maintenance check outside
+the PR and release publication gates. `ci:full` requests full regression,
+coverage and provider qualification; it does not request a complete mutation
+sweep. Use the Mutation sweep workflow to request that result. Targets,
+checkers, concurrency, deadlines and the existing non-blocking mutation-score
+threshold are unchanged. `npm run test:mutation:reverse-tools` also retains both
+complete passes for local callers.
+
+The two passes write separate JSON and HTML reports under `reports/mutation/`:
+`reverse-tools` and `reverse-tools-semantics`. Required CI retains focused
+coverage; the sweep retains each configuration's JSON/HTML reports separately.
+Both retain available diagnostics for seven days after failure and skip uploads
+on cancellation. Artifact names identify the tier or configuration and run
+attempt. A successful sweep requires both jobs and their nonempty reports;
+partial diagnostics and preflights do not establish complete mutation outcomes
+or qualify the release revision for mutation coverage.
+
+Fast CI starts the source-only projects after classification, independently of
+build and static checks, and runs five built-dependent shards after the build.
+The six test jobs still select every portable test. Full qualification keeps six
+complete Vitest shards with coverage. Neither tier retries tests. Canonical
+project ownership lives in `scripts/lib/test-projects.mjs`, shared by Vitest,
+CI group execution, and development-test preparation. A test importing compiled
+verifier code belongs to the built group even if its directory is conformance.
+Source and built blobs have separate labels to prevent merge collisions.
+Each test job emits a blob report; the merge job produces JUnit and JSON diagnostics, a module timing
+report, plus aggregate coverage during full qualification. It retains available
 reports even when a shard fails, uploads available diagnostics, and writes the
 slowest files to the workflow summary. Partial reports are marked diagnostic
 only. Failed, cancelled, or missing selected shards still fail the required gate,
-and aggregate coverage thresholds remain enforced by the merge command.
-Only successful complete merges publish the small `test-timings` artifact, with
+and aggregate coverage thresholds remain enforced in full qualification.
+Only successful complete full-tier merges publish the small `test-timings` artifact, with
 checkout-relative paths; the build job downloads that artifact for the sequencer
-instead of the coverage/JUnit bundle. Missing history falls back to native
+instead of the coverage/JUnit bundle. Timing weights come from Vitest module
+diagnostics and include tests and hooks, worker preparation, environment,
+imports, and setup. Import timings already include transform waits, which are
+not added again. The weights describe file costs under the measured worker and
+coverage settings; their sum is not workflow elapsed time. The diagnostic
+artifact retains the phase breakdown, while shard history keeps only each
+file's total. Legacy test-body-only history and missing history fall back to native
 sharding. Static checks, documentation, build, package verification, and
 real-system lanes remain separate jobs so one kind of evidence cannot stand in
-for another.
+for another. Workflow syntax and expression validation runs inside the required
+static-check job when workflow changes select it, avoiding a separate runner.
+Native, provider, fixture, SQLite compatibility, and website lanes wait for
+static checks to succeed before allocating their runners. This avoids spending
+those runner slots on revisions that already fail static validation. Portable
+test shards and documentation checks remain independent of static results, so
+they can still provide diagnostic feedback. The required gate rejects skipped
+selected lanes when static checks fail; passing revisions retain all selected
+coverage. This ordering reduces peak demand on invalid revisions but can add
+static-check waiting to otherwise passing runs; it is not a measured reduction
+in end-to-end latency.
+
+Core jobs have execution limits of five minutes for classification, ten minutes
+for static checks, builds, docs, and report merging, and thirty minutes per
+portable test shard. These limits leave headroom for cold setup and full coverage
+while preventing a hung job from holding the active main run for hours. They do
+not bound runner queue waiting. Timeouts still fail the required gate.
+
+The separate `CI timings` workflow also diagnoses missing, startup-failed,
+queued/running, approval-required, canceled, and failed PR CI through bounded,
+read-only API scans. Incomplete pagination or changing identity stays unknown.
+It never closes/reopens PRs, reruns workflows, posts comments, or changes gates.
+The timing manifest retains each run's event and head branch, including explicit
+unknowns, so PR runs cannot consume the eligible-main comparison budget.
+Its static failure report compares supported lint/duplication diagnostics with
+failed main runs using exact source, ancestry, task hashes, and toolchain proof.
+A match describes those diagnostics only; it does not establish that every
+failure in a job came from main. Duplication reports retain the actual checker
+exit result, so passing duplication checks preserve lint failures and caller
+thresholds remain owned by the producer. Missing checker outcomes leave
+those duplication diagnostics unclassified. Missing historical receipts remain unknown.
+The reporter executes only trusted default-branch code and parses whitelisted
+JSON artifact members without executing artifact content. Reports and limits
+are retained in `ci-health-diagnostics`; its ten-minute job limit covers the
+existing four-minute timing collection plus the bounded diagnostic stages.
+
+Shard-count reduction remains deferred: the available successful timing sample
+covers an older inventory, and file phase weights are not job wall time. The
+one-source/five-built split retains six test jobs; it makes no hosted speedup
+claim. Current complete timings and completed candidate hosted runs are needed
+before enabling a smaller adaptive matrix.
+
+The separate `CI timings` workflow batches recent completed CI and Release runs
+hourly or on manual dispatch. It uploads `ci-job-timings-batch` with raw API pages and
+a normalized point-in-time report for each collected workflow attempt, plus a
+batch manifest describing examined coverage, failures, and limits. Overlapping
+lookback windows may collect an attempt again; identify records by run ID and
+attempt. Each batch examines at most 100 completed runs per workflow created in
+the preceding 24 hours, with a four-minute API collection budget. It collects the
+latest attempt of each selected run and does not claim an exhaustive archive.
+It runs the reporter from the trusted default branch with read-only permissions,
+treating workflow runs as API data. It does not allocate a new reporter job for
+every completed, cancelled, or skipped workflow. Reports separate queue
+waiting (`created_at` to `started_at`) from completed execution and report
+percentiles plus matched `npm ci` and artifact-step durations.
+Queue excludes dependency waiting before job creation and does not establish
+whether account concurrency or runner availability caused the wait. Queued jobs with
+placeholder start times, skipped jobs, and missing or invalid timestamps remain
+unknown. The reporter targets each selected run and attempt explicitly.
+Summed job elapsed time is parallel work, not workflow wall time, CPU time,
+memory usage, or billing. Step names identify samples, not complete transfer
+costs. Its queue, execution, and failures are independent of the required gate
+and publication. CPU time and peak process-family memory are not measured by this API.
 
 The build job saves portable Turbo outputs across runs. Eight Linux real-system
-lanes restore this cache without waiting for the build job. The shared action
+lanes reuse its current-run artifact; standalone dispatches restore the cross-run cache. The shared action
 derives its key from `test:prepare --dry=json` task hashes, runner OS and
 architecture, `.npmrc`, `.nvmrc`, and the lockfile; test-only changes can reuse compiled outputs. Every
 build and verification command still runs, so Turbo checks task inputs and
@@ -286,7 +544,15 @@ that generator's entry. Native outputs are not stored in this cache.
 
 Native package jobs, the Windows curated lane, and the Apple artifact lane reuse
 the same workflow's Turbo cache for portable compiled JavaScript, skills, and
-catalogs. The Windows lane relies on the Linux static job for typechecking. They retain the normal build and prepack
+catalogs. The key parser retains the validated `test:prepare` task identities in
+`.cache/ci-build-plan.json`; staging reads this plan without starting another
+Turbo run that could evict cache entries. The producer stages matching archives,
+metadata, and available manifests into `.cache/ci-build-cache/`.
+`portable-build-cache.json` records availability per task. Evicted or partially
+missing entries are omitted as whole entries, and consumers rebuild cache misses,
+including when every entry is unavailable. Malformed plans, non-file entries,
+and I/O errors other than disappearance still fail publication. Older cross-run entries stay in the
+original cache. The Windows lane relies on the Linux static job for typechecking. They retain the normal build and prepack
 commands, which restore matching outputs or rebuild on a cache miss. Native
 artifacts, dependency installs, package archives, and runtime verification remain
 host-local. Keep platform-dependent outputs out of this shared cache.
@@ -300,6 +566,17 @@ changes also require `npm run verify:package`. The full-gate benchmark measures
 that explicit lane, not the routine iteration requirement.
 
 ## Real-toolchain verification lanes
+
+Linux Rizin debugger ownership changes require a separate real-provider gate on
+Rizin 0.7.4. Run
+`npm run test:focused -- tests/boundary/providers/RizinInferiorTty.test.ts`.
+This test verifies the caller-selected TTY against the actual inferior's file
+descriptors, confirms `dbg.exitkills=false`, detaches through the `olj`/`o-`
+protocol, and checks that the target survives debugger close and writes to the
+selected TTY. The suite is included in the reverse-tools Vitest and mutation
+typecheck selections; its real-provider assertions skip when Rizin 0.7.4 is
+unavailable. Run the focused command above on a host with that provider for the
+explicit real-provider verification gate.
 
 Each real-toolchain command must require only the host tools needed to prove
 its stated claim. Use a host-native fixture for host/provider acceptance, and
@@ -344,8 +621,9 @@ adds in-place reparse, breakaway, environment, and token observations.
 The separate `scripts/verify-windows-native-inspection.mjs` lane uses the
 `.cache/windows-native-inspection-fixture` artifact built on Linux with
 `node scripts/build-windows-native.mjs --inspection-fixture`. Its controlled
-first deletion failure checks retained NTFS ownership, later-query recovery,
-successful-admission caching, and environment-teardown cleanup. It neither
+first deletion failure checks retained NTFS ownership across a same-volume
+rename, later-query handle-based recovery, successful-admission caching, and
+environment-teardown cleanup. It neither
 establishes the cause of the intermittent #1701 host failure nor replaces
 verification with the shipped production artifact.
 `npm run verify:ghidra:windows:package` additionally packs and installs REA into
@@ -473,11 +751,12 @@ See [Android analysis](android-analysis.md) for boundaries and resource budgets.
 
 `verify:jeb` requires a caller-started JEB client serving MCP at
 `REA_JEB_MCP_URL` (default `http://127.0.0.1:8425/mcp`) with a project
-already open, and verifies real CLI client inspection, unit listing coverage,
+already open, and exercises shared application/provider client inspection, unit listing coverage,
 and method decompilation. The script records the engine's exact response to
-`open_jeb_project`; JEB 5.48.0 headless instances do not advertise that tool.
+`open_jeb_project`; the earlier licensed 5.48.0 headless verification did not
+advertise that tool.
 REA does not install or launch JEB; see [JEB analysis](jeb-analysis.md) for
-the bring-your-own boundary. Verified against JEB 5.48.0 serving
+the bring-your-own boundary. The earlier licensed build was verified against JEB 5.48.0 serving
 `jeb-mcp-server` 1.3.0 at four scales: a compiled Java class fixture, a
 locally built signed probe APK with a launcher activity (manifest, v1/v2/v3
 certificates, dex bytecode, filtered and paginated listing), the published
@@ -488,7 +767,12 @@ decompilation through both CLI and MCP, and the official Flutter Gallery
 analyzed as native code (75k methods on arm64) and decompiled through both
 CLI and MCP with explicit unit selection, plus the thin Java wrapper and
 decoded manifest. The dedicated Dart snapshot processor and `run_script`
-remain GUI-only surfaces in JEB 5.48.0 headless.
+remained GUI-only surfaces in that headless build.
+The separate [Linux CE native audit](../experiments/analysis-efficiency/jeb-linux-native.md)
+uses the official CE `5.48.0.202610071539` direct CLI launcher and real
+CLI/stdio MCP ELF workflows. That audit does not qualify CE Java/Android
+decompilation or GUI project opening, and it does not replace the licensed
+verification above.
 Authenticated IPA and macOS application inventory projection is documented in
 [Apple application analysis](apple-application-analysis.md).
 
@@ -601,6 +885,12 @@ records independent symbol/directory/SHA oracles; it never executes the target.
 Linux also builds stripped, ordinary-native and small malformed/ambiguous/layout
 negative inputs. The optional Windows fixture workflow builds a PE on a Windows
 runner; analyzing that PE on Linux does not verify a Windows Ghidra host.
+On a local Windows host, the .NET 8 ILCompiler finds the linker only through
+Visual Studio 2019 or 2022 (`vswhere -version [16,18)`). With only Visual
+Studio Build Tools 2026 installed, open its x64 Developer Command Prompt.
+In that same `cmd.exe` session, run `set IlcUseEnvironmentalTools=true` and
+then `npm run build:fixtures:nativeaot`. Running `vcvars64.bat` as a child of
+PowerShell does not preserve its environment in the parent PowerShell session.
 
 Build the clean pinned upstream adapter with `build:ghidra:nativeaot`, then set
 `REA_GHIDRA_NATIVEAOT_JAR`. Run `verify:ghidra:nativeaot -- symbols`, `-- stripped`,
@@ -637,7 +927,9 @@ use `--second-procedure rea_fixture_subtract --second-marker='- 13'`.
 The lane invokes the production CLI dispatcher and connects the pinned MCP
 client SDK to the production REA server. It verifies function Evidence and
 CLI/MCP parity, inventory/search, pseudocode, instructions, xrefs, malformed
-input, original-input preservation, and lifecycle cleanup. For headless
+input, original-input preservation, and lifecycle cleanup. The headless
+profile also checks containing procedures, the admitted program as the
+document, address context, and feature tracing. For headless
 analysis it confirms that the owned database IDs disappear from upstream
 discovery and private workspaces are removed. For attached analysis it confirms
 the existing GUI target remains reachable with the same input identity.
@@ -664,6 +956,38 @@ Native IDA MCP verification uses `"protocol": "native"` with an already-running 
 
 The initial Linux x64 IDA Free 9.4 run used native MCP 1.1.2 with a local navigation correction. Windows x64 verification uses **IDA Pro 9.3**, the two-function public fixture, and the shipped Windows `whoami.exe` application. The native plugin was built from upstream `c9d15d98e8a143fc74f6e14037c48f63889b6d6c`, including the merged navigation fix, with a local loopback-listener change. Production CLI/MCP parity, switching, identity and cleanup passed. Correctness and performance measurements are recorded in the [Windows native verification notes](https://github.com/morluto/rea/blob/main/experiments/analysis-efficiency/ida-native-windows.md). Stock 1.1.2 switching, native macOS, and Windows IDA Free remain unverified. See the [native bridge prerequisites](ida-provider.md#optional-native-ida-mcp-bridge).
 
+## Kuna lane
+
+`npm run verify:kuna` requires a caller-supplied `kuna` in `REA_KUNA_COMMAND`
+and a host C compiler (`REA_CC`, default `cc`) with `strip` and `nm`. It builds a
+source-owned fixture with non-inlined calls, with symbols and stripped, then verifies through MCP that
+callers, callees and exact incoming xrefs agree with those calls, graph/path
+composition reaches the callee, reference-only queries leave project/staging
+entries unchanged, repeated relationships reuse the graph, and
+the first cold pseudocode answer comes from a single-function run or an export
+that already finished, assembly waits for and serves from that export, and
+pseudocode and both dossier facets match their recorded file spans and digests,
+a fresh server reuses the export without rebuilding it, staging is empty after
+a completed export, and no owned process survives. Pass
+`--targets DIR --functions a,b` to add caller-built binaries laid out as
+`DIR/<flavor>/<name>` beside `<name>.stripped`; addresses come from the
+symbol-bearing build. `--compare-ghidra` with `GHIDRA_INSTALL_DIR` runs those
+caller-built functions through Ghidra (it refuses to run without `--targets` and
+`--functions`, an empty matrix, or names missing from every supplied target) and
+reports latency, sampled process-tree CPU and peak memory, UTF-8 response size,
+and goto and warning-marker counts. Those counts are not a correctness judgement,
+and model tokens are not measured. Reference timings and response sizes are
+reported separately; reference caches expire when the server closes. `--report PATH` writes the JSON report.
+
+The first matrix run used Kuna 1.833 and Ghidra 12.1.4 with JDK 21 on macOS
+arm64. It covered zlib 1.3.2 `minigzip`, coreutils 9.9 `sort` and the sqlite
+3.54.0 shell, built at `-O2` for ELF x86-64, ELF AArch64, Mach-O arm64 and
+Mach-O x86-64, each with symbols and stripped. A separate Linux x86-64 run verified
+the fixture and system zlib 1.2.13 / SQLite 3.40.1 libraries through MCP, including
+cached byte spans and a Ghidra comparison. See the [Linux report](https://github.com/morluto/rea/pull/3854#issuecomment-6185870391)
+for measured scope and limitations. Windows, PE and universal Mach-O remain
+unverified by this lane.
+
 ## DOS Ghidra analysis
 
 `npm run verify:ghidra:dos` requires the supported Ghidra and JDK installation
@@ -687,6 +1011,26 @@ truncation constraint, while leading-zero coordinates still resolve correctly.
 It has the same Ghidra/JDK prerequisites as the MZ lane. Neither lane claims DOS
 runtime or PC-98 device execution.
 
+`npm run verify:ghidra:6502` uses `ca65` and `ld65` to build the source-owned
+NMOS 6502 fixture from `tests/conformance/ghidra/6502.s` and `6502.cfg`. Set
+`REA_CA65` and `REA_LD65` for non-PATH installations (tested with cc65 `V2.19`).
+With an installed Ghidra 12.1.4 and full JDK, it verifies real CLI/stdio MCP
+mapping parity, exact source bytes, functions, a direct call reference,
+decompilation, 16-bit overflow rejection without replacing the active session,
+and runtime cleanup. Windows additionally requires the matching native addon;
+its verifier lineage remains explicitly unavailable outside the provider's
+retained Job Object, as in the other Windows lanes.
+
+`npm run verify:ghidra:m68k` needs no assembler: its 22-byte big-endian 68000
+fixture is source-owned annotated hex in the verifier, loaded at `0x1000`. With
+an installed Ghidra 12.1.4 and full JDK on Linux or macOS, it verifies the
+`68000:BE:32:default` BinaryLoader import, real CLI/stdio MCP load-image parity,
+exact source bytes, both functions, the `bsr.b` call reference, decompilation
+through address and file offset, rejection of a misaligned entry and of a mapping
+past `0xffffffff` without replacing the active session, and runtime cleanup.
+Windows Ghidra P0 does not admit m68k, so this is not a Windows lane. The lane
+has been run on macOS; Linux has not been exercised.
+
 `npm run verify:ghidra:raw` uses a generated ARM little-endian headerless image
 through the compiled CLI and stdio MCP server. With the same Ghidra/JDK
 prerequisites, it checks preparation and bridge startup, verified load mappings,
@@ -696,6 +1040,44 @@ cleanup. Six-byte x86 and x86_64 controls also verify supported compiler
 specifications, independent mappings, unchanged bytes, and decompilation of a
 known return value. AArch64 remains covered by deterministic tests rather than
 this real-provider lane. See [raw binary analysis](raw-binary.md).
+
+`npm run verify:ghidra:address-context` runs on Linux with a caller-installed
+Ghidra, full JDK, and an x86-64 ELF GCC toolchain (`CC` selects another compatible
+compiler). It builds
+`tests/conformance/c/pie-address-context.c` as a PIE ELF without executing it.
+The compiled CLI and real stdio MCP workflow must expose the measured image
+base, retain segment address spaces, agree on the overview, resolve explicit and
+numeric file offsets, and reject unmapped analysis addresses with actionable
+guidance. It checks the reverse `address-to-file-offset` mapping, file-coordinate
+Evidence locations, and the suggested CLI search and load-image commands.
+The verifier compares mapped bytes with the source file and checks source
+identity, session preservation after failed lookup, owned runtime cleanup, and
+verified empty process lineage. This lane does not establish Windows or macOS
+real-provider coverage.
+
+For source-identity boundaries that a normal single-file import cannot create,
+`tests/conformance/ghidra/ReaFileOffsetSourceProbe.java` exercises the production
+bridge against real Ghidra `FileBytes`. It rejects auxiliary and partial sources,
+checks the original target's round trip, and retains ambiguity when duplicate
+target bytes have distinct loaded mappings. Injected decompiler failures and
+cancellation verify that completed source/function resolution facts and backend
+failure codes survive; these injections do not establish natural engine failures.
+On Windows, after creating the
+source-owned PE fixture, run from the repository root:
+
+```powershell
+node scripts/create-ghidra-windows-fixture.mjs
+$proofRoot = Join-Path $env:TEMP 'rea-file-offset-source-proof'
+New-Item -ItemType Directory -Path $proofRoot -Force | Out-Null
+Copy-Item bridge/ghidra/ReaGhidraBridge.java, bridge/ghidra/ReaGhidraExtensions.java, tests/conformance/ghidra/ReaFileOffsetSourceProbe.java -Destination $proofRoot
+& "$env:GHIDRA_INSTALL_DIR/support/analyzeHeadless.bat" $proofRoot source-proof -import "$PWD/build/fixtures/rea-ghidra-windows.exe" -scriptPath $proofRoot -postScript ReaFileOffsetSourceProbe.java -deleteProject
+```
+
+Require the `REA_FILE_OFFSET_SOURCE_OK` marker and no script errors; Ghidra may
+exit successfully even when a post-script fails. The probe edits only its
+temporary analysis database and does not execute the fixture. This producer
+regression supplements public CLI/MCP coverage and does not establish Linux
+host behavior or native process-supervision controls.
 
 ## Apple Interface Builder archives
 
@@ -717,10 +1099,31 @@ or the GitHub issue and pull-request templates run formatting and
 generated-document validation, including the small onboarding example consistency
 suite, without the source-test shards or native package
 lanes. Classification compares the PR head with its merge base, so later
-base-branch changes do not expand that scope. Static and coverage aggregate jobs
+base-branch changes do not expand that scope. Static and portable-test aggregate jobs
 remain present and fail if classification fails. Every code change retains the
 complete six-shard Linux suite; individual test files are not selected by
 imports or filenames.
+
+Ordinary PRs also produce an **observational** test-selection plan. The candidate
+leaf-adapter ownership table lives in `scripts/ci/test-selection.mjs`, separately
+from provider-job scopes. It proposes keeping affected owners plus every unowned
+test, including all CLI/MCP, acceptance, composition, conformance, and process
+tests. Shared inputs, unknown paths, missing owner tests, and removed tests fall
+back to the complete inventory. Renames account for both paths. Main, scheduled,
+manual, and `ci:full` runs always propose the full suite.
+
+All six shards still execute the complete suite. The existing report merge
+compares the proposal with actual module outcomes and retains
+`.cache/ci-test-selection/report.json` in `test-results`, including selected and
+omitted paths, changed input paths, missed failures, unobserved files, scheduling weights, PR head and
+executed merge SHA. This adds no test reruns or runner jobs. Missing, duplicate,
+skipped, interrupted, or unhandled results cannot establish a complete comparison;
+even a complete passing comparison is not proof of ownership completeness.
+Before enabling omissions, review representative full-run comparisons and
+cross-owner consumers, including failures, and measure completed CI feedback and
+runner demand. There is no automatic promotion or switch to skip tests. The
+initial proposal measures only leaf producer-test omissions; it does not promise
+the savings of a broader affected-test planner.
 
 `scripts/ci/plan.mjs` selects lanes using the ownership table in
 `scripts/ci/scopes.mjs`. Provider implementation changes run their real-provider
@@ -735,10 +1138,32 @@ the Apple or Windows curated lanes invoke explicitly, which also select that
 lane. Edits to verifier entrypoints run only by manual, licensed or self-hosted
 workflows run static checks and the Linux suite. Website changes run website
 checks. Provider workflow changes validate the workflow and run that provider's
-verifier. Manual-provider/Android workflow changes run workflow validation only.
+verifier. Changes under `bridge/ghidra/` also select the `ghidra_bridge` lane,
+which compiles the packaged bridge sources against the pinned Ghidra 12.1.4
+jars with `npm run verify:ghidra:bridge-sources`. It never launches Ghidra or
+imports a target, so a missing import fails the PR instead of every Ghidra
+session. The launcher, compiler and package checks share named required source
+roles. The manifest must match the complete Java cohort, so deleting a helper
+or adding an unregistered dependency cannot silently change the shipped set.
+The preflight reuses the provider's Java Properties parser with the pinned Node
+toolchain's native type stripping, without an npm install or runtime build.
+The shared release policy owns the verified version and JDK major. CI checks
+the archive pin before downloading and verifies the extracted SDK version;
+changes to these source owners also select the compile lane.
+Manual-provider/Android workflow changes run workflow validation only.
+The four-version SQLite compatibility matrix has its own `sqlite` scope for
+SQLite implementation, contracts, CLI/MCP registration, fixtures, and shared
+runtime boundaries. SQLite and server-lifecycle test edits and the SQLite npm
+scripts also select it. Unrelated code edits retain the complete portable suite
+on the pinned Node version without starting four additional compatibility jobs.
+Full qualification retains every SQLite version.
 Shared process/contract/CLI boundaries, dependencies, other packaging inputs,
-unknown paths, and changes to the planner select the full baseline. Package
-script-only edits select their owning verifier when its entrypoint is
+unknown paths, and changes to the planner select the full baseline.
+CI timing collection, timing history, and test-report helper edits retain static
+checks and the complete portable suite without selecting unrelated host/provider
+lanes. Classification, qualification, gate, release receipt, and unknown CI
+scripts keep the broad fallback.
+Package script-only edits select their owning verifier when its entrypoint is
 identifiable; unknown or shared script changes select everything. Android
 build-script edits retain the Linux suite and workflow validation; real Android
 verification stays manual. Renames account for both paths.
@@ -746,38 +1171,90 @@ verification stays manual. Renames account for both paths.
 This narrower selection trades PR-time coverage for runner capacity. A change to
 unowned shared runtime code that fails only on arm64, macOS, Windows, the Apple
 artifact lane, or a provider lane that does not own the file is not caught on
-the PR; the main-push full baseline reports it after merge. Ownership globs do
+the PR; scheduled full qualification reports it after merge. Ownership globs do
 not follow imports. Use the `ci:full` label when a change may have native-host
 or provider effects outside its owners.
 
-Main pushes and manual dispatch retain the full baseline, including all portable
-provider lanes and the native matrix below. A `ci:full` PR label selects the full
-baseline on the next PR run; manual dispatch can request it immediately. Each
+Ordinary main pushes use the same owner scopes as PRs. Their diff starts at a
+successful ancestor push run of this CI workflow, rather than the preceding
+push: changes from failed or cancelled intermediate runs remain in scope.
+Missing, untrusted, or non-ancestor history selects every lane. The lookup is
+bounded to the last 100 successful push runs; lookup failures broaden selection.
+Every code change still selects all six portable shards, without coverage
+instrumentation in this fast tier. Ordinary PR matrices cancel remaining
+shards after the first failure; passing PRs execute the complete suite. Main,
+`ci:full`, scheduled, manual, and release qualification retain every shard's
+results after a failure. Available failed-shard reports remain diagnostic only:
+failed, cancelled, skipped, or missing selected shards cannot pass the gate or
+publish successful timing history. This deliberately avoids relying on an
+import graph for generated files, filesystem inputs, subprocesses, or bridges.
+
+Scheduled qualification is admitted hourly at minute 23. A forced full run at
+03:23 UTC refreshes runner and dependency drift every day. Other hourly runs
+can reuse a successful full-qualification receipt for the exact source SHA
+from the same repository's trusted CI workflow on its default branch. Both the
+receipt and original workflow run must be less than 24 hours old, so retrying an
+old gate cannot renew stale proof. Missing, expired, failed, foreign, or uncertain proof runs full
+validation; API lookup failure also runs full. Lookups examine at most 100 named
+receipts and three candidate runs within a 20-second budget. Reused runs select
+no validation lanes, identify the original run, and produce no new receipt, so
+reuse cannot indefinitely extend proof freshness. They make no fresh provider
+observation. Manual dispatch, `ci:full`, and exact release qualification always
+run full validation.
+
+Full qualification includes aggregate coverage,
+every portable provider lane, and all native hosts below. Adding `ci:full`
+immediately starts the separate `Full PR qualification` workflow against the
+label event's merge revision; subsequent PR revisions also select the full tier
+in normal CI while that label remains. Unrelated labels do not start validation
+jobs or replace the main CI checks. Manual dispatch also requests full validation.
+Fast-tier broad fallbacks retain all owner lanes and the three-host
+package matrix; Intel macOS and coverage remain full-tier obligations. Each
 classification job records its selection and broad-fallback reasons in the run
 summary. Representative Git-diff cases live in
 `tests/boundary/filesystem/ciChangeScope.test.ts`.
 
-`CI required` checks classification and every selected lane, rejecting failed,
-cancelled, or unexpectedly skipped work. Existing required check names are
-preserved; changing branch protection to require the new aggregate is a separate
-repository-settings operation. Newer commits cancel superseded CI for the same
-PR or main branch. Release publication has its own concurrency group and retains
-its package verification and public-registry canary. Licensed/self-hosted
+`CI required` checks classification and every selected lane,
+rejecting failed, cancelled, or unexpectedly skipped work. It rejects missing or
+unknown tiers and requires every canonical scope to be explicitly `true` or
+`false`; incomplete classification cannot silently omit verification lanes.
+The aggregate remains cancellable so superseded runs release their slots.
+Branch protection
+should require this aggregate, `Static checks`, `Portable tests`, and
+`Conventional PR title`. Title validation runs separately on PR opening,
+reopening, commits, and edits; correcting a title refreshes only this lightweight
+check. It reads title text through an environment variable, executes no PR code,
+and has no token permissions. Its separate concurrency group cannot cancel
+test runs. Fast PR runs cancel superseded feedback for the same PR. Main push
+runs keep one active run and the latest pending run for that branch.
+Scheduled/manual qualification has a separate concurrency group: active work
+finishes and only the latest pending run is retained. Release qualification uses
+its exact source SHA and cannot be cancelled by newer main pushes. Provider and
+website lanes inherit their caller's scheduling; reusable
+workflows have no independent cancellation group. Direct manual lane dispatches
+run independently on disposable hosted runners. Publication
+requires that qualification to succeed and consumes its exact verified tarball,
+checking source SHA, workflow run, run attempt, package/Node version and SHA-256
+before npm publication. Earlier attempts from the same workflow run are accepted
+when rerunning failed publisher jobs; future attempts and other runs are rejected.
+The public-registry canary still verifies the published package. Licensed/self-hosted
 provider workflows and the Android smoke test retain their explicit triggers.
 
 CI exercises the pinned Node.js runtime on native hosted runners:
 
-| Host                  | Runner             | Baseline checks                                                                          |
-| --------------------- | ------------------ | ---------------------------------------------------------------------------------------- |
-| Linux x64             | `ubuntu-latest`    | Installed package and real Node Inspector CLI/MCP                                        |
-| Linux arm64 (aarch64) | `ubuntu-24.04-arm` | Installed package and real Node Inspector CLI/MCP                                        |
-| macOS 15 arm64        | `macos-15`         | Installed package and real Node Inspector CLI/MCP                                        |
-| macOS 15 x64          | `macos-15-intel`   | Installed package and real Node Inspector CLI/MCP (main, dispatch and `ci:full` only)    |
-| Windows x64           | `windows-latest`   | Curated capabilities, native controls, installed package and real Node Inspector CLI/MCP |
+| Host                  | Runner             | Baseline checks                                                                             |
+| --------------------- | ------------------ | ------------------------------------------------------------------------------------------- |
+| Linux x64             | `ubuntu-latest`    | Installed package and real Node Inspector CLI/MCP                                           |
+| Linux arm64 (aarch64) | `ubuntu-24.04-arm` | Installed package and real Node Inspector CLI/MCP                                           |
+| macOS 15 arm64        | `macos-15`         | Installed package and real Node Inspector CLI/MCP                                           |
+| macOS 15 x64          | `macos-15-intel`   | Installed package and real Node Inspector CLI/MCP (hourly, dispatch, release and `ci:full`) |
+| Windows x64           | `windows-latest`   | Curated capabilities, native controls, installed package and real Node Inspector CLI/MCP    |
 
-macOS x64 is the slowest package host. Pull requests without the `ci:full` label
-omit it, so darwin x64 installed-package and Inspector regressions surface on
-the main-push full baseline rather than on the PR.
+macOS x64 is the slowest package host. Ordinary PRs and main pushes omit it,
+so darwin x64 installed-package and Inspector regressions surface in full
+qualification. Schedule admission can be delayed by GitHub; the hourly trigger
+does not guarantee an hourly completed result. Release publication waits for
+its own complete result at the exact released revision.
 
 Package lanes assert the actual Node platform/architecture before verification
 and record those values with the Node version. The package matrix runs up to
@@ -790,7 +1267,7 @@ filename cases.
 
 POSIX package verification resolves the runner's configured npm cache before
 creating disposable client homes and passes that location to its child installs.
-This reuses the download cache restored by `setup-node` while keeping client
+This reuses the download cache restored by the shared npm-cache action while keeping client
 configuration isolated. Installs retain their existing registry and integrity
 checks.
 
@@ -803,17 +1280,51 @@ The Linux source-test shards download a shared runtime and generated test
 metadata snapshot produced by the build job with `npm run test:prepare`. The
 snapshot includes `dist/`, generated skills, the MCP tool catalog, product
 catalog, and managed-conformance metadata. Each shard still installs the locked
-dependencies and runs its assigned coverage-enabled tests; it no longer
+dependencies and runs its assigned tests; full qualification enables coverage. It no longer
 regenerates the same metadata independently.
 
-The build job also retrieves the merged timing report from the last successful
-default-branch push and includes that same report in each shard's snapshot.
+The build job also finds an available `test-timings` artifact from a successful
+trusted default-branch scheduled or manual qualification and includes that same
+report in each shard's snapshot. The bounded lookup verifies the artifact's
+producer; newer schedules that reuse qualification without producing timings do
+not hide the last full run's artifact.
 CI assigns discovered files by historical duration, with a deterministic
 fallback weight for new files, rather than dividing only by file count. Every
-discovered file still belongs to exactly one shard; worker limits, project
-ordering, coverage instrumentation, and aggregate thresholds remain unchanged.
+discovered file still belongs to exactly one shard; worker limits and project
+ordering remain unchanged. The merge job rejects successful reports with missing,
+unexpected, or duplicate portable files. Coverage instrumentation and aggregate
+thresholds remain enforced in full qualification.
 Missing or unusable history falls back to Vitest's default assignment. Only
-timing data is reused; persistent compile caches remain disabled.
+timing data is reused; live provider results are never cached. Turbo outputs are
+restored by task hash, with trusted default-branch runs as cache writers and PRs
+as restore-only consumers. The static job also restores its Turbo snapshot;
+each task revalidates its own input hash before reusing outputs or diagnostics.
+The Node pin and npm install settings are global hash inputs. Knip includes its ignore rules and VitePress
+entry, so changes to those inputs cannot reuse an older successful check.
+
+The shared npm-cache action caches downloads, not `node_modules`, and every
+consumer still runs `npm ci`. Keys cover the runner OS, actual Node architecture,
+root lockfiles, and `.npmrc`. Only push, schedule, and manual events on the
+repository's default branch may save shared npm caches; PRs restore only.
+Static snapshots use the same write authority and are saved only after the
+static job's validation succeeds. Main warms the new cache namespace after
+merge; a cold cache or changed lockfile falls back to the normal install.
+This prevents each PR from saving another branch-scoped copy of the same
+download cache. It does not remove runner assignment waits.
+
+Portable owner-based test selection remains observational. Its reports compare
+proposed omissions with the full run; incomplete or skipped observations do not
+establish that fewer tests would preserve regression detection.
+
+The eight automatic browser, binary-layout, EVM, JavaScript-recovery,
+recorded-crash, and web provider lanes download `rea-build-cache` from their own
+run after the build and static jobs succeed. Their existing build commands still
+validate task hashes and rebuild mismatched inputs; provider observations always
+run. Provider-workflow-only edits also admit the build without enabling source
+test shards. Direct provider dispatches retain the cross-run restore-only cache.
+This removes repeated compilation on fresh source revisions, but adds the build
+as a prerequisite: a delayed build can delay provider admission. Compare queue
+and execution times before claiming an end-to-end speedup.
 
 These native baseline checks complement the Linux source-test shards and the
 separate Apple-artifact and real-provider lanes. Actual Hopper, Ghidra, IDA,
@@ -848,6 +1359,14 @@ establish passing Android coverage; inspect its execution receipt.
 
 The `termux-browser-diagnostics` artifact retains the Termux command log, exit
 status, and Android logcat on success or failure. The emulator is disposable.
+
+## Packet capture analysis
+
+`npm run verify:pcap -- --pcap PATH` exercises caller-supplied tshark and
+capinfos against a saved capture. Linux verification uses Wireshark 4.6.6
+and captures containing DNS, TLS and HTTP traffic. Native Windows and macOS
+engine behavior remains unverified; process fixtures do not establish it.
+See [Packet capture analysis](pcap-analysis.md) for contracts and budgets.
 
 ## Apple native metadata and UI
 
@@ -1062,7 +1581,12 @@ NUL-containing names. It compares exact WAT,
 section output and selected/tool digests through the compiled CLI and real MCP
 SDK, validates advertised schemas, checks identical CLI/MCP Evidence IDs and
 session bundle readback, retains invalid/truncated module diagnostics, preserves
-all inputs and checks workspace cleanup. Pass an installed package's
+all inputs and checks workspace cleanup.
+The lane also injects one cleanup denial for exact private runtime roots and
+input descriptors, checks recovered CLI errors, and verifies retry on the same
+MCP connection after repeated runtime-removal denial. These are controlled
+faults, not naturally occurring permission failures; no WASM target is executed.
+Pass an installed package's
 `scripts/rea.mjs` as the first argument to run the same lane against the package.
 `npm run verify:wasm:package` packs and installs REA into an isolated temporary
 prefix with lifecycle scripts disabled and runs the same required real-tool lane.

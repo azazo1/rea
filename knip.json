@@ -17,7 +17,12 @@
     "entry": ["docs/.vitepress/config.ts"]
   },
   "ignoreBinaries": ["mkfifo"],
-  "ignoreDependencies": ["electron", "esbuild", "webpack"],
+  "ignoreDependencies": [
+    "@stryker-mutator/command-runner",
+    "electron",
+    "esbuild",
+    "webpack"
+  ],
   "ignoreExportsUsedInFile": true,
   "rules": {
     "files": "error",

@@ -8,10 +8,15 @@ import { spawnOwnedProviderProcess } from "../../dist/process/ProviderProcess.js
 import { createSystemProcessOwnershipHost } from "../../dist/process/ProcessOwnershipObservation.js";
 import { liveProcesses } from "../../dist/process/ProcessOwnershipProcessTree.js";
 import { CdpConnection } from "../../dist/browser/CdpConnection.js";
-import { waitForBrowserDevtoolsPort } from "../../dist/browser/BrowserProcessStartup.js";
+import {
+  BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
+  waitForBrowserDevtoolsPort,
+} from "../../dist/browser/BrowserProcessStartup.js";
+import { requireOrdinaryWindowsVerifierCaller } from "./windows-ordinary-user-verifier.mjs";
 
 /** Launch the synthetic fixture browser and await CDP in its own verified process group. */
 export async function startRuntimeFixtureBrowser(executable, origin) {
+  await requireOrdinaryWindowsVerifierCaller();
   const profile = await mkdtemp(join(tmpdir(), "rea-real-web-runtime-"));
   let owned;
   try {
@@ -50,7 +55,7 @@ export async function startRuntimeFixtureBrowser(executable, origin) {
       stderr: () => stderr,
       // Match the broader real-browser verifier's allowance for cold Chrome
       // startup on shared runners; early process failures still reject at once.
-      timeoutMs: 60_000,
+      timeoutMs: BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
     });
     return {
       port,
@@ -147,21 +152,4 @@ async function stopOwnedBrowser(owned, profile) {
       );
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-}
-
-/** Attempt every owned cleanup and retain the original verification failure if cleanup also fails. */
-export async function closeRuntimeFixtureResources(tasks, primaryError) {
-  const failures = [];
-  for (const task of tasks) {
-    try {
-      await task();
-    } catch (cause) {
-      failures.push(cause);
-    }
-  }
-  if (failures.length > 0)
-    throw new AggregateError(
-      primaryError === undefined ? failures : [primaryError, ...failures],
-      "Runtime fixture cleanup failed",
-    );
 }

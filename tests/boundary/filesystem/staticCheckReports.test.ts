@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import { z } from "zod";
@@ -49,7 +49,7 @@ const lintDiagnostics = async (root: string) =>
       ),
     ).diagnostics;
 
-it("includes every actually linted file in both cached lint task inputs", () => {
+it("covers the lint inventory and root tool configs in resolved cache inputs", () => {
   const scan = spawnSync(
     process.execPath,
     [join(repository, "node_modules/oxlint/bin/oxlint"), "--debug=files"],
@@ -69,6 +69,7 @@ it("includes every actually linted file in both cached lint task inputs", () => 
       "run",
       "lint",
       "lint:built",
+      "knip",
       "--dry=json",
     ],
     {
@@ -99,6 +100,14 @@ it("includes every actually linted file in both cached lint task inputs", () => 
       files.filter((file) => !Object.hasOwn(task.inputs, file)),
       `${task.task} omits actual checker inputs`,
     ).toEqual([]);
+  const knip = tasks.find(({ task }) => task === "knip");
+  expect(knip).toBeDefined();
+  expect(
+    files.filter(
+      (file) => !file.includes("/") && !Object.hasOwn(knip!.inputs, file),
+    ),
+    "knip omits root tool configuration inputs",
+  ).toEqual([]);
 });
 
 it("summarizes warnings without losing their complete diagnostic records", async () => {
@@ -136,6 +145,36 @@ it("keeps lint errors failing and visible alongside the retained warnings", asyn
       expect.objectContaining({ severity: "error" }),
     ]),
   );
+});
+
+it("excludes translation staging while retaining authored website errors", async () => {
+  const root = await fixture();
+  for (const name of [".gitignore", ".oxlintrc.json"])
+    await writeFile(join(root, name), await readFile(join(repository, name)));
+  const authored = "website/public/assets/authored.js";
+  const staged =
+    "website/.i18n-regression/site/examples/notes-electron/main.js";
+  for (const name of [authored, staged]) {
+    const path = join(root, name);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(
+      path,
+      'const source = require("node:fs");\nconsole.log(source);\n',
+    );
+  }
+
+  const result = invoke(root, "lint");
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(1);
+  expect(result.stdout).toContain("1 errors, 0 warnings");
+  expect(result.stderr).toContain(authored);
+  expect(await lintDiagnostics(root)).toEqual([
+    expect.objectContaining({
+      severity: "error",
+      code: "typescript(no-var-requires)",
+      filename: authored,
+    }),
+  ]);
 });
 
 it("keeps malformed source failing with its parser diagnostic", async () => {

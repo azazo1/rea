@@ -51,6 +51,76 @@ import {
 import { parseJavaScriptSemanticGraph } from "../../../../src/domain/javascript/javascriptSemanticGraphSerialization.js";
 import { writeJavaScriptArtifactFixture } from "../../../fixtures/javascriptArtifactApplication.js";
 
+it("keeps excluded non-JavaScript files out of both semantic construction paths", async () => {
+  const root = await createTestTempDirectory("rea-js-semantic-applicability-");
+  await Promise.all(
+    (
+      [
+        ["a.js", "export const observed = 7;"],
+        ["b.js", "export const excluded = true;"],
+        ["native.node", Buffer.from([0, 1, 2, 3])],
+        ["data.json", '{"observed":7}'],
+        ["index.html", '<script src="./a.js"></script>'],
+        ["package.json", '{"name":"applicability","main":"a.js"}'],
+        [
+          "a.js.map",
+          JSON.stringify({ version: 3, sources: [], names: [], mappings: "" }),
+        ],
+      ] as const
+    ).map(([path, content]) => writeFile(join(root, path), content)),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(root, {});
+  const reader = createJavaScriptArtifactReader(root, "directory");
+  try {
+    const files = await readJavaScriptArtifactFiles(
+      reader,
+      snapshot,
+      undefined,
+      ["a.js"],
+    );
+    expect(
+      files.files.filter(({ text }) => !text.included).map(({ path }) => path),
+    ).toEqual([
+      "a.js.map",
+      "b.js",
+      "data.json",
+      "index.html",
+      "native.node",
+      "package.json",
+    ]);
+    const analysis = analyzeJavaScriptArtifactFiles(files);
+    const applicationGraph = buildJavaScriptArtifactGraph(
+      snapshot,
+      files,
+      analysis,
+    );
+    const full = buildJavaScriptSemanticGraph({
+      rootArtifactSha256: snapshot.manifest.root_sha256,
+      applicationGraph,
+      analysis,
+    });
+    const incremental = await reconstructJavaScriptArtifact({
+      input_path: root,
+      source_paths: ["a.js"],
+    });
+    for (const graph of [full, incremental.semantic_graph]) {
+      expect(
+        graph.nodes
+          .filter(({ kind }) => kind === "module")
+          .map(({ identity }) => identity.module_path)
+          .sort(),
+      ).toEqual(["a.js", "b.js"]);
+      expect(graph.coverage.status).toBe("partial");
+      expect(graph.unknowns.length).toBeGreaterThan(0);
+      expect(
+        new Set(graph.nodes.map(({ identity }) => identity.module_path)),
+      ).toEqual(new Set(["a.js", "b.js"]));
+    }
+  } finally {
+    await reader.close();
+  }
+});
+
 it("reports file progress and honors cancellation before the next source", async () => {
   const root = await fixtureDirectory();
   const controller = new AbortController();
@@ -141,7 +211,7 @@ it("preserves graph commitments and export shapes when consuming file-local IR",
         projectJavaScriptSemanticFileSteps(
           analyzed.file,
           analyzed.semantic.ir,
-          transferred.remainingFileNodeBudget(),
+          transferred.remainingFileCapacity(),
         ),
       );
       const module = projectJavaScriptModuleSemantics(analyzed.semantic.ir);
@@ -361,7 +431,7 @@ it("reconstructs package, Electron roles, Webpack/Rspack modules, and cross-laye
           expect.objectContaining({
             properties: expect.objectContaining({
               module_key: "1",
-              structural_fingerprint_algorithm: "babel-ast-v1",
+              structural_fingerprint_algorithm: "babel-ast-v3",
             }),
           }),
         ]),
@@ -388,7 +458,7 @@ it("produces deterministic ASAR graphs with unpacked native linkage and complete
   await mkdir(source);
   await writeJavaScriptArtifactFixture(source);
   const archive = join(root, "app.asar");
-  await createPackageWithOptions(source, archive, { unpack: "**/*.node" });
+  await createPackageWithOptions(source, archive, { unpack: "*.node" });
 
   const first = await reconstructJavaScriptArtifact({
     input_path: archive,
@@ -487,7 +557,7 @@ it("keeps ASAR analysis usable when unpacked native companion bytes are absent",
   await mkdir(source);
   await writeJavaScriptArtifactFixture(source);
   const archive = join(root, "app.asar");
-  await createPackageWithOptions(source, archive, { unpack: "**/*.node" });
+  await createPackageWithOptions(source, archive, { unpack: "*.node" });
   await rm(join(`${archive}.unpacked`, "native", "addon.node"));
 
   const snapshot = await scanArtifactInventory(archive);
@@ -502,10 +572,72 @@ it("keeps ASAR analysis usable when unpacked native companion bytes are absent",
       "ASAR unpacked companion bytes were unavailable; no content hash or child artifact was produced.",
     ]),
   });
+  if (missingNative === undefined)
+    throw new Error("Inventory omitted the unavailable native companion");
 
-  await reconstructAsarArchive(archive, [
+  const result = await reconstructAsarArchive(archive, [
     expect.objectContaining({ kind: "javascript-asset" }),
   ]);
+  const missingEntry = result.graph.nodes.find(
+    ({ kind, observations }) =>
+      kind === "asar-entry" &&
+      observations.some(({ label }) => label === missingNative.logical_path),
+  );
+  expect(missingEntry).toMatchObject({
+    identity: {
+      strategy: "canonical-path",
+      stability: "artifact-version",
+      artifact_sha256: snapshot.manifest.root_sha256,
+      path: missingNative.logical_path,
+    },
+    observations: [
+      expect.objectContaining({
+        label: missingNative.logical_path,
+        properties: expect.objectContaining({
+          entry_sha256: null,
+          bytes: missingNative.declared_size,
+          inventory_artifact_id: null,
+          inventory_occurrence_id: missingNative.occurrence_id,
+          hash_status: "unavailable",
+          artifact_kind: "native-addon",
+          kind: "native-addon",
+          content_available: false,
+        }),
+        evidence: expect.objectContaining({
+          limitations: expect.arrayContaining([
+            "ASAR unpacked companion bytes were unavailable; no content hash or child artifact was produced.",
+            "The inventoried native-addon entry has unavailable bytes; no content artifact identity can be established.",
+          ]),
+        }),
+      }),
+    ],
+  });
+  const unavailableAddon = result.graph.nodes.find(
+    ({ kind, observations }) =>
+      kind === "native-addon" &&
+      observations.some(({ label }) => label === missingNative.logical_path),
+  );
+  expect(unavailableAddon).toMatchObject({
+    identity: {
+      strategy: "canonical-path",
+      stability: "artifact-version",
+      artifact_sha256: snapshot.manifest.root_sha256,
+      path: missingNative.logical_path,
+    },
+    observations: [
+      expect.objectContaining({
+        label: missingNative.logical_path,
+        properties: expect.objectContaining({
+          availability: "unavailable",
+          hash_status: "unavailable",
+          artifact_kind: "native-addon",
+          bytes: missingNative.declared_size,
+          inventory_artifact_id: null,
+          inventory_occurrence_id: missingNative.occurrence_id,
+        }),
+      }),
+    ],
+  });
 });
 
 it("recurses into filesystem-backed ASAR containers without losing container-relative paths", async () => {
@@ -515,7 +647,7 @@ it("recurses into filesystem-backed ASAR containers without losing container-rel
   const resources = join(outer, "resources");
   await mkdir(resources, { recursive: true });
   await createPackageWithOptions(source, join(resources, "app.asar"), {
-    unpack: "**/*.node",
+    unpack: "*.node",
   });
 
   const result = await reconstructJavaScriptArtifact({

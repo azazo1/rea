@@ -1,10 +1,7 @@
 import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
-import {
-  numberValue,
-  cdpStringValue,
-  type UnknownRecord,
-} from "./CdpCaptureValues.js";
+import { cdpStringValue, type UnknownRecord } from "./CdpCaptureValues.js";
+import { structuredFieldToken } from "./StructuredFieldToken.js";
 
 type ResponseMetadata = WebPageInspection["metadata"]["responses"][number];
 type LinkMetadata = ResponseMetadata["links"][number];
@@ -43,13 +40,13 @@ export const safeResponseMetadata = (
       request_id: requestId,
       url,
       mime_type: boundedHeader(cdpStringValue(response.mimeType)),
-      content_length: nonnegativeInteger(headers.get("content-length")),
+      content_length: contentLength(headers.get("content-length")),
       content_encoding: boundedHeader(headers.get("content-encoding")),
       csp,
       links,
       policies: {
-        coop: policyToken(headers.get("cross-origin-opener-policy")),
-        coep: policyToken(headers.get("cross-origin-embedder-policy")),
+        coop: structuredFieldToken(headers.get("cross-origin-opener-policy")),
+        coep: structuredFieldToken(headers.get("cross-origin-embedder-policy")),
         corp: policyToken(headers.get("cross-origin-resource-policy")),
         referrer_policy: referrerPolicy(headers.get("referrer-policy")),
         x_content_type_options: policyToken(
@@ -189,26 +186,29 @@ const parseLinks = (
   allowedOrigins: ReadonlySet<string>,
 ): LinkMetadata[] => {
   const links: LinkMetadata[] = [];
-  for (const entry of splitLinkHeader(value ?? "")) {
-    const match = /^\s*<([^>]*)>(.*)$/u.exec(entry);
-    if (match === null) continue;
-    const parameters = linkParameters(match[2] ?? "");
-    const destination = safeDestination(
-      match[1] ?? "",
-      baseUrl,
-      allowedOrigins,
-    );
-    links.push({
-      href: destination.url,
-      destination_scope: destination.scope,
-      rel: (parameters.get("rel") ?? "")
-        .toLowerCase()
-        .split(/\s+/u)
-        .filter(Boolean),
-      as: boundedHeader(parameters.get("as")),
-      type: boundedHeader(parameters.get("type")),
-      crossorigin: boundedHeader(parameters.get("crossorigin")),
-    });
+  // CDP joins repeated field lines with LF; quoted delimiters belong to one line.
+  for (const line of (value ?? "").split(/\r?\n/u)) {
+    for (const entry of splitLinkHeader(line)) {
+      const match = /^\s*<([^>]*)>(.*)$/u.exec(entry);
+      if (match === null) continue;
+      const parameters = linkParameters(match[2] ?? "");
+      const destination = safeDestination(
+        match[1] ?? "",
+        baseUrl,
+        allowedOrigins,
+      );
+      links.push({
+        href: destination.url,
+        destination_scope: destination.scope,
+        rel: (parameters.get("rel") ?? "")
+          .toLowerCase()
+          .split(/\s+/u)
+          .filter(Boolean),
+        as: boundedHeader(parameters.get("as")),
+        type: boundedHeader(parameters.get("type")),
+        crossorigin: boundedHeader(parameters.get("crossorigin")),
+      });
+    }
   }
   return links;
 };
@@ -343,9 +343,12 @@ const policyToken = (value: string | undefined): string | null => {
   return /^[a-z][a-z0-9_.\x2d]*$/u.test(token) ? token : null;
 };
 
-const nonnegativeInteger = (value: string | undefined): number | null => {
-  const number = numberValue(value === undefined ? undefined : Number(value));
-  return number === undefined ? null : Math.max(0, Math.trunc(number));
+// RFC 9110 section 8.6: Content-Length = 1*DIGIT. Other spellings declare no length.
+const contentLength = (value: string | undefined): number | null => {
+  const token = (value ?? "").trim();
+  if (!/^[0-9]+$/u.test(token)) return null;
+  const length = Number(token);
+  return Number.isSafeInteger(length) ? length : null;
 };
 
 const boundedHeader = (value: string | undefined): string | null =>

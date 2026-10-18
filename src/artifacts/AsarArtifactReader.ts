@@ -13,7 +13,7 @@ import { isAbsolute, join, relative, sep } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-import { listPackage, statFile, uncache } from "@electron/asar";
+import { getRawHeader, uncache } from "@electron/asar";
 
 import {
   ArtifactReaderFailure,
@@ -25,8 +25,13 @@ import {
 import { closeAsarHandle, readValidatedAsarEntry } from "./AsarEntryStream.js";
 import { admitAsarHeader } from "./AsarHeader.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
-import { readFileHandleChunks } from "../filesystem/readFileHandleChunks.js";
-import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+import type { FileHandleChunkStream } from "../filesystem/readFileHandleChunks.js";
+import { readArtifactFileChunks } from "./readArtifactFileChunks.js";
+import {
+  readAsarListing,
+  type AsarListedEntry,
+  type AsarMetadata,
+} from "./AsarListing.js";
 
 /**
  * Official Electron ASAR adapter with range-streamed member reads.
@@ -51,7 +56,7 @@ export class AsarArtifactReader implements ArtifactReader {
   ) {}
 
   async *entries(signal?: AbortSignal): AsyncIterable<ArtifactEntry> {
-    let paths: readonly AsarListedPath[];
+    let paths: readonly AsarListedEntry[];
     try {
       await this.prepareContainer(undefined, signal);
       paths = await this.#withSnapshotOperation(async () => {
@@ -62,8 +67,9 @@ export class AsarArtifactReader implements ArtifactReader {
         this.#archiveSize = admitted.archiveBytes;
         this.#headerSize = admitted.headerBytes;
         abortIfNeeded(signal);
-        const ordered = orderAsarListing(
-          listPackage(snapshotPath, { isPack: false }),
+        const ordered = await readAsarListing(
+          getRawHeader(snapshotPath).header,
+          signal,
         );
         const archiveMetadata = await lstat(snapshotPath);
         if (!archiveMetadata.isFile() || archiveMetadata.isSymbolicLink())
@@ -77,34 +83,25 @@ export class AsarArtifactReader implements ArtifactReader {
     } catch (cause: unknown) {
       throw asarFailure(this.path, "inventory", cause);
     }
-    for (const { listed, path } of paths) {
+    for (const { metadata, path } of paths) {
       abortIfNeeded(signal);
-      if (path.length === 0) continue;
-      const providerPath = listed.startsWith(sep)
-        ? listed.slice(sep.length)
-        : listed;
-      let metadata: ReturnType<typeof statFile>;
-      try {
-        metadata = statFile(this.#snapshotPath(), providerPath, false);
-      } catch (cause: unknown) {
-        throw asarFailure(this.path, `stat ${path}`, cause);
-      }
+      const providerPath = path.split("/").join(sep);
       const kind =
-        "files" in metadata
+        metadata.files !== undefined
           ? "directory"
-          : "link" in metadata
+          : metadata.link !== undefined
             ? "symlink"
             : "file";
       const entry: ArtifactEntry = {
         path,
         kind,
-        declaredSize: "size" in metadata ? metadata.size : null,
+        declaredSize: metadata.size ?? null,
         compressedSize: null,
-        executable: "executable" in metadata && metadata.executable,
+        executable: metadata.executable === true,
         encrypted: false,
         byteOffset: null,
         declaredSha256:
-          "integrity" in metadata &&
+          metadata.integrity !== undefined &&
           metadata.integrity.algorithm === "SHA256" &&
           /^[a-f0-9]{64}$/u.test(metadata.integrity.hash)
             ? metadata.integrity.hash
@@ -340,19 +337,14 @@ export class AsarArtifactReader implements ArtifactReader {
         source,
         digesting,
         createWriteStream(snapshotPath, { flags: "wx", mode: 0o600 }),
-        signal === undefined ? {} : { signal },
       );
       const completedInput = inputHandle;
       inputHandle = undefined;
       await this.#closeOwnedHandle(completedInput);
+      abortIfNeeded(signal);
       this.#snapshot = { path: snapshotPath, sha256: hash.digest("hex") };
     } catch (cause: unknown) {
-      let failure =
-        signal?.aborted === true
-          ? new ArtifactReaderFailure("cancelled", "ASAR operation cancelled", {
-              cause,
-            })
-          : asarFailure(this.path, "snapshot", cause);
+      let failure = asarFailure(this.path, "snapshot", cause);
       if (inputHandle !== undefined) {
         const failedInput = inputHandle;
         inputHandle = undefined;
@@ -495,7 +487,7 @@ export class AsarArtifactReader implements ArtifactReader {
         );
       }
       abortIfNeeded(signal);
-      const source = this.#ownedReadStream(openedHandle, { start: 0 });
+      const source = this.#ownedReadStream(openedHandle, { start: 0, signal });
       handle = undefined;
       const output = readValidatedAsarEntry(
         source,
@@ -577,9 +569,9 @@ export class AsarArtifactReader implements ArtifactReader {
       readonly signal?: AbortSignal | undefined;
       readonly releaseOnClose?: boolean;
     },
-  ): Readable {
+  ): FileHandleChunkStream {
     const { releaseOnClose, ...readOptions } = options;
-    const source = readFileHandleChunks(handle, readOptions);
+    const source = readArtifactFileChunks(handle, readOptions);
     const owned = this.#ownedHandles.get(handle);
     if (owned === undefined)
       throw new ArtifactReaderFailure("integrity", "ASAR handle has no owner");
@@ -603,7 +595,7 @@ export class AsarArtifactReader implements ArtifactReader {
   }
 }
 
-type AsarFileMetadata = Extract<ReturnType<typeof statFile>, { size: number }>;
+type AsarFileMetadata = AsarMetadata & { readonly size: number };
 type AsarEntryState = {
   readonly metadata: AsarFileMetadata;
   readonly entry: ArtifactEntry;
@@ -652,12 +644,11 @@ const asarUnpackedEntryFailure = (
 };
 
 const isAsarFileMetadata = (
-  metadata: ReturnType<typeof statFile>,
+  metadata: AsarMetadata,
 ): metadata is AsarFileMetadata =>
-  "size" in metadata &&
   typeof metadata.size === "number" &&
-  !("files" in metadata) &&
-  !("link" in metadata);
+  metadata.files === undefined &&
+  metadata.link === undefined;
 
 const parseArchiveOffset = (value: string): number | undefined => {
   if (!/^(?:0|[1-9][0-9]*)$/u.test(value)) return undefined;
@@ -667,7 +658,9 @@ const parseArchiveOffset = (value: string): number | undefined => {
 
 const abortIfNeeded = (signal?: AbortSignal): void => {
   if (signal?.aborted === true)
-    throw new ArtifactReaderFailure("cancelled", "ASAR operation cancelled");
+    throw new ArtifactReaderFailure("cancelled", "ASAR operation cancelled", {
+      cause: signal.reason,
+    });
 };
 
 const waitForOperation = async (
@@ -682,7 +675,9 @@ const waitForOperation = async (
     const onAbort = (): void => {
       removeAbortListener();
       reject(
-        new ArtifactReaderFailure("cancelled", "ASAR operation cancelled"),
+        new ArtifactReaderFailure("cancelled", "ASAR operation cancelled", {
+          cause: signal.reason,
+        }),
       );
     };
     signal.addEventListener("abort", onAbort, { once: true });
@@ -697,33 +692,6 @@ const waitForOperation = async (
       },
     );
   });
-};
-
-interface AsarListedPath {
-  readonly listed: string;
-  readonly path: string;
-}
-
-/**
- * Pair each host-spelled listing with its portable archive path, ordered by
- * the portable path so Windows and POSIX hosts agree.
- *
- * @electron/asar returns paths assembled with the host path module. Keep that
- * spelling for its API calls, but expose archive paths with portable
- * separators. On POSIX, backslashes can be literal filename characters and
- * must remain untouched.
- */
-export const orderAsarListing = (
-  listed: readonly string[],
-  separator: string = sep,
-): AsarListedPath[] =>
-  listed
-    .map((entry) => ({ listed: entry, path: toArtifactPath(entry, separator) }))
-    .sort((left, right) => compareUnicodeCodePoints(left.path, right.path));
-
-const toArtifactPath = (listed: string, separator: string): string => {
-  const portable = separator === "\\" ? listed.replaceAll("\\", "/") : listed;
-  return portable.replace(/^\/+|\/+$/gu, "");
 };
 
 const asarFailure = (

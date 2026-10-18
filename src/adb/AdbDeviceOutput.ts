@@ -10,11 +10,15 @@ import {
   adbHostFileName,
   type AdbHostFileNameReason,
 } from "./AdbHostFileName.js";
+import {
+  ADB_DEVICE_STATES,
+  type AdbDeviceState,
+} from "../domain/adb/adbDeviceAnalysis.js";
 
 /** One device exactly as `adb devices -l` reports it. */
 export interface AdbDeviceEntry {
   readonly serial: string;
-  readonly state: string;
+  readonly state: AdbDeviceState;
   readonly transport: "usb" | "tcp" | "unknown";
   readonly product: string | null;
   readonly model: string | null;
@@ -24,26 +28,13 @@ export interface AdbDeviceEntry {
   readonly kind_basis: "emulator_serial_prefix" | "usb_transport" | "none";
 }
 
-/**
- * Device states adb prints after the serial, longest first so two-word
- * states match before their single-word prefixes. A line whose remainder
- * starts with none of them is not a device line.
- */
-const DEVICE_STATES = [
-  "no permissions",
-  "unauthorized",
-  "authorizing",
-  "offline",
-  "recovery",
-  "sideload",
-  "connecting",
-  "bootloader",
-  "device",
-  "unknown",
-  "host",
-] as const;
-
 const DEVICE_LINE = /^(\S+)\s+(.*)$/u;
+
+const normalizeAdbOutputLine = (rawLine: string): string => rawLine.trimEnd();
+
+const isSuccessfulDaemonStartNotice = (line: string): boolean =>
+  line === "* daemon started successfully" ||
+  line === "* daemon started successfully *";
 
 const metadataValue = (remainder: string, key: string): string | null => {
   const match = new RegExp(`(?:^|\\s)${key}:(\\S+)`, "u").exec(remainder);
@@ -57,6 +48,7 @@ const metadataValue = (remainder: string, key: string): string | null => {
  */
 export const parseAdbDevicesOutput = (
   stdout: string,
+  stderr = "",
 ): {
   devices: readonly AdbDeviceEntry[];
   unparsedLines: readonly string[];
@@ -66,18 +58,23 @@ export const parseAdbDevicesOutput = (
   const unparsedLines: string[] = [];
   let daemonStarted = false;
   for (const rawLine of stdout.split(/\r?\n/u)) {
-    const line = rawLine.trimEnd();
-    if (line === "" || line.startsWith("List of devices attached")) continue;
-    if (line.startsWith("* daemon")) {
-      if (line.includes("started successfully")) daemonStarted = true;
+    const line = normalizeAdbOutputLine(rawLine);
+    if (isSuccessfulDaemonStartNotice(line)) {
+      daemonStarted = true;
       continue;
     }
+    if (line === "" || line.startsWith("List of devices attached")) continue;
+    if (line.startsWith("* daemon")) continue;
     const match = DEVICE_LINE.exec(line);
-    const state = DEVICE_STATES.find((candidate) =>
-      match?.[2]?.startsWith(candidate),
-    );
+    const state = ADB_DEVICE_STATES.find((candidate) => {
+      const remainder = match?.[2];
+      if (remainder === undefined || !remainder.startsWith(candidate))
+        return false;
+      const next = remainder[candidate.length];
+      return next === undefined || /\s/u.test(next);
+    });
     if (match === null || state === undefined) {
-      if (line.trim() !== "") unparsedLines.push(line);
+      if (rawLine.trim() !== "") unparsedLines.push(rawLine);
       continue;
     }
     const serial = match[1]!;
@@ -115,6 +112,15 @@ export const parseAdbDevicesOutput = (
             ? "usb_transport"
             : "none",
     });
+  }
+  if (!daemonStarted && stderr !== "") {
+    for (const rawLine of stderr.split(/\r?\n/u)) {
+      const line = normalizeAdbOutputLine(rawLine);
+      if (isSuccessfulDaemonStartNotice(line)) {
+        daemonStarted = true;
+        break;
+      }
+    }
   }
   return { devices, unparsedLines, daemonStarted };
 };
@@ -192,7 +198,7 @@ export const parsePackageListOutput = (
     if (line === "") continue;
     const match = PACKAGE_LINE.exec(line);
     if (match === null) {
-      unparsedLines.push(line);
+      unparsedLines.push(rawLine);
       continue;
     }
     packages.push({
@@ -201,6 +207,25 @@ export const parsePackageListOutput = (
     });
   }
   return { packages, unparsedLines };
+};
+
+/** Quote raw device paths for prose without allowing bidi or invisible text. */
+export const displayDevicePath = (devicePath: string): string => {
+  let excerpt = "";
+  let count = 0;
+  for (const character of devicePath) {
+    if (count === 160) break;
+    excerpt += character;
+    count += 1;
+  }
+  const quoted = JSON.stringify(excerpt).replace(
+    /[\p{C}\p{Z}\p{Default_Ignorable_Code_Point}\u2800]/gu,
+    (character) =>
+      character === " "
+        ? character
+        : `\\u{${character.codePointAt(0)!.toString(16).toUpperCase()}}`,
+  );
+  return excerpt.length === devicePath.length ? quoted : `${quoted} (excerpt)`;
 };
 
 /** One APK of an installed package exactly as `pm path` reports it. */

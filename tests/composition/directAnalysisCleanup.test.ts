@@ -24,6 +24,7 @@ const cleanupError = new ProviderCleanupError(
   "fixture",
   ["fixture-provider-process"],
   { reason: "process exit could not be confirmed" },
+  { remediationAction: "Close the retained fixture process before retrying." },
 );
 
 const primaryError = new AnalysisTimeoutError("read_bytes", 100, {
@@ -60,6 +61,9 @@ const factories = (
   const dependencies: DirectAnalysisDependencies = {
     readConfiguration: () => parseConfig({}),
     createBinarySession: () => session,
+    createArtifactBinarySession: () => session,
+    createNativeDispatchBinarySession: () => session,
+    createNativeBinarySession: () => session,
     createManagedBinarySession: () => session,
   };
   return { dependencies, session };
@@ -110,6 +114,9 @@ describe("one-shot analysis cleanup outcomes", () => {
       code: "cleanup_incomplete",
       category: primary.category,
       message: primary.message,
+      remediation: {
+        action: "Close the retained fixture process before retrying.",
+      },
       details: {
         execution_failure: primary.code,
         captured_output: primary.details?.captured_output,
@@ -145,6 +152,42 @@ describe("one-shot analysis cleanup outcomes", () => {
       },
     });
   });
+
+  it.each([false, true])(
+    "retains original cleanup diagnostics when final close fails: %s",
+    async (closeFails) => {
+      const [path] = await createBinarySessionTargets();
+      const executionError = new AnalysisTimeoutError("read_bytes", 100, {
+        cleanup: {
+          reason: "snapshot removal failed during execution",
+          resources: ["primary-snapshot"],
+        },
+        capturedOutput: primaryError.capturedOutput,
+      });
+      const primary = projectAnalysisError(executionError);
+      const { dependencies } = factories({
+        executionError,
+        ...(closeFails ? { cleanupError } : {}),
+      });
+      const result = analysisCliErrorEnvelopeSchema.parse(
+        await runDirectAnalysis(dependencies, path, "read_bytes", {}),
+      );
+      expect(result).toMatchObject({
+        code: "cleanup_incomplete",
+        details: {
+          ...primary.details,
+          ...(closeFails
+            ? { cleanup_error: projectAnalysisError(cleanupError) }
+            : {}),
+        },
+      });
+      expect(
+        JSON.stringify(result).match(/retained observation/g),
+      ).toHaveLength(1);
+      if (!closeFails)
+        expect(result.details).not.toHaveProperty("cleanup_error");
+    },
+  );
 
   it("retains both unexpected execution failure and cleanup failure", async () => {
     const [path] = await createBinarySessionTargets();
@@ -189,6 +232,9 @@ describe("managed one-shot cleanup outcomes", () => {
     if (result.ok) return;
     expect(projectAnalysisError(result.error)).toMatchObject({
       code: "cleanup_incomplete",
+      remediation: {
+        action: "Close the retained fixture process before retrying.",
+      },
       details: {
         resources: ["fixture-provider-process"],
         diagnostics: {

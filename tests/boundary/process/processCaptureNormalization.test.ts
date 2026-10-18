@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
@@ -27,6 +27,35 @@ const identitySchema = z.object({
 
 const itWithLinuxCaptureCapability =
   process.platform === "linux" ? itWithCaptureCapability : it.skip;
+
+itWithCaptureCapability(
+  "captures a POSIX PATH executable with a literal backslash in its basename",
+  async () => {
+    const root = await createTestTempDirectory("rea-process-backslash-name-");
+    const bin = join(root, "bin");
+    await mkdir(bin);
+    const command = "selected\\node";
+    const selected = join(bin, command);
+    await symlink(process.execPath, selected);
+    const scenario = parseProcessScenario({
+      executable: command,
+      working_directory: root,
+      environment: { PATH: bin },
+      arguments: ["-e", 'process.stdout.write("selected executable")'],
+      settle_ms: 100,
+    });
+    const result = await captureProcessScenario(scenario);
+    if (!result.ok) throw result.error;
+    expect(result.value.frames.map(({ data }) => data).join("")).toBe(
+      "selected executable",
+    );
+    expect(result.value.exit).toMatchObject({ code: 0, reason: "exited" });
+    expect(result.value.cleanup).toMatchObject({
+      owned_process_group: "verified",
+      temporary_root: "removed",
+    });
+  },
+);
 
 itWithCaptureCapability(
   "preserves numeric reports and original normalized PTY text in Evidence",
@@ -195,6 +224,64 @@ itWithLinuxCaptureCapability.each([false, true])(
       state: "quiesced",
       cleanup_outcome: "not_required",
     });
+    expect(capture.cleanup).toMatchObject({
+      owned_process_group: "verified",
+      temporary_root: "removed",
+    });
+  },
+  20_000,
+);
+
+itWithCaptureCapability(
+  "preserves selected nested path identities in actual PTY Evidence",
+  async () => {
+    const root = await createTestTempDirectory("rea-process-nested-paths-");
+    const executable = join(root, "selected-node");
+    const observed = join(root, "data");
+    await symlink(process.execPath, executable);
+    await mkdir(observed);
+    const original = `${executable}\n${observed}/result\n${root}/log`;
+    const scenario = parseProcessScenario({
+      executable,
+      working_directory: root,
+      filesystem_observation_paths: [observed],
+      arguments: ["-e", `process.stdout.write(${JSON.stringify(original)})`],
+      normalization: { paths: true, pids: false, ports: false, patterns: [] },
+      settle_ms: 100,
+    });
+    const result = await captureProcessScenario(scenario);
+    if (!result.ok) throw result.error;
+    const capture = parseProcessCapture(
+      createProcessCaptureEvidence(scenario, result.value).normalized_result,
+    );
+    expect(capture.frames.map(({ data }) => data).join("")).toBe(
+      "<executable>\r\n<filesystem-root-0>/result\r\n<working-directory>/log",
+    );
+    expect(
+      capture.frames.map(({ raw_data, data }) => raw_data ?? data).join(""),
+    ).toBe(original.replaceAll("\n", "\r\n"));
+    expect(capture.manifest.comparison_contract).toHaveProperty(
+      "path_normalization_version",
+      "longest-original-paths-v1",
+    );
+    const legacyContract = { ...capture.manifest.comparison_contract };
+    delete legacyContract.path_normalization_version;
+    const legacy = parseProcessCapture({
+      ...capture,
+      manifest: {
+        ...capture.manifest,
+        comparison_contract: legacyContract,
+        comparison_contract_sha256: digestProcessCommitment(legacyContract),
+      },
+    });
+    expect(() => compareProcessCaptures(legacy, capture)).toThrow(
+      expect.objectContaining({
+        issues: [
+          expect.objectContaining({ expected: ["path_normalization_version"] }),
+        ],
+      }),
+    );
+    expect(capture.exit).toMatchObject({ code: 0, reason: "exited" });
     expect(capture.cleanup).toMatchObject({
       owned_process_group: "verified",
       temporary_root: "removed",

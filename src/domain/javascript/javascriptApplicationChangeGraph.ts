@@ -118,6 +118,11 @@ const changedFromEdge = (
   if (
     item.match.status !== "matched" ||
     item.status === "unchanged" ||
+    // Pairing and uncertainty remain in the item; neither establishes a change.
+    (item.status === "unknown" &&
+      !item.dimensions.some(
+        (dimension) => dimension !== "location" && dimension !== "coverage",
+      )) ||
     left === null ||
     right === null ||
     left === right ||
@@ -180,7 +185,12 @@ const comparisonEvidence = (
       executable_sha256: null,
     },
     coverage: complete
-      ? { status: "complete", truncated: false, omitted_count: 0, limits: [] }
+      ? {
+          status: "complete",
+          truncated: false,
+          omitted_count: 0,
+          limits: sourceCoverageLimits(input),
+        }
       : {
           status: "partial",
           truncated:
@@ -210,7 +220,7 @@ const changeGraphCoverage = (
       status: "complete",
       truncated: false,
       omitted_count: 0,
-      limits: [],
+      limits: sourceCoverageLimits(input),
     };
   return {
     status: "partial",

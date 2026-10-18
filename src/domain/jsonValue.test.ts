@@ -40,6 +40,13 @@ it("still parses only JSON values at runtime", () => {
     expect(jsonValueSchema.safeParse(value).success).toBe(false);
 });
 
+it("rejects sparse arrays and enumerable symbol-keyed object members", () => {
+  const sparse = new Array(1);
+  const symbolKeyed = { [Symbol("caller data")]: "retain or reject" };
+  expect(jsonValueSchema.safeParse(sparse).success).toBe(false);
+  expect(jsonValueSchema.safeParse(symbolKeyed).success).toBe(false);
+});
+
 const deepObject = (depth: number): unknown => {
   let value: unknown = 1;
   for (let index = 0; index < depth; index += 1) value = { nested: value };
@@ -74,6 +81,18 @@ describe("jsonValueSchema depth bound", () => {
       );
     },
   );
+
+  it("stops enclosing refinements before rejected JSON reaches consumers", () => {
+    let consumed = 0;
+    const envelope = z.object({ value: jsonValueSchema }).superRefine(() => {
+      consumed += 1;
+    });
+    const result = envelope.safeParse({ value: deepObject(10_000) });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues[0]?.message).toContain("maximum nesting depth");
+    expect(consumed).toBe(0);
+  });
 
   it("rejects cyclic values instead of recursing forever", () => {
     const cyclic: Record<string, unknown> = {};
@@ -122,3 +141,55 @@ it.each([undefined, Number.NaN, Infinity, 1n, () => 0, new Date(0)])(
     }
   },
 );
+
+describe("inert JSON data boundaries", () => {
+  it.each(["member", "constructor", "array"])(
+    "rejects an accessor at %s without invoking it",
+    (kind) => {
+      let accessed = false;
+      const value = kind === "array" ? [] : {};
+      Object.defineProperty(value, kind === "array" ? "0" : kind, {
+        enumerable: true,
+        get() {
+          accessed = true;
+          throw new Error("caller accessor must remain inert");
+        },
+      });
+      expect(jsonValueSchema.safeParse(value).success).toBe(false);
+      expect(accessed).toBe(false);
+    },
+  );
+
+  it("rejects proxies before reflection can invoke traps", () => {
+    let observed = false;
+    const value = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          observed = true;
+          throw new Error("caller trap must remain inert");
+        },
+      },
+    );
+    expect(jsonValueSchema.safeParse(value).success).toBe(false);
+    expect(observed).toBe(false);
+    const revoked = Proxy.revocable([], {});
+    revoked.revoke();
+    expect(jsonValueSchema.safeParse(revoked.proxy).success).toBe(false);
+  });
+
+  it("projects array data without invoking caller iteration or map methods", () => {
+    const value = [1, { nested: "preserved" }];
+    Object.defineProperty(value, Symbol.iterator, {
+      value() {
+        throw new Error("caller iterator must remain inert");
+      },
+    });
+    Object.defineProperty(value, "map", {
+      value() {
+        throw new Error("caller map must remain inert");
+      },
+    });
+    expect(jsonValueSchema.parse(value)).toEqual([1, { nested: "preserved" }]);
+  });
+});

@@ -81,6 +81,40 @@ including the existing `inspect-analysis-view` CLI. Session record lifetime and
 export/import semantics remain unchanged. A server without Evidence retention
 rejects selected summary before analysis; complete delivery remains available.
 
+### Member summary and retained member rows
+
+Complete `inspect_managed_members` delivery always includes the assembly-wide
+`member_refs` and `exported_types`, which `type_names` does not narrow, so even
+one selected or unmatched type can return megabytes. Select
+`{"path":"/absolute/path/Assembly.dll","type_names":["Namespace.Type"],"detail":"summary"}`
+to keep the complete source in the session and receive identity, metadata
+status, the selection with its unmatched names, coverage/issues, the separate
+user-string coverage, limitations and per-collection counts. Then page original
+rows with view kind `managed-members`:
+
+```json
+{
+  "source": {
+    "kind": "retained-evidence",
+    "evidence_id": "<parent_evidence_id>"
+  },
+  "view": {
+    "kind": "managed-members",
+    "collection": "call_edges",
+    "offset": 0,
+    "limit": 64
+  }
+}
+```
+
+Collections are `types`, `exported_types`, `fields`, `methods`, `member_refs`,
+`call_edges`, `field_accesses` and `user_strings` (the literals). Each page names
+its collection, retains original rows, order, tokens, signatures and body facts,
+and carries the source selection and coverage; `user_strings` pages carry the
+literal pool's own coverage. Older Evidence that never examined exported types
+or user strings reports a null count and refuses those pages rather than
+returning an empty one.
+
 ## Shipped scope
 
 The canonical parser admits PE/CLI bytes and their metadata/CIL without loading
@@ -133,25 +167,80 @@ MCP uses `inspect_managed_members` with
 Repeat `--type` or supply multiple unique `type_names` for several types.
 Names match the reported `full_name` exactly. Top-level names are namespace
 qualified; nested types currently report bare names, which can select several
-types with that name.
+types with that name. Each type's `enclosing_type_token` records its enclosing
+TypeDef. `nesting_read` distinguishes complete source rows (true), incomplete
+current rows (false), and historical Evidence (null). A null enclosing token
+alone does not establish that a type is top-level.
+Each selected type also retains `name_sha256`, a framed digest of its namespace,
+name and enclosing names. It uses the same bounded, cached owner as signature
+type operands and remains available when selection omits the enclosing types.
+It adds one fixed-size digest per returned type rather than repeated name paths.
 
 The result preserves the requested names in `selection.type_names` and reports
 unmatched names separately. If metadata names are unreadable, limitations retain
 that uncertainty. With no selection, `selection` is null and whole-assembly
 inspection keeps its existing resource policy. Selection restricts types,
-fields, methods, call edges and field accesses; member references remain an
-assembly-wide inventory, so output size is not guaranteed to be small.
+fields, methods, call edges, field accesses and user strings; member references
+remain an assembly-wide inventory, so output size is not guaranteed to be small.
 
 Coverage describes the selected members. Comparisons leave members outside the
 opposite observation's selection unknown, and application graphs report their
 selected scope as partial. Neither makes an absence claim about the whole
 assembly. Older member Evidence without `selection` remains readable.
 
+### User strings
+
+`ldstr` anchors keep their build-local `0x70` tokens. `user_strings.literals`
+lists each distinct token loaded by an inspected method body once, in token
+order, with its `#US` file offset and decoded value. Values keep their stored
+UTF-16 code units, including unpaired surrogates. Token `0x70000000` names the
+heap's empty entry at offset 0 and reads as `""`; any other item there is
+malformed. The terminal flag is checked against ECMA-335 II.24.2.4, and the
+length prefix against the width II.23.2 assigns. A difference is reported with
+its byte offset as a user-string issue while preserving the readable literal.
+Toolchain conventions can differ; this conformance observation does not
+establish runtime rejection. A missing `#US` stream is one stream-level issue;
+a malformed item is reported against its token. User strings carry their own
+coverage: any of these makes `user_strings.state` partial and lists the issue
+in `user_strings.issues`, while the member `coverage` and `metadata.status` are
+unaffected, and readable literals remain. The state is also partial when an
+inspected method's CIL was not fully decoded (a malformed exception section
+alone does not count) or a method that may belong to the inspected types was
+not inspected (its row could not be read, or its type's name could not be read
+under a `type_names` selection), because `ldstr` instructions there were not
+observed. Normalized CIL digests do not include decoded values.
+`compare_managed_members` does not decode or compare literals: an unchanged
+method does not establish unchanged strings, and the comparison says so in its
+limitations. Older member Evidence without `user_strings` reads as `null`: not
+examined.
+
+### Edge target declaring types
+
+`member_refs[].parent_name`, `call_edges[].target_declaring_type`, and
+`field_accesses[].field_declaring_type` name the type that declares each
+target. Referenced spec signatures validate encoded type coordinates against
+the metadata tables, including nested type arguments and custom modifiers.
+TypeRef resolution scopes are checked transitively with cycle detection;
+readable names survive malformed scopes as partial evidence.
+TypeDef and TypeRef names use the namespace-qualified `full_name`
+form, and nested types keep bare names. A generic-instantiation TypeSpec
+parent names its generic type, such as ``System.Collections.Generic.List`1``.
+Other well-formed TypeSpec forms and ModuleRef or MethodDef parents stay
+`null`. A `method-spec` call edge reports the name and declaring type of the
+generic method it instantiates. A field access is named only by a field or a
+field-signature MemberRef. TypeSpec and MethodSpec blobs are decoded with the
+member-signature grammar, and a MethodSpec must instantiate a generic method
+with as many type arguments as it declares. Malformed or unsupported rows and
+blobs, and arity mismatches, make coverage partial. A readable MethodSpec
+method column that names a method, or a TypeRef whose resolution scope is
+invalid, keeps its name.
+Older member Evidence without these fields reads them as `null`: unknown.
+
 ## Analysis objective
 
 Start by identifying the artifact with `inspect_managed_artifact`, then inspect
 its types and CIL with `inspect_managed_members`. Use [member comparison](#member-comparison)
-for another build, and [managed/native boundary rules](#managednative-boundary-rules)
+for another build, and [managed/native boundary rules](#managed-native-boundaries)
 when matching declared native calls to supplied native Evidence. Static inspection
 does not load or execute the assembly. Reconstructed structure and unresolved
 native/runtime questions retain their own authority and coverage.
@@ -161,21 +250,74 @@ native/runtime questions retain their own authority and coverage.
 Names and semantic labels do not establish durable member identity. Comparison
 preserves observed differences, structural inferences, and unknowns separately.
 
-Cross-version matching first prefers exact CIL/signature identity. When that
-does not match, it pairs an exact declared type, method name, and raw signature
-before trying structural body shape. The exact-signature key uses names only
-as part of that full tuple; names alone never select a pair. Duplicate tuples
-remain ambiguous rather than being paired by token order. Fields follow the
-same exact tiers. The raw signature is exact whether or not REA decoded it, so
-undecoded signatures pair by that tuple too, but they never enter structural
-rounds. An unmatched member is therefore reported as `unknown`, not added or
-removed, when its own signature was not decoded or when the other side has an
-unpaired member, one-sided or ambiguous, with the same declared type and name
-whose signature was not decoded.
+Cross-version matching first pairs members of the same declared type and name.
+A current declared type uses its observed `name_sha256`, so same-named nested
+types in different enclosing types stay distinct even in selected inventories.
+Malformed, missing, contradictory, cyclic or over-deep enclosing identity remains unknown;
+the comparison preserves display names without using them to repair that gap.
+Historical observations retain an explicitly limited bare-name mode when either
+side predates the identity facts. A known current identity gap still remains
+unknown beside a historical observation. Matching then pairs
+methods by exact CIL/signature identity, then by signature, then by
+structural body shape; fields by signature. Exact CIL/signature identity
+requires equal raw CIL digests and decoded fingerprints. Equal decoded
+fingerprints alone cannot establish an exact match: they omit switch targets
+and collapse distinct NaN encodings. Only then may a remap pair a
+renamed or moved member across declared types or names: a method by exact
+CIL/signature identity or structural body shape, a field by exact decoded
+signature. A remap never takes a member whose own declared type and name remain
+unpaired on the other side, so a member is never taken from its own changed
+counterpart. A member whose declared identity is unresolved could belong to any type. It
+never makes a declared-identity pair, and any remap group it joins stays
+ambiguous. Unresolved same-named counterparts prevent definitive added/removed
+claims, while observed names and tokens remain available in the result.
+The exact-signature key uses names only as part of that
+full tuple; names alone never select a pair. Duplicate tuples remain ambiguous
+rather than being paired by token order. Every round compares signatures by
+`resolved_sha256`: the raw signature with each TypeDef or TypeRef operand
+replaced by a digest of that type's namespace and name, hashed as separate
+values so `A` + `B.C` differs from `A.B` + `C`, after its enclosing types for a
+nested type (`Outer/Inner`). The defining assembly is not part of the name:
+a TypeDef and a TypeRef with the same namespace and name compare as the
+same nominal name, and a TypeRef's ResolutionScope assembly is ignored, so a type
+forwarded from one assembly to another still pairs. Two different types with
+the same full name in different assemblies therefore have equal name digests.
+Comparison reports this scope limitation inline; it does not establish CLR
+type identity or runtime binding equivalence.
+Nesting deeper than 64 levels is not named, and such a signature compares by
+its raw digest. Comparison keys keep resolved and raw digests apart, so a raw
+digest never pairs with an equal resolved one.
+Raw signature bytes name types by metadata row, and rows are build-local, so
+the same signature usually has different raw bytes in two builds. A signature
+that names no types resolves to its raw digest. When an operand cannot be
+resolved, such as a TypeSpec, or when REA could not parse the signature, the
+raw digest stands in. Missing or unreadable TypeDef and TypeRef operands are
+reported as coverage issues. Invalid NestedClass rows retain their failure
+reasons and withhold TypeDef signature identities; type names and nesting are
+parsed once by their shared owner. Each current inspection records
+`signature_resolution: "type-names-v1"`, even when none of its operands can be
+resolved. Historical Evidence defaults this attestation to `null`. When either
+observation predates resolution, both sides compare raw digests, which pair only where type rows agree,
+and the comparison reports that limitation. The signature is exact whether or
+not REA decoded it, so undecoded signatures pair by that tuple too, but they
+never enter structural rounds. An unmatched member is therefore reported as
+`unknown`, not added or removed, when its own signature was not decoded or when
+the other side has an unpaired member, one-sided or ambiguous, with the same
+declared type and name whose signature was not decoded. When both observations
+attest type-name resolution, a decoded signature that still compares by its raw
+digest is treated the same way: an unmatched member with one, or beside an
+unpaired same-named member with one, is `unknown`, because its raw bytes name
+types by build-local row. A matched unresolved signature also remains unknown
+unless another observed dimension establishes a change; identical row bytes
+can reference different TypeSpec contents. Its resolution limitation is retained
+even when another dimension changes.
 
 For a matched method, an unavailable or partial body makes body-shape facets
-unknown while preserving observed signature differences. Structural identity
-compares normalized signatures, the limited decoded-CIL tuple fingerprint,
+unknown while preserving observed signature differences. For complete bodies,
+a difference in either the raw CIL digest or the decoded fingerprint is reported
+in the `cil` dimension, including reordered switch targets with equal decoded
+fingerprints. Structural identity compares resolved signatures, the limited
+decoded-CIL tuple fingerprint,
 constants, and bounded shape context. It reports all candidates at the winning
 score and remains ambiguous when the evidence does not distinguish them. The
 digest does not itself remap metadata tokens.
@@ -210,9 +352,10 @@ install it or its toolchain. The [NativeAOT guide](ghidra-nativeaot.md) defines
 these routes, their layout/host restrictions, derived-memory provenance, and
 verification coverage.
 
-REA's experimental Windows Ghidra boundary admits native x86 and x86-64 PE
-applications and DLLs for static analysis. This does not establish Windows
-NativeAOT metadata-recovery coverage.
+REA's experimental Windows Ghidra boundary admits native x86, x86-64, ARMNT (Thumb-2) and ARM64 PE
+applications and DLLs for static analysis. For x64 PE NativeAOT, the read-only
+parser also runs there; the [NativeAOT guide](ghidra-nativeaot.md) lists what a
+Windows host covers.
 
 For NativeAOT analysis, preserve the selected native artifact's path and digest
 and report recovered type data with its returned provenance. Linking those types
@@ -220,11 +363,16 @@ to native function addresses requires verified
 provider evidence; names or vtable similarity alone do not prove that a native
 function implements a specific managed method.
 
+<div id="managed-native-boundaries"></div>
+
 ## Managed/native boundary rules
 
 `verify_managed_native_boundaries` compares declared P/Invoke module and entry
 point identities with supplied native export or function evidence. Name/module
 matches establish declaration links; they do not establish that a call executed.
+When either side lacks a usable module identity, a matching name remains
+unresolved and retains the candidate evidence; REA reports a module mismatch
+only when both identities are available and differ.
 
 Metadata tokens are not native addresses. Native body mapping for C++/CLI,
 ReadyToRun, NativeAOT, and IL2CPP requires separately verified format and provider
@@ -262,8 +410,9 @@ these indirections for member ownership and local attribute-constructor types;
 field and method tokens still identify the original definition rows.
 `field_list` and `method_list` retain the metadata's list coordinates, which
 refer to the pointer table when present rather than necessarily contiguous
-definition rows. Malformed or ambiguous pointers leave the owner unknown with
-partial coverage while preserving readable member and attribute facts.
+definition rows. Invalid or nonmonotonic list coordinates and malformed or
+ambiguous pointers leave affected owners unknown with partial coverage while
+preserving readable member and attribute facts.
 The retained inverse indexes are admitted against the existing representation
 budget before allocation.
 
@@ -309,8 +458,8 @@ Opcode names retain short/long forms and prefix opcodes. This makes the value a
 reproducible decoded-tuple fingerprint, not a canonical semantic CIL identity:
 it does not resolve tokens across MVIDs, does not commit full control flow or
 exception semantics, and does not replace the raw CIL digest. Cross-build
-comparison uses the value only as one unique-only structural tier and reports
-ambiguity when that evidence is insufficient.
+comparison requires equal raw CIL digests as well for exact CIL/signature
+matches and reports ambiguity when structural evidence is insufficient.
 
 For example, a decoded `nop; ret` body serializes exactly as
 `[["nop","none",null],["ret","none",null]]` and has digest

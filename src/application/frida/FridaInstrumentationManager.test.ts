@@ -9,6 +9,7 @@ import type {
   Session,
   Signal,
 } from "frida";
+import { AnalysisInputError } from "../../domain/analysisErrorCore.js";
 import { FridaInstrumentationManager } from "../../frida/FridaInstrumentationManager.js";
 
 const signal = <Handler extends (...args: never[]) => void>() => {
@@ -40,13 +41,14 @@ class FakeScript implements Script {
     readonly beforeLoad: () => Promise<void> = async () => {},
     readonly description = "script loaded",
     readonly stack = "",
+    readonly messageValue?: FridaMessage,
   ) {}
 
   async load(): Promise<void> {
     await this.beforeLoad();
     if (this.loadFailure !== undefined) throw this.loadFailure;
     this.message.emit(
-      {
+      this.messageValue ?? {
         type: "send",
         payload: this.payload,
         description: this.description,
@@ -73,6 +75,7 @@ class FakeSession implements Session {
   nextPayload: unknown = { event: "loaded" };
   nextDescription = "script loaded";
   nextStack = "";
+  nextMessage: FridaMessage | undefined;
   nextLoadFailure: Error | undefined;
   nextUnloadFailureCount = 0;
   detachFailureCount = 0;
@@ -94,12 +97,14 @@ class FakeSession implements Session {
       },
       this.nextDescription,
       this.nextStack,
+      this.nextMessage,
     );
     script.loadFailure = this.nextLoadFailure;
     script.unloadFailureCount = this.nextUnloadFailureCount;
     this.nextPayload = { event: "loaded" };
     this.nextDescription = "script loaded";
     this.nextStack = "";
+    this.nextMessage = undefined;
     this.nextLoadFailure = undefined;
     this.nextUnloadFailureCount = 0;
     this.scripts.push(script);
@@ -132,6 +137,7 @@ class FakeDevice implements Device {
   readonly process = { pid: 512, name: "fixture" } satisfies Process;
   readonly session = new FakeSession();
   resumed: number[] = [];
+  attachedTargets: Array<number | string> = [];
   resumeFailureCount = 0;
   readonly spawned: string[] = [];
 
@@ -156,7 +162,8 @@ class FakeDevice implements Device {
     this.resumed.push(pid);
   }
 
-  async attach(): Promise<Session> {
+  async attach(target: number | string): Promise<Session> {
+    this.attachedTargets.push(target);
     return this.session;
   }
 }
@@ -202,6 +209,110 @@ const startLocalAttachedSession = async (
 
 // eslint-disable-next-line max-lines-per-function -- related manager lifecycle cases share the same focused fake provider.
 describe("FridaInstrumentationManager", () => {
+  it("attaches by PID when Frida omits the target from process lookup", async () => {
+    const bindings = new FakeDeviceManager();
+    bindings.device.getProcessByPid = async () => {
+      throw new Error("Process not found");
+    };
+    const manager = new FridaInstrumentationManager({
+      deviceManager: bindings,
+    });
+    const started = await manager.startSession({
+      mode: "attach",
+      deviceId: "local",
+      pid: 512,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    expect(started.value.pid).toBe(512);
+    expect(bindings.device.attachedTargets).toEqual([512]);
+    expect(started.value.target).toBe("pid 512");
+    expect(bindings.device.session.isDetached()).toBe(false);
+    await manager.closeAll();
+    expect(bindings.device.session.isDetached()).toBe(true);
+  });
+
+  it("keeps the caller PID when Frida resolves a different process", async () => {
+    const bindings = new FakeDeviceManager();
+    bindings.device.getProcessByPid = async () => ({
+      ...bindings.device.process,
+      pid: 513,
+    });
+    const manager = new FridaInstrumentationManager({
+      deviceManager: bindings,
+    });
+    const started = await manager.startSession({
+      mode: "attach",
+      deviceId: "local",
+      pid: 512,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    expect(started.value.pid).toBe(512);
+    expect(started.value.target).toBe("fixture (pid 512)");
+    expect(bindings.device.attachedTargets).toEqual([512]);
+    await manager.closeSession(started.value.sessionId);
+  });
+
+  it("records a session already detached during process metadata lookup", async () => {
+    const bindings = new FakeDeviceManager();
+    let lookupStarted!: () => void;
+    const lookupEntered = new Promise<void>((resolve) => {
+      lookupStarted = resolve;
+    });
+    let finishLookup!: () => void;
+    const lookupGate = new Promise<void>((resolve) => {
+      finishLookup = resolve;
+    });
+    bindings.device.getProcessByPid = async () => {
+      lookupStarted();
+      await lookupGate;
+      return bindings.device.process;
+    };
+    const manager = new FridaInstrumentationManager({
+      deviceManager: bindings,
+    });
+    const starting = manager.startSession({
+      mode: "attach",
+      deviceId: "local",
+      pid: 512,
+    });
+    await lookupEntered;
+    bindings.device.session.markDetached();
+    finishLookup();
+
+    const started = await starting;
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    expect(started.value.pid).toBe(512);
+    expect(bindings.device.attachedTargets).toEqual([512]);
+    expect(started.value.state).toBe("detached");
+    expect(manager.status(started.value.sessionId)?.state).toBe("detached");
+    await manager.closeSession(started.value.sessionId);
+  });
+
+  it("still reports a real attach failure when process lookup is unavailable", async () => {
+    const bindings = new FakeDeviceManager();
+    bindings.device.getProcessByPid = async () => {
+      throw new Error("Process not found");
+    };
+    bindings.device.attach = async () => {
+      throw new Error("attach denied");
+    };
+    const manager = new FridaInstrumentationManager({
+      deviceManager: bindings,
+    });
+    const started = await manager.startSession({
+      mode: "attach",
+      deviceId: "local",
+      pid: 512,
+    });
+    expect(started.ok).toBe(false);
+    if (started.ok) return;
+    expect(JSON.stringify(started.error)).toContain("attach denied");
+    await manager.closeAll();
+  });
+
   it("retains a failed startup's spawn and remote lease until cleanup succeeds", async () => {
     const bindings = new FakeDeviceManager();
     bindings.device.attach = async () => {
@@ -744,7 +855,93 @@ it("attributes messages to their producing script and returns each load's messag
   await manager.closeAll();
 });
 
-it("keeps an active script message bucket after its last message is evicted", async () => {
+it("retains Frida error source coordinates in script and session evidence", async () => {
+  const { bindings, manager, started } = await startLocalAttachedSession();
+  expect(started.ok).toBe(true);
+  if (!started.ok) return;
+
+  bindings.device.session.nextMessage = {
+    type: "error",
+    description: "instrumentation failed",
+    stack: "Error: instrumentation failed",
+    fileName: "agent.js",
+    lineNumber: 7,
+    columnNumber: 3,
+  };
+  const loaded = await manager.loadScript(started.value.sessionId, {
+    sourceKind: "inline",
+    source: "throw new Error('instrumentation failed');",
+  });
+  expect(loaded.ok).toBe(true);
+  if (loaded.ok) {
+    expect(loaded.value.messages[0]).toMatchObject({
+      type: "error",
+      file_name: "agent.js",
+      line_number: 7,
+      column_number: 3,
+    });
+  }
+  expect(manager.status(started.value.sessionId)?.messages[0]).toMatchObject({
+    file_name: "agent.js",
+    line_number: 7,
+    column_number: 3,
+  });
+
+  bindings.device.session.nextMessage = {
+    type: "error",
+    description: "location unavailable",
+    stack: "Error: location unavailable",
+  };
+  const withoutLocation = await manager.loadScript(started.value.sessionId, {
+    sourceKind: "inline",
+    source: "throw new Error('location unavailable');",
+  });
+  expect(withoutLocation.ok).toBe(true);
+  if (withoutLocation.ok) {
+    expect(withoutLocation.value.messages[0]).not.toHaveProperty("file_name");
+    expect(withoutLocation.value.messages[0]).not.toHaveProperty("line_number");
+    expect(withoutLocation.value.messages[0]).not.toHaveProperty(
+      "column_number",
+    );
+  }
+  await manager.closeAll();
+});
+
+it("does not carry earlier script truncation into a complete later load", async () => {
+  const { bindings, manager, started } = await startLocalAttachedSession();
+  expect(started.ok).toBe(true);
+  if (!started.ok) return;
+
+  const first = await manager.loadScript(started.value.sessionId, {
+    sourceKind: "inline",
+    source: "send('A');",
+  });
+  expect(first.ok).toBe(true);
+  if (!first.ok) return;
+  const firstScript = bindings.device.session.scripts[0];
+  expect(firstScript).toBeDefined();
+  if (firstScript === undefined) return;
+  for (let index = 0; index < 800; index += 1)
+    firstScript.message.emit(
+      { type: "send", payload: "x".repeat(32_700) },
+      null,
+    );
+
+  bindings.device.session.nextPayload = { tag: "B" };
+  const second = await manager.loadScript(started.value.sessionId, {
+    sourceKind: "inline",
+    source: "send('B');",
+  });
+  expect(second.ok).toBe(true);
+  if (second.ok) {
+    expect(second.value.messages).toHaveLength(1);
+    expect(second.value.messagesTruncated).toBe(false);
+  }
+  expect(manager.status(started.value.sessionId)?.messagesTruncated).toBe(true);
+  await manager.closeAll();
+});
+
+it("reports truncation when that script loses its own message", async () => {
   const { bindings, manager, started } = await startLocalAttachedSession();
   const session = bindings.device.session;
   expect(started.ok).toBe(true);
@@ -800,11 +997,48 @@ it("keeps an active script message bucket after its last message is evicted", as
     );
     expect(second.value.messagesTruncated).toBe(true);
   }
+  expect(manager.status(started.value.sessionId)?.messagesTruncated).toBe(true);
   expect(manager.status(started.value.sessionId)?.messages).toContainEqual(
     expect.objectContaining({
       script_id: second.ok ? second.value.scriptId : "",
       payload: { tag: "B2" },
     }),
+  );
+  await manager.closeAll();
+});
+
+it("retains the newest contiguous messages across repeated budget evictions", async () => {
+  const { bindings, manager, started } = await startLocalAttachedSession();
+  expect(started.ok).toBe(true);
+  if (!started.ok) return;
+  bindings.device.session.nextPayload = { index: -1 };
+  const loaded = await manager.loadScript(started.value.sessionId, {
+    sourceKind: "inline",
+    source: "send({index: -1});",
+  });
+  expect(loaded.ok).toBe(true);
+  const script = bindings.device.session.scripts[0];
+  expect(script).toBeDefined();
+  if (script === undefined) return;
+
+  // About 500 of these fit the 16 MiB budget, so 2,000 sends evict and
+  // compact the queue several times.
+  const filler = "x".repeat(32_000);
+  for (let index = 0; index < 2_000; index += 1)
+    script.message.emit({ type: "send", payload: { index, filler } }, null);
+
+  const status = manager.status(started.value.sessionId);
+  expect(status?.messagesTruncated).toBe(true);
+  const indexes = (status?.messages ?? []).map(
+    (message) => (message as { payload: { index: number } }).payload.index,
+  );
+  expect(indexes.length).toBeGreaterThan(400);
+  expect(indexes.at(-1)).toBe(1_999);
+  expect(indexes).toEqual(
+    Array.from(
+      { length: indexes.length },
+      (_, offset) => 2_000 - indexes.length + offset,
+    ),
   );
   await manager.closeAll();
 });
@@ -888,6 +1122,73 @@ it("redacts remote credentials and maps a missing optional binding", async () =>
   expect(unavailable.ok).toBe(false);
   if (!unavailable.ok)
     expect(unavailable.error.message).toContain("Cannot find package 'frida'");
+});
+
+it("clears current binding failure after recovery", async () => {
+  const bindings = new FakeDeviceManager();
+  let attempts = 0;
+  const manager = new FridaInstrumentationManager({
+    deviceManagerLoader: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient binding load failure");
+      return bindings;
+    },
+  });
+
+  const failed = await manager.listDevices();
+  expect(failed.ok).toBe(false);
+  if (!failed.ok)
+    expect(failed.error.message).toContain("transient binding load failure");
+  expect(manager.availabilityFailure()?.reason).toBe(
+    "transient binding load failure",
+  );
+
+  const recovered = await manager.listDevices();
+  expect(recovered.ok).toBe(true);
+  expect(manager.availabilityFailure()).toBeUndefined();
+});
+
+it("keeps remote option conflicts as actionable invalid input", async () => {
+  const manager = new FridaInstrumentationManager({
+    deviceManager: new FakeDeviceManager(),
+  });
+  const retained = await manager.startSession({
+    mode: "attach",
+    remote: { address: "127.0.0.1:27042", token: "first-token" },
+    pid: 512,
+  });
+  expect(retained.ok).toBe(true);
+  if (!retained.ok) return;
+
+  const conflicting = [
+    await manager.listDevices({
+      address: "127.0.0.1:27042",
+      token: "other-token",
+    }),
+    await manager.listProcesses({
+      remote: { address: "127.0.0.1:27042", token: "other-token" },
+    }),
+    await manager.startSession({
+      mode: "attach",
+      remote: { address: "127.0.0.1:27042", token: "other-token" },
+      pid: 512,
+    }),
+  ];
+  for (const result of conflicting) {
+    expect(result.ok).toBe(false);
+    if (result.ok) continue;
+    if (!(result.error instanceof AnalysisInputError)) throw result.error;
+    expect(result.error.operation).not.toBe("frida_remote_connection");
+    expect(result.error.issues).toContainEqual(
+      expect.objectContaining({
+        path: ["remote"],
+        reason: "invalid_value",
+        message: expect.stringContaining("different connection options"),
+      }),
+    );
+    expect(result.error.message).not.toContain("other-token");
+  }
+  await manager.closeAll();
 });
 
 it("redacts remote credentials echoed by a target script", async () => {
@@ -985,6 +1286,28 @@ it("serializes script loading against concurrent close and unloads the loaded sc
   expect((await closing).ok).toBe(true);
   expect(bindings.device.session.scripts[0]?.isDestroyed).toBe(true);
   expect(bindings.device.session.isDetached()).toBe(true);
+});
+
+it("drains startup when the provider loader initiates shutdown", async () => {
+  const bindings = new FakeDeviceManager();
+  let closing: Promise<void> | undefined;
+  const manager = new FridaInstrumentationManager({
+    deviceManagerLoader: async () => {
+      closing = manager.closeAll();
+      return bindings;
+    },
+  });
+  const started = await manager.startSession({
+    mode: "spawn",
+    deviceId: "local",
+    program: "/tmp/fixture",
+  });
+  if (!started.ok) throw started.error;
+  expect(closing).toBeDefined();
+  await closing;
+  expect(bindings.device.session.isDetached()).toBe(true);
+  expect(bindings.device.resumed).toEqual([512]);
+  expect(manager.status(started.value.sessionId)).toBeUndefined();
 });
 
 it("names the unknown session or script ID it rejects", async () => {

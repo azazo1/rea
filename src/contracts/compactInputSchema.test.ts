@@ -162,6 +162,24 @@ describe("compact advertised input schema", () => {
       expect(compact(input)).toBe(canonical(input));
   });
 
+  it("does not reintroduce unsupported dialect keywords in reduced schemas", () => {
+    let nested: Record<string, unknown> = { type: "string" };
+    for (let level = 0; level < 12; level += 1)
+      nested = { type: "object", properties: { child: nested } };
+    const { schema, presentation } = compactAdvertisedInputSchema(
+      {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        properties: { deep: nested },
+        dependentRequired: { detail: ["target"] },
+      },
+      1_500,
+    );
+    expect(presentation).toBe("reduced");
+    expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
+    expect(schema).not.toHaveProperty("dependentRequired");
+  });
+
   it("keeps unconstrained JSON values explicit for client type inference", () => {
     const { schema } = compactAdvertisedInputSchema(
       {
@@ -173,10 +191,19 @@ describe("compact advertised input schema", () => {
     const properties = schema.properties as Record<string, unknown>;
     expect(properties.normalized_result).toEqual({
       type: ["null", "boolean", "object", "array", "number", "string"],
+      items: {},
     });
     expect(properties.literal).toEqual({ const: {} });
     const validate = new Ajv2020({ strict: false }).compile(schema);
-    for (const normalized_result of [null, true, {}, [], 42, "result"])
+    for (const normalized_result of [
+      null,
+      true,
+      {},
+      [],
+      42,
+      "result",
+      [[null, true, 42, "nested"], { values: [[], [false]] }],
+    ])
       expect(validate({ normalized_result })).toBe(true);
   });
 
@@ -245,11 +272,24 @@ describe("compact input schema budget and reduction", () => {
     expect(presentation).toBe("reduced");
     expect(schema.properties).toEqual({
       capture: { type: "object", description: "Complete capture." },
-      observations: { type: "array" },
+      observations: {
+        type: "array",
+        items: {
+          type: ["null", "boolean", "object", "array", "number", "string"],
+          items: {},
+        },
+      },
       label: { type: ["string", "null"] },
     });
     const validate = new Ajv2020({ strict: false }).compile(schema);
     expect(validate({ capture: {}, observations: [], label: null })).toBe(true);
+    expect(
+      validate({
+        capture: {},
+        observations: [[[null, true, 42, "nested"], { values: [[], [false]] }]],
+        label: null,
+      }),
+    ).toBe(true);
     expect(validate({ capture: {}, observations: [], label: "capture" })).toBe(
       true,
     );

@@ -1,6 +1,9 @@
 import { z } from "zod";
 
-import { parseEnvironment } from "../config/environment.js";
+import {
+  parseEnvironment,
+  parseEnvironmentValues,
+} from "../config/environment.js";
 import { ConfigurationError } from "../domain/configurationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
@@ -10,14 +13,54 @@ import {
 import { PRODUCT_IDENTITY } from "../identity.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { dshDocument } from "./DshCordisPatch.js";
+import type { McpToolTimeoutInputs } from "../mcpStartupPolicy.js";
+import type { AnalysisProviderSelector } from "../contracts/providerSelection.js";
+
+export type ProviderRequestBudgetResolver = (
+  analysisProvider: AnalysisProviderSelector,
+  environment: Readonly<Record<string, string>>,
+) => Result<number | undefined, ConfigurationError>;
+
+export interface ClientRegistrationEnvironmentDetails {
+  readonly values: Readonly<Record<string, string>>;
+  readonly timeoutInputs: McpToolTimeoutInputs;
+}
 
 /** Read explicit REA overrides without dropping peers when one value is invalid. */
 export const clientRegistrationEnvironment = (
   parsed: ClientConfigurationDocument | undefined,
   overrides: Readonly<Record<string, string>> = {},
+  validation: "fragment" | "effective" = "effective",
 ): Result<Readonly<Record<string, string>>, ConfigurationError> => {
   if (parsed?.dialect === "dsh")
-    return dshDocument(parsed.document).environment(overrides);
+    return dshDocument(parsed.document).environment(overrides, validation);
+  const details = clientRegistrationEnvironmentDetails(
+    parsed,
+    overrides,
+    validation,
+  );
+  return details.ok ? ok(details.value.values) : details;
+};
+
+/** Retain original strings and the parser-owned timeout facts. */
+export const clientRegistrationEnvironmentDetails = (
+  parsed: ClientConfigurationDocument | undefined,
+  overrides: Readonly<Record<string, string>> = {},
+  validation: "fragment" | "effective" = "effective",
+  resolveProviderRequestBudget?: ProviderRequestBudgetResolver,
+): Result<ClientRegistrationEnvironmentDetails, ConfigurationError> => {
+  if (parsed?.dialect === "dsh") {
+    const environment = dshDocument(parsed.document).environment(
+      overrides,
+      validation,
+    );
+    if (!environment.ok) return environment;
+    return validatedDetails(
+      environment.value,
+      validation,
+      resolveProviderRequestBudget,
+    );
+  }
   const key =
     parsed?.dialect === "opencode" || parsed?.dialect === "opencode_v2"
       ? "environment"
@@ -46,13 +89,45 @@ export const clientRegistrationEnvironment = (
   // Validate known settings with the runtime's parser, but retain the original
   // string overrides, including unknown client-specific keys and no defaults.
   const environment = { ...existing.data, ...overrides };
-  const validated = parseEnvironment(environment);
+  return validatedDetails(
+    environment,
+    validation,
+    resolveProviderRequestBudget,
+  );
+};
+
+const validatedDetails = (
+  environment: Readonly<Record<string, string>>,
+  validation: "fragment" | "effective",
+  resolveProviderRequestBudget?: ProviderRequestBudgetResolver,
+): Result<ClientRegistrationEnvironmentDetails, ConfigurationError> => {
+  const validated =
+    validation === "fragment"
+      ? parseEnvironmentValues(environment)
+      : parseEnvironment(environment);
   if (!validated.ok) return validated;
-  return ok(
-    Object.fromEntries(
+  const providerRequestBudget =
+    resolveProviderRequestBudget?.(
+      validated.value.REA_ANALYSIS_PROVIDER,
+      environment,
+    ) ?? ok(undefined);
+  if (!providerRequestBudget.ok) return providerRequestBudget;
+  return ok({
+    values: Object.fromEntries(
       Object.entries(environment).sort(([left], [right]) =>
         compareUnicodeCodePoints(left, right),
       ),
     ),
-  );
+    timeoutInputs: {
+      analysisProvider: validated.value.REA_ANALYSIS_PROVIDER,
+      ghidraStartupTimeoutMs: validated.value.REA_GHIDRA_STARTUP_TIMEOUT_MS,
+      hopperStartupTimeoutMs: validated.value.REA_HOPPER_STARTUP_TIMEOUT_MS,
+      ...(validated.value.REA_JEB_MCP_TIMEOUT_MS === undefined
+        ? {}
+        : { jebMcpTimeoutMs: validated.value.REA_JEB_MCP_TIMEOUT_MS }),
+      ...(providerRequestBudget.value === undefined
+        ? {}
+        : { providerRequestTimeoutMs: providerRequestBudget.value }),
+    },
+  });
 };

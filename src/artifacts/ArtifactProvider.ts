@@ -27,6 +27,7 @@ import {
 } from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCapabilityUnavailableError,
+  AnalysisCancelledError,
   AnalysisInputError,
   AnalysisUnsupportedTargetError,
 } from "../domain/analysisErrorCore.js";
@@ -37,9 +38,14 @@ import { interfaceBuilderLimitsSchema } from "../domain/apple/interfaceBuilderGr
 import { err, ok, type Result } from "../domain/result.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import { ArtifactResourceScope } from "./ArtifactResourceScope.js";
+import {
+  artifactFileCancellationCause,
+  bindArtifactFileCleanup,
+} from "./ArtifactFileOperation.js";
 import { artifactCapabilities } from "./ArtifactProviderMetadata.js";
 import { ARTIFACT_GRAPH_PROVIDER } from "../application/InvestigationProviders.js";
 import { createEvidence } from "../domain/evidence.js";
+import { freezeJsonSnapshot } from "../domain/immutableJson.js";
 import { createArtifactInspection } from "../domain/artifactInspection.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 
@@ -233,18 +239,18 @@ class ArtifactClient implements AnalysisClient {
       (cause: unknown) => {
         const failure =
           cause instanceof ArtifactReaderFailure ? cause : undefined;
-        return err(
-          new ProviderCleanupError(
-            ARTIFACT_GRAPH_PROVIDER.id,
-            failure?.cleanup?.resources ?? ["artifact resources"],
-            {
-              reason:
-                failure?.cleanup?.reason ??
-                (cause instanceof Error ? cause.message : String(cause)),
-            },
-            { cause, operation: "close_binary" },
-          ),
+        const error = new ProviderCleanupError(
+          ARTIFACT_GRAPH_PROVIDER.id,
+          failure?.cleanup?.resources ?? ["artifact resources"],
+          {
+            reason:
+              failure?.cleanup?.reason ??
+              (cause instanceof Error ? cause.message : String(cause)),
+          },
+          { cause, operation: "close_binary" },
         );
+        bindArtifactFileCleanup(cause, error);
+        return err(error);
       },
     );
   }
@@ -314,6 +320,7 @@ class ArtifactClient implements AnalysisClient {
       targetSha256: this.target.sha256,
       enumerateRoots: bundle !== undefined,
       parameters,
+      resourceScope: this.#resourceScope,
       ...(options?.signal === undefined ? {} : { signal: options.signal }),
     });
     return ok(
@@ -341,7 +348,11 @@ class ArtifactClient implements AnalysisClient {
       total: 1,
       message: "inventory substep started",
     });
-    const inventory = await this.inventory(inventoryParameters, options);
+    // The freshly parsed inventory is exclusively owned here. Sealing it lets
+    // the nested Evidence share it instead of cloning and re-digesting it.
+    const inventory = freezeJsonSnapshot(
+      await this.inventory(inventoryParameters, options),
+    );
     const subject = subjectFor(
       this.target.sourcePath ?? this.target.path,
       inventory.manifest,
@@ -355,7 +366,10 @@ class ArtifactClient implements AnalysisClient {
       // The nested inventory already names every occurrence's logical path.
       locations: [],
     });
-    const result = createArtifactInspection(inventoryEvidence);
+    // The returned execution and its Evidence then reuse this owned report.
+    const result = freezeJsonSnapshot(
+      createArtifactInspection(inventoryEvidence),
+    );
     await options?.progress?.report({
       phase: "inspect_artifact.inventory",
       completed: 1,
@@ -399,23 +413,31 @@ export const translateArtifactFailure = (
   operation: ArtifactAnalysisOperation,
   cause: unknown,
 ): AnalysisError => {
-  if (cause instanceof ArtifactReaderFailure)
-    return new ArtifactOperationError(
+  if (cause instanceof ArtifactReaderFailure) {
+    const error = new ArtifactOperationError(
       operation,
       cause.reason,
       cause.details,
       cause.message,
       {
+        cause:
+          cause.reason === "cancelled"
+            ? artifactFileCancellationCause(cause)
+            : cause,
         ...(cause.cleanup === undefined ? {} : { cleanup: cause.cleanup }),
         ...(cause.partialObservation === undefined
           ? {}
           : { partialObservation: cause.partialObservation }),
       },
     );
+    bindArtifactFileCleanup(cause, error);
+    return error;
+  }
   // Caller-selection and unsupported-target failures are already typed; keep
   // their correction details instead of reducing them to an I/O failure.
   if (
     cause instanceof AnalysisInputError ||
+    cause instanceof AnalysisCancelledError ||
     cause instanceof AnalysisUnsupportedTargetError
   )
     return cause;

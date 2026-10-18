@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
 import { expect } from "vitest";
 import { z } from "zod";
 
@@ -5,11 +8,25 @@ import { javascriptApplicationAnalysisResultSchema } from "../../../src/domain/j
 import { connectLocalToolsMcp } from "../../fixtures/localToolsMcp.js";
 import type { TestCli } from "./cliFixture.js";
 
-/** Analyze a directory through a public adapter and validate its result contract. */
+const execute = promisify(execFile);
+
+export const runNodeJsonControl = async (
+  root: string,
+  filename: string,
+): Promise<unknown> => {
+  const { stdout } = await execute(process.execPath, [filename], {
+    cwd: root,
+    timeout: 5_000,
+  });
+  return JSON.parse(stdout) as unknown;
+};
+
+/** Analyze a directory; a supplied MCP caller reuses its test-owned connection. */
 export const analyzeJavaScriptDirectory = async (
   surface: "CLI" | "stdio MCP",
   cli: TestCli,
   root: string,
+  mcpCall?: Awaited<ReturnType<typeof connectLocalToolsMcp>>["call"],
 ) => {
   let document: unknown;
   if (surface === "CLI") {
@@ -20,7 +37,7 @@ export const analyzeJavaScriptDirectory = async (
     expect(response.exitCode, response.stderr).toBe(0);
     document = response.json;
   } else {
-    const { call } = await connectLocalToolsMcp();
+    const call = mcpCall ?? (await connectLocalToolsMcp()).call;
     const response = await call("analyze_javascript_application", {
       input_path: root,
       format: "directory",

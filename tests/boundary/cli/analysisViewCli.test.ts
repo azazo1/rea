@@ -1,4 +1,5 @@
 import { apiSurfaceHar } from "../../fixtures/historicalHar.js";
+import { inspectAnalysisView } from "../../../src/application/analysisView/AnalysisViewService.js";
 import { createHash } from "node:crypto";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -14,11 +15,134 @@ import {
   analysisViewCaptureFixture,
   analysisViewCaptureEvidence,
   analysisViewObjectDenseCapture,
+  analysisViewJavaScriptEvidence,
+  analysisViewJavaScriptAnalysisWithSource,
+  analysisViewNativeEvidence,
 } from "../../fixtures/analysisView.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 import { ghidraFunctionDossier } from "../../../src/domain/ghidraValues.fixture.js";
 import { createEvidenceBundle } from "../../../src/domain/evidenceBundle.js";
 import { inspectEvidenceBundle } from "../../../src/application/investigation/InspectEvidenceBundle.js";
+
+cliTest(
+  "preserves native relationship coverage independently of exhausted CLI pages",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-native-coverage-cli-");
+    const parent = analysisViewNativeEvidence({
+      status: "partial",
+      limited_directions: ["callees"],
+      limitations: ["Callees: fixture read limit"],
+      diagnostics: ["Fixture relationship diagnostic"],
+    });
+    const parentBefore = JSON.stringify(parent);
+    const request = join(root, "request.json");
+    await writeFile(
+      request,
+      JSON.stringify({
+        source: { kind: "inline", evidence: parent },
+        view: { kind: "native", facet: "callees", offset: 0, limit: 1 },
+      }),
+    );
+    const response = await cli.run({
+      arguments: ["inspect-analysis-view", request, "--json"],
+    });
+    expect(response.exitCode).toBe(0);
+    const evidence = parseEvidence(response.json);
+    expect(evidence.relationship_coverage).toEqual(
+      parent.relationship_coverage,
+    );
+    expect(evidence.normalized_result).toMatchObject({
+      item: [],
+      coverage: { total: 0, exhausted: true },
+      limitations: expect.arrayContaining(["Fixture dossier caveat"]),
+    });
+    expect(evidence.evidence_links).toEqual([parent.evidence_id]);
+    expect(JSON.stringify(parent)).toBe(parentBefore);
+  },
+);
+
+cliTest(
+  "reads typed module references through the public CLI with canonical Evidence",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-module-reference-cli-");
+    const request = join(root, "request.json");
+    const parent = analysisViewJavaScriptEvidence(
+      analysisViewJavaScriptAnalysisWithSource(),
+    );
+    const input = {
+      source: { kind: "inline", evidence: parent },
+      view: {
+        kind: "javascript",
+        collection: "modules",
+        projection: "references",
+        where: { path: "renderer.js" },
+        limit: 1,
+      },
+    };
+    const expected = inspectAnalysisView(input);
+    if (!expected.ok) throw expected.error;
+    await writeFile(request, JSON.stringify(input));
+    const response = await cli.run({
+      arguments: ["inspect-analysis-view", request, "--json"],
+    });
+    expect(response.exitCode).toBe(0);
+    const evidence = parseEvidence(response.json);
+    expect(evidence.normalized_result).toEqual(
+      expected.value.normalized_result,
+    );
+    expect(evidence.evidence_id).toBe(expected.value.evidence_id);
+    expect(evidence.evidence_links).toEqual([parent.evidence_id]);
+  },
+);
+cliTest(
+  "projects opted-in query names through compiled CLI without query values",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-query-names-cli-");
+    const path = join(root, "view.json");
+    const capture = analysisViewCaptureFixture();
+    capture.records = capture.records.slice(0, 2);
+    capture.total_records = 2;
+    capture.records.forEach((record, index) => {
+      record.reported = {
+        request: {
+          method: "GET",
+          url:
+            index === 0
+              ? "https://api.test/products?category=books&page=1&category=repeat"
+              : "https://api.test/products?category=games&sort=price#ignored",
+        },
+      };
+    });
+    await writeFile(
+      path,
+      JSON.stringify({
+        source: {
+          kind: "inline",
+          evidence: analysisViewCaptureEvidence(capture),
+        },
+        view: { kind: "api-surface", include_query_parameter_names: true },
+      }),
+    );
+    const result = await cli.run({
+      arguments: ["inspect-analysis-view", path, "--json"],
+    });
+    expect(result.exitCode).toBe(0);
+    const evidence = parseEvidence(result.json);
+    expect(evidence.normalized_result).toMatchObject({
+      groups: [
+        {
+          query_parameter_names: [
+            { name: "category", record_ordinals: [0, 1] },
+            { name: "page", record_ordinals: [0] },
+            { name: "sort", record_ordinals: [1] },
+          ],
+        },
+      ],
+    });
+    for (const value of ["books", "games", "repeat", "price", "ignored"])
+      expect(result.stdout).not.toContain(value);
+  },
+);
 
 cliTest(
   "projects portable artifact inventory after the original ZIP is removed",

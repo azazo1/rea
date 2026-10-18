@@ -4,7 +4,7 @@
 in an existing capture. Network, USB or Bluetooth recordings can use the same
 field/filter interface when the installed TShark supports their encapsulation
 and dissectors. This tool does not acquire traffic, open an interface or control
-a device. HAR/mitmproxy web-capture workflows remain separate.
+a device. HAR/SAZ/mitmproxy web-capture workflows remain separate.
 
 Supply an existing TShark 4.x installation **on Linux**, with util-linux
 `prlimit` available at `/usr/bin/prlimit`. Override its absolute path with
@@ -53,6 +53,22 @@ input reading or change two-pass reassembly. Producer output must still fit its
 resource limit; use selected fields, a display filter or an input-packet limit
 when dissection output is too large. Each call checks the recording's current
 digest, so pages from different source digests must not be combined.
+
+For a question about a known input prefix, select `packet_limit` for that
+prefix, the fields needed for the answer, and a matching output window. For
+example, a question about the first twelve PostgreSQL TCP packets within
+original frames 1–2,000 can use fields `tcp.srcport`, `tcp.dstport`, `tcp.flags`,
+filter `tcp.port == 5432`, `packet_limit: 2000` and `match_limit: 12`.
+The matching count then describes that input prefix. A filter containing
+`frame.number <= 2000` without an input limit still reads the entire capture;
+returning twelve rows does not limit producer output. These controls answer a
+bounded question and must not be used to infer whole-capture absence.
+
+Discover unfamiliar field names with `inspect_packet_fields`, using an exact
+protocol and a narrow query. If the installed names are already established,
+direct field selection avoids an additional glossary probe. Count discovery
+and any retries when comparing investigation cost; a small page alone does
+not establish a faster workflow.
 
 Additional selections:
 
@@ -128,3 +144,49 @@ Each provider admits one inspection at a time, including acquisition and cleanup
 An occupied provider returns a retryable capacity error before acquiring another
 file or worker. Closing the provider stops new admission and drains accepted work;
 failed cleanup remains owned and can be retried.
+
+## Discover protocols and field names
+
+`inspect_packet_fields` / `inspect-packet-fields` queries the installed TShark
+registration glossary before selecting fields for capture inspection:
+
+```sh
+rea inspect-packet-fields --query usb
+rea inspect-packet-fields --kind fields --protocol usb --query idVendor
+rea inspect-packet-fields --kind fields --protocol udp --all
+```
+
+`kind` defaults to `protocols`; `fields` selects field definitions. `protocol`
+selects an exact protocol abbreviation (the protocol itself or its child fields).
+`query` is a case-insensitive literal substring in name, abbreviation or field
+description. `offset` skips matching records; `limit` defaults to 50. MCP
+`limit: null` or CLI `--all` requests all remaining matches within the resource
+budget. `--all` and `--limit` conflict. The window reports examined records of
+the selected kind before filters, matching records, returned records and
+`has_more`; it never counts capture packets.
+
+Returned records preserve field type, parent protocol, display base, bitmask,
+description and original glossary line number. Empty producer strings remain
+empty; protocol records have null field-only properties. Repeated abbreviations
+remain separate registrations. A listed field is an installation capability, not
+proof that the field appears in a selected recording.
+
+The adapter uses the documented `tshark -G fields` grammar under its existing
+private empty profile and Linux process limits. TShark 4.6.9's full glossary was
+measured at 22,303,197 bytes; discovery admits at most **32 MiB** combined command
+output (capture inspection remains at **4 MiB**). Parsing walks lines once and
+constructs objects only for the selected page. Returned strings are copied so
+retained pages do not retain the complete glossary string. Before constructing a selected
+record it charges six times the source UTF-8 bytes plus 512 bytes against an
+**8 MiB** representation budget, covering JSON escaping and record bookkeeping.
+If that budget would be exceeded, narrow the query or page size; results are not
+silently truncated. This is a conservative admission budget, not measured heap
+usage. Parent pipe buffers and producer per-process limits remain distinct.
+
+Tool/limiter identity, version, stderr and selected arguments are retained in
+Evidence. No capture, interface or device is opened. Discovery shares capture
+analysis's admission slot and cleanup owner. Each call rereads the glossary;
+installed plugins, libraries and global configuration remain trusted and are not
+fully fingerprinted. There is no cache or snapshot-consistent pagination claim.
+The real Linux lane checks public CLI/MCP queries against the direct glossary,
+including USB vendor-ID typing, negative queries and paging.

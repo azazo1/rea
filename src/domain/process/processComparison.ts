@@ -1,7 +1,10 @@
 import canonicalize from "canonicalize";
 import { z } from "zod";
 import { processSourceTruncated } from "./processCaptureCoverage.js";
-import type { ProcessObservationSource } from "./processObservation.js";
+import type {
+  ProcessObservationLocation,
+  ProcessObservationSource,
+} from "./processObservation.js";
 
 import type { ProcessCapture } from "./processCaptureParsing.js";
 import { comparableTerminalFrame } from "./processObservation.js";
@@ -165,17 +168,25 @@ type DivergenceDimension = Exclude<
   { readonly status: "none" | "unknown" }
 >["dimension"];
 
-const eventTime = (value: unknown): number | null => {
-  if (
-    typeof value === "object" &&
-    value !== null &&
-    "at_ms" in value &&
-    typeof value.at_ms === "number" &&
-    Number.isSafeInteger(value.at_ms) &&
-    value.at_ms >= 0
-  )
-    return value.at_ms;
-  return null;
+// Interactions record when their outcome was observed as the dispatch time;
+// every other timed observation uses at_ms.
+const EVENT_TIME_FIELD: Readonly<Record<DivergenceDimension, string>> = {
+  terminal: "at_ms",
+  interaction: "dispatched_at_ms",
+  exit: "at_ms",
+  filesystem: "at_ms",
+  process: "at_ms",
+};
+
+const eventTime = (
+  dimension: DivergenceDimension,
+  value: unknown,
+): number | null => {
+  if (typeof value !== "object" || value === null) return null;
+  const time: unknown = Reflect.get(value, EVENT_TIME_FIELD[dimension]);
+  return typeof time === "number" && Number.isSafeInteger(time) && time >= 0
+    ? time
+    : null;
 };
 
 const firstCollectionDivergence = (
@@ -195,8 +206,8 @@ const firstCollectionDivergence = (
       status: "found",
       dimension,
       index,
-      left_at_ms: eventTime(leftValue),
-      right_at_ms: eventTime(rightValue),
+      left_at_ms: eventTime(dimension, leftValue),
+      right_at_ms: eventTime(dimension, rightValue),
       left: jsonValueSchema.parse(leftValue),
       right: jsonValueSchema.parse(rightValue),
     };
@@ -291,6 +302,18 @@ const differingContractFields = (
     )
     .sort();
 
+const LOCATION_SOURCES = {
+  frames: "terminal_raw",
+  rendered_frames: "terminal_rendered",
+  interaction_events: "interaction",
+  lifecycle: "lifecycle",
+  process_samples: "process",
+  filesystem_checkpoints: "filesystem",
+} as const satisfies Record<
+  ProcessObservationLocation["collection"],
+  ProcessObservationSource
+>;
+
 const applyTraceVerdict = (
   dimensions: ComparisonDimensions,
   specification: ProcessTraceSpecification,
@@ -306,6 +329,21 @@ const applyTraceVerdict = (
         : "changed";
   const sources = new Set(specification.events.map(({ source }) => source));
   const covered = dimensionsForTraceSources(sources);
+  // A different verdict names the failing events and observations; attribute
+  // it only to their dimensions; unrelated comparisons keep their own status,
+  // including unknown coverage and independently observed additions/removals.
+  const diagnosticSources = new Set<ProcessObservationSource>([
+    ...specification.events
+      .filter(({ id }) => trace.diagnostic?.event_ids.includes(id) === true)
+      .map(({ source }) => source),
+    ...(trace.diagnostic?.locations ?? []).map(
+      ({ collection }) => LOCATION_SOURCES[collection],
+    ),
+  ]);
+  const attributed =
+    diagnosticSources.size > 0
+      ? dimensionsForTraceSources(diagnosticSources)
+      : covered;
   const statusFor = (
     dimension: (typeof PROCESS_COMPARISON_DIMENSIONS)[number],
   ): ComparisonStatus => {
@@ -313,7 +351,9 @@ const applyTraceVerdict = (
     if (!covered.has(dimension)) return exact;
     if (trace.verdict === "nonconforming") return exact;
     if (trace.verdict === "different")
-      return traceShowsDifference ? "changed" : exact;
+      return traceShowsDifference && attributed.has(dimension)
+        ? "changed"
+        : exact;
     if (
       trace.verdict === "unknown" &&
       ["changed", "added", "removed"].includes(exact)

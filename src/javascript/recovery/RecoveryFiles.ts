@@ -1,6 +1,6 @@
+import { regularFileCancellation } from "../../filesystem/OwnedRegularFile.js";
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, mkdir, open, opendir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, opendir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 import { normalizeArtifactPath } from "../../artifacts/ArtifactPaths.js";
@@ -8,8 +8,14 @@ import {
   AnalysisCancelledError,
   AnalysisInputError,
   AnalysisOutputError,
+  AnalysisResourceConstraintError,
   AnalysisTimeoutError,
 } from "../../domain/analysisErrorCore.js";
+import {
+  NonRegularFileReadError,
+  openRegularFile,
+  RegularFileAdmissionFailure,
+} from "../../filesystem/RegularFile.js";
 import { RECOVERY_LIMITS } from "./WakaruRelease.js";
 
 const OPERATION = "recover_javascript_sources";
@@ -18,6 +24,16 @@ const OPERATION = "recover_javascript_sources";
 export const recoveryDigest = (bytes: Uint8Array): string =>
   createHash("sha256").update(bytes).digest("hex");
 
+/** A file exceeded the byte bound its caller selected; the caller owns what that bound means. */
+class RecoveryFileSizeError extends AnalysisOutputError {
+  constructor(
+    reason: string,
+    readonly maximum: number,
+  ) {
+    super(OPERATION, reason);
+  }
+}
+
 /** Read a stable regular file without retaining bytes during engine fingerprinting. */
 const scanRecoveryFile = async (
   path: string,
@@ -25,14 +41,33 @@ const scanRecoveryFile = async (
   consume: (chunk: Buffer) => void,
   signal?: AbortSignal,
 ) => {
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  const hash = createHash("sha256");
-  try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.size > maximum)
+  // A FIFO without a writer must be rejected before it can block the open.
+  const handle = await openRegularFile(path, {
+    symlinks: "reject",
+    signal,
+  }).catch((cause: unknown) => {
+    // A descriptor whose close failed stays owned by its error, even when
+    // cancellation was also requested.
+    if (cause instanceof RegularFileAdmissionFailure) throw cause;
+    const cancellation = regularFileCancellation(cause);
+    if (cancellation !== undefined)
+      throw new AnalysisCancelledError(OPERATION, {
+        cause: cancellation.reason,
+      });
+    if (cause instanceof NonRegularFileReadError)
       throw new AnalysisOutputError(
         OPERATION,
         `Expected a regular file no larger than ${String(maximum)} bytes: ${path}`,
+      );
+    throw cause;
+  });
+  const hash = createHash("sha256");
+  try {
+    const before = await handle.stat();
+    if (before.size > maximum)
+      throw new RecoveryFileSizeError(
+        `Expected a regular file no larger than ${String(maximum)} bytes: ${path}`,
+        maximum,
       );
     let bytes = 0;
     for await (const raw of handle.createReadStream({ autoClose: false })) {
@@ -40,9 +75,9 @@ const scanRecoveryFile = async (
       const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
       bytes += chunk.length;
       if (bytes > maximum)
-        throw new AnalysisOutputError(
-          OPERATION,
+        throw new RecoveryFileSizeError(
           `File exceeds ${String(maximum)} bytes: ${path}`,
+          maximum,
         );
       hash.update(chunk);
       consume(chunk);
@@ -114,14 +149,43 @@ const snapshotRecoveryInput = async (
   let bytes: Buffer;
   try {
     bytes = await readRecoveryFile(path, maximum, signal);
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch (cause: unknown) {
     if (cause instanceof AnalysisCancelledError) throw cause;
+    // The operation-wide input allowance is a deterministic byte budget, not
+    // a malformed argument; the same selection fails again unchanged.
+    if (cause instanceof RecoveryFileSizeError)
+      throw new AnalysisResourceConstraintError(
+        OPERATION,
+        "file-size",
+        `Selected JavaScript input ${path} exceeds the ${String(cause.maximum)} bytes remaining of the ${String(RECOVERY_LIMITS.inputBytes)}-byte total input allowance`,
+        {
+          maximum_input_bytes: RECOVERY_LIMITS.inputBytes,
+          remaining_input_bytes: cause.maximum,
+        },
+        {
+          cause,
+          retryable: false,
+          remediationAction:
+            "Select JavaScript inputs whose combined size is within maximum_input_bytes. Do not truncate required source; retrying the unchanged selection will fail again.",
+        },
+      );
     throw recoveryInputFailure(
       "path",
       `Cannot snapshot UTF-8 JavaScript input ${path}: ${recoveryFailureMessage(cause)}`,
       cause,
     );
+  }
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (cause: unknown) {
+    throw new AnalysisInputError(OPERATION, { cause }, [
+      {
+        path: ["path"],
+        reason: "invalid_format",
+        expected: "UTF-8",
+        message: `JavaScript input is not valid UTF-8: ${path}`,
+      },
+    ]);
   }
   await mkdir(dirname(snapshotPath), { recursive: true, mode: 0o700 });
   await writeFile(snapshotPath, bytes, { flag: "wx", mode: 0o600 });
@@ -167,6 +231,11 @@ export const snapshotRecoveryInputs = async (
         ? "bundle.js"
         : relative(commonDirectory, resolve(path)).split(sep).join("/");
     try {
+      // Wakaru's multi-input public paths interpret backslashes as separators.
+      if (relativePath.includes("\\"))
+        throw new TypeError(
+          "Wakaru cannot preserve literal backslashes in input paths",
+        );
       if (normalizeArtifactPath(relativePath) !== relativePath)
         throw new TypeError(
           "Input names must already use NFC Unicode spelling",
@@ -279,6 +348,6 @@ export const checkRecoveryDeadline = (
   signal?: AbortSignal,
 ): void => {
   checkRecoveryCancellation(signal);
-  if (Date.now() >= deadline)
+  if (performance.now() >= deadline)
     throw new AnalysisTimeoutError(OPERATION, RECOVERY_LIMITS.timeoutMs);
 };

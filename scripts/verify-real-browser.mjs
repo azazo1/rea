@@ -9,7 +9,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CdpBrowserProvider } from "../dist/browser/CdpBrowserProvider.js";
-import { waitForBrowserDevtoolsPort } from "../dist/browser/BrowserProcessStartup.js";
+import {
+  BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
+  waitForBrowserDevtoolsPort,
+} from "../dist/browser/BrowserProcessStartup.js";
 import { createBrowserScenarioProvider } from "../dist/composition/browserScenario.js";
 import {
   inspectWebPageInputSchema,
@@ -36,31 +39,39 @@ import {
   verifyScenarioFailureEvidence,
 } from "./lib/browser-scenario-verifier.mjs";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
+import { closeVerifierResources } from "./lib/verifier-cleanup.mjs";
+import { requireOrdinaryWindowsVerifierCaller } from "./lib/windows-ordinary-user-verifier.mjs";
 import { verifyLargeScreenshotE2e } from "./lib/browser-screenshot-e2e.mjs";
 import { verifyPopupEventCoverage } from "./lib/browser-popup-e2e.mjs";
 import { verifyBrowserNetworkEvidence } from "./lib/browser-network-e2e.mjs";
 import { verifyBrowserScriptExport } from "./lib/browser-script-export-e2e.mjs";
 import { verifyBrowserModules } from "./lib/browser-module-e2e.mjs";
 import { verifyBrowserDomDestinations } from "./lib/browser-dom-destinations-e2e.mjs";
+import { verifyBrowserSocketTransport } from "./lib/browser-socket-e2e.mjs";
 import { verifyBrowserCaptureMetadataBudget } from "./lib/browser-capture-metadata-budget-e2e.mjs";
 import { artifactCliEvidence, artifactMcpResult } from "./lib/artifact-e2e.mjs";
 import { verifyScenarioEnvironment } from "./lib/browser-scenario-environment-e2e.mjs";
 import { verifyScenarioStorage } from "./lib/browser-scenario-storage-e2e.mjs";
+import { verifyScenarioServiceWorkers } from "./lib/browser-scenario-service-workers-e2e.mjs";
+import { verifyBrowserUrlUserInfo } from "./lib/browser-url-userinfo-e2e.mjs";
 
-const REAL_BROWSER_STARTUP_TIMEOUT_MS = 60_000;
 const SCENARIO_SECRET_VALUE = "rea-browser-verifier-secret";
 const SCENARIO_URL_SECRET_VALUE = "rea-browser-url-verifier-secret";
 process.env.REA_BROWSER_VERIFIER_SECRET = SCENARIO_SECRET_VALUE;
 process.env.REA_BROWSER_VERIFIER_URL = SCENARIO_URL_SECRET_VALUE;
 const verifierRun = createVerifierRun();
 
+await requireOrdinaryWindowsVerifierCaller();
 const executable = await browserExecutable();
-const profile = await mkdtemp(join(tmpdir(), "rea-real-browser-"));
-const site = await startBrowserVerifierSite();
+let profile;
+let site;
 let browser;
 let pageProxy;
 let report;
+let verificationError;
 try {
+  profile = await mkdtemp(join(tmpdir(), "rea-real-browser-"));
+  site = await startBrowserVerifierSite();
   browser = spawn(
     executable,
     [
@@ -92,7 +103,7 @@ try {
     executable,
     activePortPath: join(profile, "DevToolsActivePort"),
     stderr: () => stderr,
-    timeoutMs: REAL_BROWSER_STARTUP_TIMEOUT_MS,
+    timeoutMs: BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
   });
   const endpoint = `http://127.0.0.1:${String(port)}`;
   const provider = new CdpBrowserProvider();
@@ -232,6 +243,13 @@ try {
 
   pageProxy = await startPageCdpProxy(endpoint);
   await verifyPageScopedTransport(provider, pageProxy, site.origin);
+  const browserSocketTransport = await verifyBrowserSocketTransport({
+    provider,
+    profile,
+    endpoint,
+    target,
+    origin: site.origin,
+  });
   const attachedScenarioInput = browserScenario(
     {
       mode: "connect",
@@ -289,6 +307,11 @@ try {
     endpoint,
     targetId: target,
   });
+  process.stderr.write("Browser verifier: scenario service workers\n");
+  const scenarioServiceWorkers = await verifyScenarioServiceWorkers(
+    endpoint,
+    target,
+  );
   const launchedScenario = await createBrowserScenarioProvider(
     process.env,
   ).captureScenario(
@@ -356,6 +379,7 @@ try {
   });
   const moduleTrace = await verifyBrowserModules(executable);
   const captureMetadata = await verifyBrowserCaptureMetadataBudget(endpoint);
+  const urlUserInfo = await verifyBrowserUrlUserInfo(endpoint, site.origin);
   report = {
     browser: observed.value.browser.product,
     endpoint,
@@ -375,6 +399,7 @@ try {
     bundle_cli_and_stdio_mcp: true,
     sessionEvents: session.value.timeline.length,
     pageScopedTransport: true,
+    browserSocketTransport,
     screenshotBytes: screenshot.value.artifact.bytes,
     largeScreenshot,
     popupEvents,
@@ -382,6 +407,7 @@ try {
     scriptExport,
     moduleTrace,
     captureMetadata,
+    urlUserInfo,
     domDestinations,
     browserScenarioCli: true,
     browserScenarioAttachCleanup: "disconnected-external",
@@ -389,21 +415,42 @@ try {
     scenarioFailure,
     scenarioEnvironment,
     scenarioStorage,
+    scenarioServiceWorkers,
     verified: true,
   };
+} catch (cause) {
+  verificationError = cause;
+  throw cause;
 } finally {
-  process.stderr.write("Browser verifier cleanup: closing page proxy\n");
-  if (pageProxy !== undefined) await pageProxy.close();
-  process.stderr.write("Browser verifier cleanup: stopping owned Chrome\n");
-  if (browser !== undefined) await stopProcess(browser);
-  process.stderr.write("Browser verifier cleanup: closing fixture site\n");
-  await site.close();
-  await rm(profile, {
-    recursive: true,
-    force: true,
-    maxRetries: 10,
-    retryDelay: 100,
-  });
+  const cleanup = [];
+  if (pageProxy !== undefined) {
+    cleanup.push(async () => {
+      process.stderr.write("Browser verifier cleanup: closing page proxy\n");
+      await pageProxy.close();
+    });
+  }
+  if (browser !== undefined) {
+    cleanup.push(async () => {
+      process.stderr.write("Browser verifier cleanup: stopping owned Chrome\n");
+      await stopProcess(browser);
+    });
+  }
+  if (site !== undefined) {
+    cleanup.push(async () => {
+      process.stderr.write("Browser verifier cleanup: closing fixture site\n");
+      await site.close();
+    });
+  }
+  if (profile !== undefined)
+    cleanup.push(() =>
+      rm(profile, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100,
+      }),
+    );
+  await closeVerifierResources(cleanup, verificationError);
 }
 process.stdout.write(
   `${JSON.stringify({

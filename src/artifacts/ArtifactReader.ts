@@ -1,14 +1,27 @@
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import type { AnalysisCleanupLease } from "./AnalysisCleanupLease.js";
 import type { Readable } from "node:stream";
-import type { ArtifactCommand } from "../domain/artifactGraph.js";
+import type {
+  ArtifactCommand,
+  ArtifactInventoryCoverage,
+} from "../domain/artifactGraph.js";
 import type { ZipPackageFormat } from "../domain/zipPackageFormat.js";
 import type {
   AnalysisCleanupObservation,
   AnalysisPartialObservation,
 } from "../domain/analysisErrorBase.js";
 
+/** Which bound a `limit` failure hit, so callers need not infer it. */
+export type ArtifactReaderBoundary = "file-size" | "capacity" | "memory";
+
 export interface ArtifactReaderFailureOptions extends ErrorOptions {
-  readonly cleanup?: AnalysisCleanupObservation;
-  readonly partialObservation?: AnalysisPartialObservation;
+  readonly cancellation?: { readonly reason: unknown } | undefined;
+  readonly cleanup?: AnalysisCleanupObservation | undefined;
+  /** Exact authority for all reported cleanup; undefined leaves ownership unknown. */
+  readonly cleanupLeases?: readonly AnalysisCleanupLease[] | undefined;
+  readonly partialObservation?: AnalysisPartialObservation | undefined;
+  /** The constrained resource bound for a limit failure. */
+  readonly boundary?: ArtifactReaderBoundary;
 }
 
 /** Archive-neutral entry metadata. Reader adapters never choose output paths. */
@@ -90,10 +103,36 @@ export const sameArtifactEntry = (
   entry.sourceIdentity?.mtimeNs === produced.sourceIdentity?.mtimeNs &&
   entry.sourceIdentity?.ctimeNs === produced.sourceIdentity?.ctimeNs;
 
+/** One entry or subtree deliberately excluded from a traversal. */
+export interface ArtifactTraversalOmission {
+  readonly path: string;
+  readonly kind:
+    | "fifo"
+    | "socket"
+    | "block-device"
+    | "character-device"
+    | "unsupported"
+    | "directory-descendants";
+}
+
+/** Facts from an exhausted traversal, separate from entry content certainty. */
+export interface ArtifactReaderTraversal {
+  readonly status: ArtifactInventoryCoverage["status"];
+  readonly limitations: readonly string[];
+}
+
+/** Per-iterator observation sink; adapters report intentional omissions without shared state. */
+export interface ArtifactTraversalOptions {
+  readonly onOmission?: (omission: ArtifactTraversalOmission) => void;
+}
+
 /** Read-only adapter over one directory, archive, or virtual container. */
 export interface ArtifactReader {
   readonly format: "directory" | ZipPackageFormat | "asar" | "file";
-  entries(signal?: AbortSignal): AsyncIterable<ArtifactEntry>;
+  entries(
+    signal?: AbortSignal,
+    options?: ArtifactTraversalOptions,
+  ): AsyncIterable<ArtifactEntry>;
   open(entry: ArtifactEntry, signal?: AbortSignal): Promise<Readable>;
   provenance(): readonly ArtifactCommand[];
   close(): Promise<void>;
@@ -101,8 +140,12 @@ export interface ArtifactReader {
 
 /** Typed adapter failure translated at provider boundary. */
 export class ArtifactReaderFailure extends Error {
+  readonly cancellation: { readonly reason: unknown } | undefined;
   readonly cleanup: AnalysisCleanupObservation | undefined;
+  readonly cleanupLeases: readonly AnalysisCleanupLease[] | undefined;
   readonly partialObservation: AnalysisPartialObservation | undefined;
+  /** The constrained bound for a `limit` reason, when the reader knows it. */
+  readonly boundary: ArtifactReaderBoundary | undefined;
 
   constructor(
     readonly reason:
@@ -124,27 +167,59 @@ export class ArtifactReaderFailure extends Error {
   ) {
     super(message, options);
     this.name = "ArtifactReaderFailure";
+    this.cancellation =
+      reason === "cancelled"
+        ? (options?.cancellation ?? { reason: options?.cause })
+        : undefined;
     this.cleanup = options?.cleanup;
+    this.cleanupLeases =
+      options?.cleanupLeases ?? (this.cleanup === undefined ? [] : undefined);
     this.partialObservation = options?.partialObservation;
+    this.boundary = options?.boundary;
   }
 
-  /** Preserve the primary failure while attaching cleanup and any complete observation. */
+  /** Preserve the primary failure and observation. Supplied leases must cover all merged cleanup. */
   static withCleanup(
     cause: unknown,
     cleanup: AnalysisCleanupObservation,
     partialObservation?: AnalysisPartialObservation,
+    cleanupLeases?: readonly AnalysisCleanupLease[],
   ): ArtifactReaderFailure {
     const primary =
       cause instanceof ArtifactReaderFailure
         ? cause
-        : new ArtifactReaderFailure("io", errorMessage(cause), { cause });
+        : new ArtifactReaderFailure("io", errorMessage(cause), {
+            cause,
+            ...(cause instanceof AnalysisError
+              ? {
+                  partialObservation: cause.partialObservation,
+                  ...(cause.cleanupIncomplete
+                    ? {
+                        cleanup: ArtifactReaderFailure.cleanupObservation(
+                          cause,
+                          [],
+                        ),
+                      }
+                    : {}),
+                }
+              : {}),
+          });
     const mergedObservation = partialObservation ?? primary.partialObservation;
     return new ArtifactReaderFailure(
       primary.reason,
       primary.message,
       {
         cause: primary,
+        cancellation: primary.cancellation,
         cleanup: combineCleanup(primary.cleanup, cleanup),
+        cleanupLeases:
+          cleanupLeases ??
+          (cleanup === primary.cleanup ? primary.cleanupLeases : undefined),
+        // The constrained bound survives cleanup wrapping, or a file-size
+        // refusal would be reported as a memory constraint once a close fails.
+        ...(primary.boundary === undefined
+          ? {}
+          : { boundary: primary.boundary }),
         ...(mergedObservation === undefined
           ? {}
           : { partialObservation: mergedObservation }),
@@ -156,11 +231,19 @@ export class ArtifactReaderFailure extends Error {
   /** Give otherwise opaque cleanup failures a concrete owned resource. */
   static cleanupObservation(
     cause: unknown,
-    resource: string,
+    resource: string | readonly string[],
   ): AnalysisCleanupObservation {
     if (cause instanceof ArtifactReaderFailure && cause.cleanup !== undefined)
       return cause.cleanup;
-    return { reason: errorMessage(cause), resources: [resource] };
+    if (cause instanceof AnalysisError && cause.cleanupIncomplete)
+      return {
+        reason: cause.cleanup?.reason ?? cause.message,
+        resources: [...cause.cleanupResources],
+      };
+    return {
+      reason: errorMessage(cause),
+      resources: typeof resource === "string" ? [resource] : [...resource],
+    };
   }
 }
 
@@ -177,3 +260,13 @@ const combineCleanup = (
 
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
+
+/** Read explicit source authority; unrelated domain cleanup remains unresolved. */
+export const artifactPrimaryCleanupLeases = (
+  cause: unknown,
+): readonly AnalysisCleanupLease[] | undefined =>
+  cause instanceof ArtifactReaderFailure
+    ? cause.cleanupLeases
+    : cause instanceof AnalysisError && cause.cleanupIncomplete
+      ? undefined
+      : [];

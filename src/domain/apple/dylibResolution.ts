@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { AnalysisCancelledError } from "../analysisErrorCore.js";
 
 import {
   compatibleSlice,
@@ -16,6 +17,7 @@ import {
 import {
   DYLIB_RESOLUTION_LIMITATIONS,
   deriveFindings,
+  type TracedRootSlice,
 } from "./dylibResolutionFindings.js";
 
 /**
@@ -427,7 +429,9 @@ const resolveDependency = async (
 ): Promise<Edge> => {
   const current = context.loaded.get(loader);
   const chain = current?.chain ?? [loader];
-  const loaded = context.byInstallName.get(dependency.install_name);
+  const loaded = dependency.install_name.startsWith("@rpath/")
+    ? context.byInstallName.get(dependency.install_name)
+    : undefined;
   const candidates: Candidate[] = [];
   if (loaded !== undefined)
     candidates.push({
@@ -506,11 +510,17 @@ const traceProcess = async (
     chain: [context.root],
     conditional: false,
   });
-  if (rootSlice.install_name !== null)
+  if (
+    rootSlice.install_name !== null &&
+    rootSlice.install_name.startsWith("@rpath/")
+  )
     context.byInstallName.set(rootSlice.install_name, context.root);
   const pending = [context.root];
   while (pending.length > 0) {
-    signal?.throwIfAborted();
+    if (signal?.aborted)
+      throw new AnalysisCancelledError("trace_dylib_resolution", {
+        cause: signal.reason,
+      });
     const loader = pending.pop() ?? "";
     const current = context.loaded.get(loader);
     if (current === undefined) continue;
@@ -537,6 +547,7 @@ const traceProcess = async (
       });
       if (
         slice.install_name !== null &&
+        slice.install_name.startsWith("@rpath/") &&
         !context.byInstallName.has(slice.install_name)
       )
         context.byInstallName.set(slice.install_name, image);
@@ -562,6 +573,7 @@ export const traceDylibLoading = async (
   for (const path of request.unclassified ?? [])
     images.set(path, await view.image(path));
   const roots: DylibTrace["roots"][number][] = [];
+  const rootSlices: TracedRootSlice[] = [];
   const edges: Edge[] = [];
   const withoutArchitecture: string[] = [];
   const environmentRoots = new Set<string>();
@@ -591,6 +603,7 @@ export const traceDylibLoading = async (
       )
         environmentRoots.add(root);
       roots.push({ image: root, architecture: slice.architecture });
+      rootSlices.push({ image: root, slice });
       edges.push(
         ...(await traceProcess(
           {
@@ -635,7 +648,7 @@ export const traceDylibLoading = async (
         facts.status === "parsed" ? facts.slices.map(withoutDependencies) : [],
     })),
     edges,
-    findings: deriveFindings(edges, roots, images),
+    findings: deriveFindings(edges, rootSlices),
     coverage: {
       status:
         unparsed.length === 0 &&

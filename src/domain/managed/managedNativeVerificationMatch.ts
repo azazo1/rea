@@ -100,11 +100,13 @@ export const collectNativeSymbols = (
   return { symbols, accepted, unsupported };
 };
 
-const sameSymbolName = (expected: string, native: NativeSymbol): boolean =>
-  expected ===
-  (native.source === "macho-export" && native.name.startsWith("_")
+const normalizedSymbolName = (native: NativeSymbol): string =>
+  native.source === "macho-export" && native.name.startsWith("_")
     ? native.name.slice(1)
-    : native.name);
+    : native.name;
+
+const sameSymbolName = (expected: string, native: NativeSymbol): boolean =>
+  expected === normalizedSymbolName(native);
 
 const normalizeModule = (value: string): string =>
   basename(value)
@@ -124,12 +126,20 @@ const moduleCompatible = (
   scope: string | null,
   symbol: NativeSymbol,
 ): boolean => {
-  if (scope === null) return true;
+  if (scope === null || scope.trim().length === 0) return false;
   const expected = normalizeModule(scope);
   return [symbol.module_name, symbol.module_path]
-    .filter((value): value is string => value !== null)
+    .filter(
+      (value): value is string =>
+        value !== null && normalizeModule(value).length > 0,
+    )
     .some((value) => nativeModuleIdentities(value).has(expected));
 };
+
+const hasModuleIdentity = (symbol: NativeSymbol): boolean =>
+  [symbol.module_name, symbol.module_path].some(
+    (value) => value !== null && normalizeModule(value).length > 0,
+  );
 
 const candidateNames = (
   managed: Pick<
@@ -190,25 +200,24 @@ const matchPinvoke = (
     };
 
   const candidates: [NativeSymbol, ...NativeSymbol[]] = [first, ...remaining];
+  const scopeKnown =
+    managed.import_scope_name !== null &&
+    managed.import_scope_name.trim().length > 0;
   const exact = candidates.find(
     (symbol) =>
-      managed.import_name === symbol.name &&
+      managed.import_name === normalizedSymbolName(symbol) &&
       moduleCompatible(managed.import_scope_name, symbol),
   );
   const decorated = candidates.find((symbol) =>
     moduleCompatible(managed.import_scope_name, symbol),
   );
-  const selected = exact ?? decorated ?? first;
-  if (!moduleCompatible(managed.import_scope_name, selected))
-    return {
-      match: {
-        status: "contradicted",
-        basis: "module-mismatch",
-        confidence: "unknown",
-        matched_native: selected,
-        candidates,
-      },
-    };
+  const selected =
+    exact ??
+    decorated ??
+    (scopeKnown
+      ? candidates.find((symbol) => !hasModuleIdentity(symbol))
+      : undefined) ??
+    first;
   if (exact !== undefined)
     return {
       match: {
@@ -222,11 +231,31 @@ const matchPinvoke = (
         candidates,
       },
     };
+  if (decorated !== undefined)
+    return {
+      match: {
+        basis: "decorated-name-candidate",
+        status: "inferred",
+        confidence: "inferred",
+        matched_native: selected,
+        candidates,
+      },
+    };
+  if (!scopeKnown || !hasModuleIdentity(selected))
+    return {
+      match: {
+        status: "unresolved",
+        basis: "module-identity-unknown",
+        confidence: "unknown",
+        matched_native: selected,
+        candidates,
+      },
+    };
   return {
     match: {
-      basis: "decorated-name-candidate",
-      status: "inferred",
-      confidence: "inferred",
+      status: "contradicted",
+      basis: "module-mismatch",
+      confidence: "unknown",
       matched_native: selected,
       candidates,
     },
@@ -234,26 +263,31 @@ const matchPinvoke = (
 };
 
 const pinvokeLimitations = (
-  status: PinvokeVerification["status"],
+  match: PinvokeMatch,
   managed: PinvokeImport,
 ): readonly string[] => [
-  ...(managed.import_scope_name === null
+  ...(managed.import_scope_name === null ||
+  managed.import_scope_name.trim().length === 0
     ? ["Managed declaration does not name an import scope/module."]
     : []),
-  ...(status === "inferred"
+  ...(match.status === "inferred"
     ? [
         "Native symbol matched a decorated candidate rather than the exact declared import name.",
       ]
     : []),
-  ...(status === "contradicted"
+  ...(match.status === "contradicted"
     ? [
         "A symbol name candidate exists, but the supplied native Evidence module identity does not match the managed import scope.",
       ]
     : []),
-  ...(status === "unresolved"
-    ? [
-        "No supplied native export/function Evidence matched this declared import.",
-      ]
+  ...(match.status === "unresolved"
+    ? match.basis === "module-identity-unknown"
+      ? [
+          "A native name candidate exists, but a required module identity is unavailable; module correspondence is unknown.",
+        ]
+      : [
+          "No supplied native export/function Evidence matched this declared import.",
+        ]
     : []),
 ];
 
@@ -283,7 +317,7 @@ export const verifyPinvoke = ({
     declaration_verification: item.verification,
   };
   const selection = matchPinvoke(item, native.symbols, native.accepted);
-  const limitations = pinvokeLimitations(selection.match.status, item);
+  const limitations = pinvokeLimitations(selection.match, item);
   return {
     verification: pinvokeVerificationSchema.parse({
       item_id: `mnv_pinvoke_${digest({

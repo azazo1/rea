@@ -12,6 +12,7 @@ const PREFIX_OPCODES = new Set([
   "tail.",
   "constrained.",
   "readonly.",
+  "no.",
 ]);
 
 const OPCODES = new Map<
@@ -232,6 +233,7 @@ const OPCODES = new Map<
   [0xfe16, { name: "constrained.", operand: "type" }],
   [0xfe17, { name: "cpblk", operand: "none" }],
   [0xfe18, { name: "initblk", operand: "none" }],
+  [0xfe19, { name: "no.", operand: "short-i" }],
   [0xfe1a, { name: "rethrow", operand: "none" }],
   [0xfe1c, { name: "sizeof", operand: "type" }],
   [0xfe1d, { name: "refanytype", operand: "none" }],
@@ -265,82 +267,105 @@ type OperandResult = {
 
 type OperandReader = (il: Buffer, offset: number) => OperandResult;
 
-const FIXED_OPERAND_READERS = new Map<string, OperandReader>([
+// String(-0) loses a CIL constant's sign in both anchors and normalized hashes.
+const floatingPointOperand = (value: number): string =>
+  Object.is(value, -0) ? "-0" : String(value);
+
+/**
+ * A fixed-width operand declares its byte width next to its reader so the
+ * extent check can bound the read before any value is consumed. Keeping both
+ * facts in one entry is what stops the width and the reader from drifting.
+ */
+type FixedOperand = {
+  readonly width: number;
+  readonly read: OperandReader;
+};
+
+const fixed = (width: number, read: OperandReader): FixedOperand => ({
+  width,
+  read,
+});
+
+const FIXED_OPERAND_READERS = new Map<string, FixedOperand>([
   [
     "none",
-    (_il, offset) => ({ next: offset, anchorKind: "none", value: null }),
+    fixed(0, (_il, offset) => ({
+      next: offset,
+      anchorKind: "none",
+      value: null,
+    })),
   ],
   [
     "short-var",
-    (il, offset) => ({
+    fixed(1, (il, offset) => ({
       next: offset + 1,
       anchorKind: "variable",
       value: String(il.readUInt8(offset)),
-    }),
+    })),
   ],
   [
     "var",
-    (il, offset) => ({
+    fixed(2, (il, offset) => ({
       next: offset + 2,
       anchorKind: "variable",
       value: String(il.readUInt16LE(offset)),
-    }),
+    })),
   ],
   [
     "short-i",
-    (il, offset) => ({
+    fixed(1, (il, offset) => ({
       next: offset + 1,
       anchorKind: "constant",
       value: String(il.readInt8(offset)),
-    }),
+    })),
   ],
   [
     "i",
-    (il, offset) => ({
+    fixed(4, (il, offset) => ({
       next: offset + 4,
       anchorKind: "constant",
       value: String(il.readInt32LE(offset)),
-    }),
+    })),
   ],
   [
     "i8",
-    (il, offset) => ({
+    fixed(8, (il, offset) => ({
       next: offset + 8,
       anchorKind: "constant",
       value: il.readBigInt64LE(offset).toString(),
-    }),
+    })),
   ],
   [
     "r4",
-    (il, offset) => ({
+    fixed(4, (il, offset) => ({
       next: offset + 4,
       anchorKind: "constant",
-      value: String(il.readFloatLE(offset)),
-    }),
+      value: floatingPointOperand(il.readFloatLE(offset)),
+    })),
   ],
   [
     "r8",
-    (il, offset) => ({
+    fixed(8, (il, offset) => ({
       next: offset + 8,
       anchorKind: "constant",
-      value: String(il.readDoubleLE(offset)),
-    }),
+      value: floatingPointOperand(il.readDoubleLE(offset)),
+    })),
   ],
   [
     "short-branch",
-    (il, offset) => ({
+    fixed(1, (il, offset) => ({
       next: offset + 1,
       anchorKind: "branch",
       value: String(offset + 1 + il.readInt8(offset)),
-    }),
+    })),
   ],
   [
     "branch",
-    (il, offset) => ({
+    fixed(4, (il, offset) => ({
       next: offset + 4,
       anchorKind: "branch",
       value: String(offset + 4 + il.readInt32LE(offset)),
-    }),
+    })),
   ],
 ]);
 
@@ -355,13 +380,42 @@ const TOKEN_OPERAND_KINDS = new Map<
   ["signature", "signature"],
 ]);
 
+/** Every token operand is a 4-byte metadata token. */
+const TOKEN_OPERAND_WIDTH = 4;
+
+/**
+ * Bytes the operand at `offset` occupies, or `null` when the extent itself
+ * cannot be read from `il`. This is the single extent authority: `readOperand`
+ * must never be called for an operand whose extent it cannot bound, so no
+ * operand read can leave the method body.
+ */
+const operandExtent = (
+  il: Buffer,
+  offset: number,
+  kind: string,
+): number | null => {
+  const fixedOperand = FIXED_OPERAND_READERS.get(kind);
+  if (fixedOperand !== undefined) return fixedOperand.width;
+  if (kind === "switch") {
+    if (offset > il.length - 4) return null;
+    return 4 + il.readUInt32LE(offset) * 4;
+  }
+  return TOKEN_OPERAND_KINDS.has(kind) || kind === "token"
+    ? TOKEN_OPERAND_WIDTH
+    : 0;
+};
+
+/**
+ * Read an operand whose extent is already known to fit. `next` is always
+ * `offset + operandExtent(il, offset, kind)`; callers bound the read first.
+ */
 const readOperand = (
   il: Buffer,
   offset: number,
   kind: string,
 ): OperandResult => {
-  const fixed = FIXED_OPERAND_READERS.get(kind);
-  if (fixed !== undefined) return fixed(il, offset);
+  const fixedOperand = FIXED_OPERAND_READERS.get(kind);
+  if (fixedOperand !== undefined) return fixedOperand.read(il, offset);
   if (kind === "switch") {
     const count = il.readUInt32LE(offset);
     return {
@@ -370,14 +424,15 @@ const readOperand = (
       value: String(count),
     };
   }
+  if (!TOKEN_OPERAND_KINDS.has(kind) && kind !== "token")
+    return { next: offset, anchorKind: "unknown", value: null };
   const raw = il.readUInt32LE(offset);
   const token = `0x${raw.toString(16).padStart(8, "0")}`;
-  const tokenOperandKind = TOKEN_OPERAND_KINDS.get(kind);
-  if (tokenOperandKind !== undefined)
-    return { next: offset + 4, anchorKind: tokenOperandKind, value: token };
-  if (kind === "token")
-    return { next: offset + 4, anchorKind: tokenKind(token), value: token };
-  return { next: offset, anchorKind: "unknown", value: null };
+  return {
+    next: offset + TOKEN_OPERAND_WIDTH,
+    anchorKind: TOKEN_OPERAND_KINDS.get(kind) ?? tokenKind(token),
+    value: token,
+  };
 };
 
 export const decodeInstructions = (
@@ -400,17 +455,25 @@ export const decodeInstructions = (
       const start = offset;
       const first = il.readUInt8(offset);
       offset += 1;
+      if (first === 0xfe && offset >= il.length) {
+        issue = `Two-byte CIL opcode at IL offset ${String(start)} leaves method body`;
+        break;
+      }
       const code = first === 0xfe ? 0xfe00 + il.readUInt8(offset++) : first;
       const descriptor = OPCODES.get(code);
       if (descriptor === undefined) {
         issue = `Unsupported CIL opcode 0x${code.toString(16)} at IL offset ${String(start)}`;
         break;
       }
-      const operand = readOperand(il, offset, descriptor.operand);
-      if (operand.next < offset || operand.next > il.length) {
+      // Bound the operand extent before reading its value. Reading first would
+      // throw a raw Buffer RangeError out of a truncated body and replace this
+      // diagnostic with the runtime message, losing the instruction identity.
+      const extent = operandExtent(il, offset, descriptor.operand);
+      if (extent === null || offset + extent > il.length) {
         issue = `Instruction ${descriptor.name} at IL offset ${String(start)} leaves method body`;
         break;
       }
+      const operand = readOperand(il, offset, descriptor.operand);
       // Charge each actual instruction before growing the decoded arrays.
       // A multi-byte operand must not consume a full record per raw IL byte.
       admitInstruction?.(start);
@@ -480,9 +543,34 @@ export const parseExceptionRegions = (
         "Exception section size leaves artifact",
         regions,
       );
-    if ((size - 4) % clauseSize !== 0)
+    let count: number;
+    let sectionSize = size;
+    if (fat) {
+      if ((size - 4) % clauseSize !== 0)
+        return malformedExceptionRegions(
+          "Exception section size does not contain whole clauses",
+          regions,
+        );
+      count = (size - 4) / clauseSize;
+    } else if ((size - 4) % clauseSize === 0) {
+      count = (size - 4) / clauseSize;
+    } else if (size >= clauseSize && size % clauseSize === 0) {
+      // CoreCLR accommodates legacy VB/MC++ sections whose DataSize omits the
+      // four-byte section header. DataSize is still not the physical extent.
+      count = size / clauseSize;
+      sectionSize = 4 + count * clauseSize;
+    } else {
       return malformedExceptionRegions(
         "Exception section size does not contain whole clauses",
+        regions,
+      );
+    }
+    if (
+      sectionOffset > methodEnd - sectionSize ||
+      sectionOffset > bytes.length - sectionSize
+    )
+      return malformedExceptionRegions(
+        "Exception section size leaves artifact",
         regions,
       );
     if (
@@ -494,7 +582,6 @@ export const parseExceptionRegions = (
         regions,
       );
 
-    const count = (size - 4) / clauseSize;
     // Accumulates with the method IL bound; the body reserves what it retains.
     budget?.admitTransient(count * 256, sectionOffset);
     for (const region of readExceptionClauses(
@@ -506,7 +593,7 @@ export const parseExceptionRegions = (
       regions.push(region);
 
     hasMoreSections = (kind & 0x80) !== 0;
-    sectionOffset += size;
+    sectionOffset += sectionSize;
   }
   return { status: "complete", regions };
 };

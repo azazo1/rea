@@ -1,10 +1,17 @@
 import { z } from "zod";
+import { byteSearchResultSchema } from "../domain/native/bytePattern.js";
 import {
   artifactInventorySummaryViewResultSchema,
+  interfaceBuilderSummaryViewResultSchema,
+  machoSummaryViewResultSchema,
   managedArtifactSummaryViewResultSchema,
+  managedMemberSummaryViewResultSchema,
 } from "../domain/analysisView/analysisView.js";
 import { evidenceBundleSummarySchema } from "../domain/evidenceRecordSummary.js";
-import { BINARY_ARCHITECTURES } from "../domain/binaryTargetTypes.js";
+import {
+  BINARY_ARCHITECTURES,
+  RAW_ONLY_ARCHITECTURES,
+} from "../domain/binaryTargetTypes.js";
 import {
   binaryArchitectureSchema,
   rawBinaryEntryPointSchema,
@@ -41,7 +48,7 @@ import {
   listArchitecturesSchema,
 } from "../domain/native/nativeInspection.js";
 import { artifactExtractionResultSchema } from "../domain/artifactGraph.js";
-import { artifactInspectionOutputSchema } from "../domain/artifactInspection.js";
+import { artifactInspectionResultSchema } from "../domain/artifactInspection.js";
 import { interfaceBuilderAnalysisSchema } from "../domain/apple/interfaceBuilderGraph.js";
 import { dylibResolutionResultSchema } from "../domain/apple/dylibResolution.js";
 import { keyedArchiveResultSchema } from "../domain/apple/keyedArchive.js";
@@ -85,6 +92,7 @@ import {
 } from "./toolOutputSchemaPrimitives.js";
 
 import { processCaptureSchema } from "../domain/process/processCapture.js";
+import { electronFuseReportSchema } from "../domain/electron/electronFuses.js";
 const contextFacetSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("available"), value: jsonValueSchema }),
   z.object({
@@ -107,6 +115,7 @@ const bookmarkFacetSchema = z.discriminatedUnion("state", [
 
 /** Exact structured-content schemas shared by direct analysis providers. */
 export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
+  search_bytes: evidenceResultOf(byteSearchResultSchema),
   annotate_native_function: evidenceResultOf(nativeFunctionAnnotationsSchema),
   inspect_native_load_image: evidenceResultOf(nativeLoadImageSchema),
   inspect_native_data_type: evidenceResultOf(nativeDataTypeSchema),
@@ -356,18 +365,22 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   binary_overview: evidenceResultOf(
     z.object({
       document: z.string(),
-      segments: z.array(
-        z.object({
-          name: z.string(),
-          start: z.string(),
-          end: z.string(),
-          length: z.number().min(0),
-        }),
-      ),
-      segment_count: z.number().int().min(0),
+      image_base: z.string().min(1).optional(),
+      segments: z
+        .array(
+          z.object({
+            name: z.string(),
+            start: z.string(),
+            end: z.string(),
+            length: z.number().min(0).nullable(),
+            image_base: z.string().exactOptional(),
+            address_space: z.string().exactOptional(),
+          }),
+        )
+        .optional(),
+      segment_count: z.number().int().min(0).optional(),
       procedure_count: z.number().int().min(0),
       string_count: z.number().int().min(0),
-      image_base: z.string().min(1).optional(),
     }),
   ),
   analyze_function: functionDossierOutput,
@@ -381,7 +394,9 @@ export const nativeOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   observe_native_ui: evidenceResultOf(nativeUiResultSchema),
   capture_native_ui_scenario: evidenceResultOf(nativeUiResultSchema),
   observe_native_calls: evidenceResultOf(nativeCallObservationResultSchema),
-  inspect_macho: evidenceResultOf(inspectMachoSchema),
+  inspect_macho: evidenceResultOf(
+    z.union([inspectMachoSchema, machoSummaryViewResultSchema]),
+  ),
   inspect_signature: evidenceResultOf(inspectSignatureSchema),
   inspect_plist: evidenceResultOf(inspectPlistSchema),
   list_architectures: evidenceResultOf(listArchitecturesSchema),
@@ -392,12 +407,17 @@ export const nativeOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
 export const artifactOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   inspect_artifact: evidenceResultOf(
     z.union([
-      artifactInspectionOutputSchema,
+      artifactInspectionResultSchema,
       artifactInventorySummaryViewResultSchema,
     ]),
   ),
   extract_artifact: evidenceResultOf(artifactExtractionResultSchema),
-  decode_interface_builder: evidenceResultOf(interfaceBuilderAnalysisSchema),
+  decode_interface_builder: evidenceResultOf(
+    z.union([
+      interfaceBuilderAnalysisSchema,
+      interfaceBuilderSummaryViewResultSchema,
+    ]),
+  ),
   inspect_keyed_archive: evidenceResultOf(keyedArchiveResultSchema),
   inspect_asset_catalog: evidenceResultOf(appleAssetCatalogResultSchema),
   trace_dylib_resolution: evidenceResultOf(dylibResolutionResultSchema),
@@ -411,7 +431,12 @@ export const managedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
       managedArtifactSummaryViewResultSchema,
     ]),
   ),
-  inspect_managed_members: evidenceResultOf(managedMemberInspectionSchema),
+  inspect_managed_members: evidenceResultOf(
+    z.union([
+      managedMemberInspectionSchema,
+      managedMemberSummaryViewResultSchema,
+    ]),
+  ),
   inspect_managed_native_boundaries: evidenceResultOf(
     managedNativeBoundaryInspectionSchema,
   ),
@@ -439,11 +464,14 @@ const lifecycleTargetFields = {
   path: z.string(),
   kind: targetKindSchema,
   sha256: z.string().regex(/^[a-f0-9]{64}$/u),
-  architecture: z.enum(BINARY_ARCHITECTURES).nullable(),
 };
 const detectedLifecycleTargetSchema = z.object({
   ...lifecycleTargetFields,
   format: targetFormatSchema.exclude(["raw-binary"]),
+  architecture: z
+    .enum(BINARY_ARCHITECTURES)
+    .exclude([...RAW_ONLY_ARCHITECTURES])
+    .nullable(),
 });
 const rawLifecycleTargetSchema = z.object({
   ...lifecycleTargetFields,
@@ -569,3 +597,8 @@ export const sessionOutputSchemas = {
     }),
   ),
 } satisfies Readonly<Record<string, z.ZodObject>>;
+
+/** Exact Evidence schema for read-only Electron fuse inspection. */
+export const electronFuseOutputSchemas = {
+  inspect_electron_fuses: evidenceResultOf(electronFuseReportSchema),
+};

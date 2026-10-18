@@ -225,6 +225,8 @@ export const createSystemProcessOwnershipHost = (
     readonly darwinCompiler?: DarwinProcessReaderCompiler;
     /** Override the caller-owned module cache used compiling that helper. */
     readonly darwinModuleCachePath?: string;
+    /** Deadline for Darwin ownership-helper compilation. */
+    readonly compileTimeoutMs?: number;
   } = {},
 ): ProcessOwnershipHost => {
   const darwinModuleCachePath =
@@ -247,6 +249,9 @@ export const createSystemProcessOwnershipHost = (
           ...(darwinModuleCachePath === undefined
             ? {}
             : { moduleCachePath: darwinModuleCachePath }),
+          ...(options.compileTimeoutMs === undefined
+            ? { environment: hostEnvironment }
+            : { compileTimeoutMs: options.compileTimeoutMs }),
         })
       : undefined;
   const listProcesses = async (signal?: AbortSignal) => {
@@ -503,6 +508,22 @@ export const observeProcessStartIdentity = async (
         state: "unavailable",
         reason: `process identity changed while validating the captured run token for PID ${String(pid)}`,
       };
+};
+
+/** Confirm whether the process that held an authenticated bridge has exited. */
+export const observeProcessStartIdentityExit = async (
+  pid: number,
+  expectedIdentity: string,
+  host: ProcessOwnershipHost = systemProcessOwnershipHost,
+): Promise<"exited" | "present" | "unverified"> => {
+  try {
+    const observed = await observeProcessStartIdentity(pid, host);
+    if (observed === undefined) return "exited";
+    if (observed.state !== "readable") return "unverified";
+    return observed.identity === expectedIdentity ? "present" : "exited";
+  } catch {
+    return "unverified";
+  }
 };
 
 /** Revalidate a launch-time start identity immediately before signaling a PID. */

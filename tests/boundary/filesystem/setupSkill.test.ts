@@ -3,10 +3,14 @@ import {
   access,
   chmod,
   copyFile,
+  lstat,
   mkdir,
   readFile,
+  readdir,
+  rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
@@ -16,7 +20,9 @@ import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 import {
   canonicalSkillNeedsInstall,
+  existingSkillDestinations,
   installCanonicalSkill,
+  readInstalledSkillIdentity,
   skillDestinations,
   type SkillInstallFileOperations,
 } from "../../../src/application/SetupSkill.js";
@@ -38,6 +44,239 @@ const expectPermissionMode = async (
   if (process.platform === "win32") return;
   expect((await stat(path)).mode & 0o777).toBe(expected);
 };
+
+describe("skill recovery backup selection", () => {
+  it("reuses a verified existing backup without copying it again", async () => {
+    const home = await createTestTempDirectory("rea-skill-matching-backup-");
+    const [destination] = skillDestinations(home, []);
+    if (destination === undefined) throw new Error("Missing shared skill root");
+    const manifest = join(destination.path, "SKILL.md");
+    const current = "currently installed instructions\n";
+    await mkdir(dirname(manifest), { recursive: true });
+    await writeFile(manifest, current);
+    await writeFile(`${manifest}.rea.backup`, current);
+    const result = await installCanonicalSkill(home, [], {}, process.platform, {
+      mkdir: async (path) =>
+        mkdir(path, { recursive: true }).then(() => undefined),
+      backup: async () => {
+        throw new Error("A matching backup must not be copied again");
+      },
+      write: (path, content, mode) =>
+        writeFileAtomic(path, content, { encoding: "utf8", mode }),
+      remove: async (path) => rm(path, { force: true }),
+    });
+
+    expect(result).toEqual({ ok: true, value: "installed" });
+    expect(await readFile(`${manifest}.rea.backup`, "utf8")).toBe(current);
+    expect(await canonicalSkillNeedsInstall(home, [])).toBe(false);
+  });
+
+  it("advertises a current recovery snapshot when the first backup is historical", async () => {
+    const home = await createTestTempDirectory("rea-skill-historical-backup-");
+    const [destination] = skillDestinations(home, []);
+    if (destination === undefined) throw new Error("Missing shared skill root");
+    const manifest = join(destination.path, "SKILL.md");
+    const current = "currently installed instructions V2\n";
+    const oldSnapshot = "historical instructions V0\n";
+    await mkdir(dirname(manifest), { recursive: true });
+    await writeFile(manifest, current);
+    await writeFile(`${manifest}.rea.backup`, oldSnapshot);
+    let manifestWrites = 0;
+    const operations: SkillInstallFileOperations = {
+      mkdir: async (path) =>
+        mkdir(path, { recursive: true }).then(() => undefined),
+      backup: async (source, target) =>
+        copyFile(source, target, fsConstants.COPYFILE_EXCL),
+      write: async (path, content, mode) => {
+        if (path === manifest && ++manifestWrites === 2)
+          throw new Error("injected rollback failure");
+        await writeFileAtomic(path, content, { encoding: "utf8", mode });
+        if (path === manifest && manifestWrites === 1)
+          throw new Error("injected failure after publication");
+      },
+      remove: async (path) => rm(path, { force: true }),
+    };
+
+    const result = await installCanonicalSkill(
+      home,
+      [],
+      {},
+      process.platform,
+      operations,
+    );
+
+    if (result.ok) throw new Error("Expected the injected write failure");
+    expect(result.error.rollbackFailures).toEqual([
+      { path: manifest, reason: "injected rollback failure" },
+    ]);
+    const recovery = result.error.recoveryBackupPaths.find((path) =>
+      path.startsWith(`${manifest}.rea.backup.`),
+    );
+    expect(recovery).toBeDefined();
+    expect(await readFile(recovery!, "utf8")).toBe(current);
+    expect(await readFile(`${manifest}.rea.backup`, "utf8")).toBe(oldSnapshot);
+  });
+});
+
+describe("skill recovery byte preservation", () => {
+  it("backs up and restores the exact bytes of invalid UTF-8 before replacing a skill", async () => {
+    const home = await createTestTempDirectory("rea-skill-damaged-bytes-");
+    const [destination] = skillDestinations(home, []);
+    if (destination === undefined) throw new Error("Missing shared skill root");
+    const manifest = join(destination.path, "SKILL.md");
+    const original = Buffer.from([0x63, 0x61, 0x66, 0xe9, 0xff, 0x0a]);
+    const firstBackup = `${manifest}.rea.backup`;
+    const recovery = `${firstBackup}.${createHash("sha256").update(original).digest("hex")}.recovery`;
+    await mkdir(dirname(manifest), { recursive: true });
+    await writeFile(manifest, original);
+    await writeFile(firstBackup, "historical instructions V0\n");
+    let manifestWrites = 0;
+    const result = await installCanonicalSkill(home, [], {}, process.platform, {
+      mkdir: async (path) =>
+        mkdir(path, { recursive: true }).then(() => undefined),
+      backup: async (source, target) =>
+        copyFile(source, target, fsConstants.COPYFILE_EXCL),
+      write: async (path, content, mode) => {
+        if (path === manifest && ++manifestWrites === 2)
+          throw new Error("injected rollback failure");
+        await writeFileAtomic(path, content, { encoding: "utf8", mode });
+        if (path === manifest && manifestWrites === 1)
+          throw new Error("injected failure after publication");
+      },
+      remove: async (path) => rm(path, { force: true }),
+    });
+    if (result.ok) throw new Error("Expected the injected write failure");
+    expect(result.error.recoveryBackupPaths).toContain(recovery);
+    expect(await readFile(recovery)).toEqual(original);
+    expect(await readFile(firstBackup, "utf8")).toBe(
+      "historical instructions V0\n",
+    );
+  });
+});
+
+describe("skill directory admission", () => {
+  it("excludes a linked references directory from update maintenance", async () => {
+    const directory = await createTestTempDirectory(
+      "rea-skill-linked-maintenance-",
+    );
+    const installed = await installCanonicalSkill(directory, ["claude_code"]);
+    expect(installed.ok).toBe(true);
+    const [selected] = skillDestinations(directory, ["claude_code"]);
+    if (selected === undefined) throw new Error("Missing skill destination");
+    const references = join(selected.path, "references");
+    const retained = join(directory, "retained-references");
+    await rename(references, retained);
+    await symlink(
+      retained,
+      references,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    expect(await existingSkillDestinations(directory)).toEqual([]);
+    expect((await lstat(references)).isSymbolicLink()).toBe(true);
+    await access(join(retained, "native-and-artifacts.md"));
+  });
+
+  it
+    .skipIf(process.platform === "win32" || process.getuid?.() === 0)
+    .each(["aligned", "stale", "missing"] as const)(
+    "reports every unreadable reference with a %s manifest",
+    async (manifestState) => {
+      const directory = await createTestTempDirectory(
+        "rea-skill-unreadable-reference-",
+      );
+      expect((await installCanonicalSkill(directory, ["claude_code"])).ok).toBe(
+        true,
+      );
+      const [selected] = skillDestinations(directory, ["claude_code"]);
+      if (selected === undefined) throw new Error("Missing skill destination");
+      const manifest = join(selected.path, "SKILL.md");
+      if (manifestState === "stale")
+        await writeFile(manifest, "\nlocal changes\n", { flag: "a" });
+      if (manifestState === "missing") await rm(manifest);
+      const references = [
+        "references/connection-and-recovery.md",
+        "references/evidence-workflows.md",
+      ].map((relative) => join(selected.path, relative));
+      for (const reference of references) await chmod(reference, 0o000);
+      try {
+        const identity = await readInstalledSkillIdentity(directory, [
+          "claude_code",
+        ]);
+        const issues = references.map((path) =>
+          expect.objectContaining({
+            path,
+            kind: "unreadable",
+            detail: expect.stringContaining("EACCES"),
+          }),
+        );
+        expect(identity).toMatchObject({
+          canonical: false,
+          version:
+            manifestState === "missing" ? null : PRODUCT_IDENTITY.skillVersion,
+          issues,
+        });
+        const report = await runDoctor(
+          undefined,
+          createDoctorHostFixture({
+            installedSkillIdentity: () => Promise.resolve(identity),
+          }),
+        );
+        expect(report.identity?.skill).toMatchObject({
+          state: "unknown",
+          issues,
+          remediation: expect.stringContaining("evidence-workflows.md"),
+        });
+      } finally {
+        for (const reference of references) await chmod(reference, 0o600);
+      }
+    },
+  );
+
+  it.each(["root", "references"] as const)(
+    "refuses a linked skill %s before changing any selected destination",
+    async (linkedDirectory) => {
+      const home = await createTestTempDirectory("rea-skill-linked-root-");
+      const destinations = skillDestinations(home, ["shared", "claude_code"]);
+      const selected = destinations.find(
+        ({ client }) => client === "claude_code",
+      );
+      if (selected === undefined)
+        throw new Error("Missing Claude Code skill root");
+      const managed = join(home, "user-managed");
+      await mkdir(managed);
+      const original = "user-owned instructions\n";
+      await writeFile(join(managed, "SKILL.md"), original);
+      const linked =
+        linkedDirectory === "root"
+          ? selected.path
+          : join(selected.path, "references");
+      await mkdir(dirname(linked), { recursive: true });
+      await symlink(
+        managed,
+        linked,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      const result = await installCanonicalSkill(home, [
+        "shared",
+        "claude_code",
+      ]);
+      if (result.ok) throw new Error("Expected linked directory refusal");
+      expect(result.error.stage).toBe("prepare");
+      expect(result.error.path).toBe(linked);
+      expect(result.error.reason).toContain("symbolic link");
+      expect(result.error.rollbackFailures).toEqual([]);
+      expect((await lstat(linked)).isSymbolicLink()).toBe(true);
+      expect(await readFile(join(managed, "SKILL.md"), "utf8")).toBe(original);
+      expect(await readdir(managed)).toEqual(["SKILL.md"]);
+      const shared = destinations.find(({ client }) => client === "shared");
+      if (shared === undefined) throw new Error("Missing shared skill root");
+      await expect(access(shared.path)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+});
 
 describe("canonical skill transaction", () => {
   it("does not roll back files when backup preparation fails", async () => {
@@ -105,7 +344,7 @@ describe("canonical skill transaction", () => {
     await writeFile(connection, "old connection\n", { mode: 0o644 });
     await writeFile(native, "old native\n", { mode: 0o600 });
     const writes = new Map<string, number>();
-    const nativeWrites: string[] = [];
+    const nativeWrites: (string | Buffer)[] = [];
     const operations: SkillInstallFileOperations = {
       mkdir: async (path) => {
         await mkdir(path, { recursive: true });
@@ -154,7 +393,7 @@ describe("canonical skill transaction", () => {
     expect(await readFile(native, "utf8")).not.toBe("old native\n");
     expect(await readFile(`${native}.rea.backup`, "utf8")).toBe("old native\n");
     expect(nativeWrites).toHaveLength(2);
-    expect(nativeWrites[1]).toBe("old native\n");
+    expect(nativeWrites[1]).toEqual(Buffer.from("old native\n", "utf8"));
     expect(result.error.message).toContain(
       `Existing-file backups remain at ${manifest}.rea.backup`,
     );

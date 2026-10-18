@@ -36,6 +36,12 @@ application starts, and REA never resumes it or sends
 `Runtime.runIfWaitingForDebugger`. Resume a paused target with a separate
 caller-owned debugger before requesting application runtime observations.
 
+For a packaged Electron app, read
+[`inspect_electron_fuses`](electron-fuses.md) before starting an `electron-main`
+target. When `EnableNodeCliInspectArguments` is disabled or removed, Electron
+ignores `--inspect` and `--inspect-brk`. A missing main-process target after
+launch does not, by itself, show that fuse.
+
 The caller supplies the literal-loopback HTTP endpoint directly. Selecting an endpoint exposes all targets it serves and their local script locations or renderer origins. A target must match the exact requested target ID and expose a same-port WebSocket reported by that endpoint. Targets explicitly marked attached are rejected rather than displacing another debugger. Node's `/json/list` omits attachment state, so REA preserves it as `null` (unknown), reports that limitation, and permits observation unless the endpoint explicitly reports `attached: true`. Local paths are canonicalized after symlink resolution.
 
 The `attached` field in JavaScript runtime and browser target results is nullable: `true` and `false` are reported only when discovery supplied a boolean; `null` means the endpoint omitted or could not report the state. CDP `TargetInfo` worker records require an `attached` boolean; REA excludes a worker record with a missing or malformed value as an invalid protocol value.
@@ -89,6 +95,11 @@ pauses or resumes execution, calls `Runtime.runIfWaitingForDebugger`, launches
 the target, instruments JavaScript, or invokes Electron APIs. Closing a call
 closes only REA's WebSocket.
 
+Each WebSocket handshake and command response has its own 20-second deadline,
+separate from the caller-selected observation window. A stalled handshake or
+command reports `provider_timeout` and retains observations already received;
+caller cancellation still reports cancellation.
+
 The direct observations are:
 
 - `Debugger.scriptParsed`, establishing that a bounded script location was
@@ -98,7 +109,9 @@ The direct observations are:
 - `Runtime.executionContextCreated`,
   `Runtime.executionContextDestroyed`, and
   `Runtime.executionContextsCleared`, establishing context lifecycle within
-  the capture window.
+  the capture window. A created or destroyed event whose context ID is
+  missing or not a safe integer adds no context record; it is retained only
+  as a count reported in `unknowns`.
 
 The Inspector protocol does not directly expose require/import caller edges,
 EventEmitter emissions or listener invocation, Electron IPC messages or

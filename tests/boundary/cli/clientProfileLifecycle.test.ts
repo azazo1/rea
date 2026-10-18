@@ -163,31 +163,33 @@ for (const group of groups) {
           environment,
           timeoutMs: 20_000,
         });
-      for (const { client, config, skillDirectory } of profiles) {
-        const planned = await run([
-          "setup",
-          "--client",
-          client,
-          "--dry-run",
-          "--json",
-        ]);
-        expect(planned.exitCode, client).toBe(0);
-        expect(planned.json, client).toMatchObject({
-          status: "planned",
-          plannedActions: expect.arrayContaining([
+      const planned = await run([
+        "setup",
+        ...clientArguments,
+        "--dry-run",
+        "--json",
+      ]);
+      expect(planned.exitCode, planned.stderr).toBe(0);
+      expect(planned.json).toMatchObject({
+        status: "planned",
+        plannedActions: expect.arrayContaining([
+          ...profiles.map(({ client, config }) =>
             expect.objectContaining({
               id: `configure_client:${client}`,
               target: config,
             }),
-            expect.objectContaining({ target: skillDirectory }),
-          ]),
-        });
+          ),
+          ...[
+            ...new Set(profiles.map(({ skillDirectory }) => skillDirectory)),
+          ].map((target) => expect.objectContaining({ target })),
+        ]),
+      });
+      for (const { config, skillDirectory } of profiles) {
+        await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
         await expect(access(skillDirectory)).rejects.toMatchObject({
           code: "ENOENT",
         });
       }
-      for (const { config } of profiles)
-        await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
       const setup = await run(["setup", ...clientArguments, "--yes", "--json"]);
       expect(setup.exitCode).toBe(0);
       expect(setup.json).toMatchObject({ status: "ready" });
@@ -287,9 +289,12 @@ cliTest("uninstall names each retained skill directory", async ({ cli }) => {
   };
   const skill = report.items?.find(({ name }) => name === "skill");
   expect(skill?.status).toBe("retained");
-  for (const directory of [shared, claude]) {
+  for (const [client, directory] of [
+    ["shared", shared],
+    ["claude_code", claude],
+  ] as const) {
     expect(skill?.detail).toContain(
-      `${directory}: retained (Skill manifest is not REA-owned.)`,
+      `${client} (${directory}): retained (Skill manifest is not REA-owned.)`,
     );
     expect(await readFile(join(directory, "SKILL.md"), "utf8")).toBe(
       "---\nname: unrelated\n---\n",

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { fixedTupleSchema } from "./fixedTupleSchema.js";
+import { addressCoordinate } from "./native/addressCoordinate.js";
 
 import type { JsonValue } from "./jsonValue.js";
 
@@ -6,7 +8,6 @@ import { err, ok, type Result } from "./result.js";
 import { nativeApiBoundarySchema } from "./native/nativeApiBoundary.js";
 import { nativeValueFlowSchema } from "./native/nativeValueFlow.js";
 import { AnalysisOutputError } from "./analysisErrorCore.js";
-import { HopperProtocolError } from "./hopperErrors.js";
 
 export interface AddressedName {
   readonly address: string;
@@ -20,30 +21,19 @@ export interface SegmentSummary {
   readonly readable: boolean | null;
   readonly writable: boolean | null;
   readonly executable: boolean | null;
+  readonly image_base?: string;
+  readonly address_space?: string;
 }
 
 /** Return a bounded byte distance between canonical addresses in one space. */
-export const addressDistance = (start: string, end: string): number => {
+export const addressDistance = (start: string, end: string): number | null => {
   const left = addressCoordinate(start);
   const right = addressCoordinate(end);
-  if (left === null || right === null || left.space !== right.space) return 0;
+  if (left === null || right === null || left.space !== right.space)
+    return null;
   const distance = right.offset - left.offset;
-  if (distance <= 0n) return 0;
-  return Number(
-    distance > BigInt(Number.MAX_SAFE_INTEGER)
-      ? BigInt(Number.MAX_SAFE_INTEGER)
-      : distance,
-  );
-};
-
-const addressCoordinate = (
-  value: string,
-): { readonly space: string; readonly offset: bigint } | null => {
-  const separator = value.lastIndexOf(":0x");
-  const space = separator < 0 ? "default" : value.slice(0, separator);
-  const offset = separator < 0 ? value : value.slice(separator + 1);
-  if (!/^0x[0-9a-f]+$/u.test(offset)) return null;
-  return { space, offset: BigInt(offset) };
+  if (distance < 0n || distance > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(distance);
 };
 
 const procedureMapSchema = z.record(z.string(), z.string());
@@ -58,10 +48,9 @@ const segmentSchema = z.object({
   readable: z.boolean().nullable(),
   writable: z.boolean().nullable(),
   executable: z.boolean().nullable(),
+  image_base: z.string().min(1).exactOptional(),
+  address_space: z.string().min(1).exactOptional(),
 });
-const segmentImageBaseSchema = z
-  .object({ image_base: z.string().min(1) })
-  .passthrough();
 const unavailableAnalysisFactSchema = z
   .object({ available: z.literal(false), reason: z.string() })
   .strict();
@@ -127,9 +116,9 @@ export const functionBodySchema = z.discriminatedUnion("available", [
     })
     .superRefine((body, context) => {
       let total = 0n;
-      const bounds = new Map<string, { start: bigint; end: bigint }>();
-      const closedSpaces = new Set<string>();
-      let previousSpace: string | null = null;
+      const bounds = new Map<string | null, { start: bigint; end: bigint }>();
+      const closedSpaces = new Set<string | null>();
+      let previousSpace: string | null | undefined;
       for (const range of body.ranges) {
         const start = addressCoordinate(range.start);
         const end = addressCoordinate(range.end);
@@ -145,7 +134,7 @@ export const functionBodySchema = z.discriminatedUnion("available", [
           });
           return;
         }
-        if (previousSpace !== null && previousSpace !== start.space)
+        if (previousSpace !== undefined && previousSpace !== start.space)
           closedSpaces.add(previousSpace);
         const previous = bounds.get(start.space);
         if (
@@ -289,6 +278,70 @@ export const unresolvedCallSchema = z.strictObject({
   reason: z.string(),
 });
 
+const swiftStringLiteralFields = {
+  source_address: z
+    .string()
+    .describe(
+      "Instruction that consumes both words: a call, tail call, return, or paired store.",
+    ),
+  value: z
+    .string()
+    .describe("Decoded UTF-8 text, including the canonical empty string."),
+  registers: fixedTupleSchema([z.string(), z.string()]),
+  words: fixedTupleSchema([z.string(), z.string()]).describe(
+    "Observed constant register values, in register order.",
+  ),
+};
+
+/** A Swift String literal decoded from the two words of its ABI value, not a data reference. */
+export const swiftStringLiteralSchema = z.discriminatedUnion("representation", [
+  z.strictObject({
+    ...swiftStringLiteralFields,
+    representation: z
+      .literal("small")
+      .describe("The UTF-8 bytes are inside the two words."),
+    address: z.null().describe("A small literal has no storage of its own."),
+  }),
+  z.strictObject({
+    ...swiftStringLiteralFields,
+    representation: z
+      .literal("large")
+      .describe(
+        "An immortal literal whose words hold its count and a pointer to its bytes.",
+      ),
+    address: z.string().describe("Address of a large literal's bytes."),
+  }),
+]);
+
+const swiftStringLiteralOmissionFields = {
+  source_address: swiftStringLiteralFields.source_address,
+  byte_length: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  reason: z
+    .enum(["capacity", "unresolved_jump"])
+    .describe(
+      "Why this candidate is omitted: capacity stopped decoding, or an unresolved jump left its use unknown.",
+    ),
+  registers: swiftStringLiteralFields.registers,
+  words: swiftStringLiteralFields.words,
+};
+
+/** A Swift literal candidate omitted because decoding capacity or control flow left it unknown. */
+export const swiftStringLiteralOmissionSchema = z.discriminatedUnion(
+  "representation",
+  [
+    z.strictObject({
+      ...swiftStringLiteralOmissionFields,
+      representation: z.literal("small"),
+      address: z.null(),
+    }),
+    z.strictObject({
+      ...swiftStringLiteralOmissionFields,
+      representation: z.literal("large"),
+      address: z.string().describe("Address of the literal's bytes."),
+    }),
+  ],
+);
+
 /** Observed endpoints with complete or partial reference classification evidence. */
 export const referenceEdgeSchema = z
   .object({
@@ -306,6 +359,11 @@ export const referenceEdgeSchema = z
       .exactOptional(),
   })
   .strict();
+const facetAvailabilitySchema = z.discriminatedUnion("available", [
+  z.object({ available: z.literal(true) }).strict(),
+  z.object({ available: z.literal(false), reason: z.string().min(1) }).strict(),
+]);
+
 export const functionDossierSchema = z
   .object({
     procedure: procedureIdentitySchema.safeExtend({
@@ -340,6 +398,18 @@ export const functionDossierSchema = z
         })
         .strict(),
     ),
+    swift_string_literals: z
+      .array(swiftStringLiteralSchema)
+      .exactOptional()
+      .describe(
+        "Swift String literals decoded from constant register values. Absent when the provider does not decode them for this target.",
+      ),
+    swift_string_literal_omissions: z
+      .array(swiftStringLiteralOmissionSchema)
+      .exactOptional()
+      .describe(
+        "Literal candidates omitted for capacity or unresolved control flow. Present exactly when swift_string_literals is present; empty when all examined use sites were classified.",
+      ),
     basic_blocks: z.array(
       z
         .object({
@@ -351,6 +421,19 @@ export const functionDossierSchema = z
     ),
     native_api: nativeApiBoundarySchema.nullable(),
     native_value_flow: nativeValueFlowSchema.nullable(),
+    facet_availability: z
+      .object({
+        pseudocode: facetAvailabilitySchema.exactOptional(),
+        assembly: facetAvailabilitySchema.exactOptional(),
+        comments: facetAvailabilitySchema.exactOptional(),
+        callers: facetAvailabilitySchema.exactOptional(),
+        callees: facetAvailabilitySchema.exactOptional(),
+        references: facetAvailabilitySchema.exactOptional(),
+        strings_names: facetAvailabilitySchema.exactOptional(),
+        cfg: facetAvailabilitySchema.exactOptional(),
+      })
+      .strict()
+      .exactOptional(),
     limitations: z.array(z.string()),
   })
   .strict();
@@ -374,10 +457,11 @@ export const parseFunctionDossier = (
       );
 };
 
-/** Parse Hopper's direct or wrapped procedure map into stable entries. */
+/** Parse a provider's direct or wrapped procedure map into stable entries. */
 export const parseProcedures = (
   value: JsonValue,
-): Result<readonly AddressedName[], HopperProtocolError> => {
+  operation = "list_procedures",
+): Result<readonly AddressedName[], AnalysisOutputError> => {
   const parsed = procedureMapSchema.safeParse(
     unwrapProperty(value, "procedures"),
   );
@@ -388,79 +472,120 @@ export const parseProcedures = (
           name,
         })),
       )
-    : invalid("procedure map", parsed.error);
+    : invalid(operation, "procedure map", parsed.error);
 };
 
-/** Parse Hopper's direct or wrapped list of address/name records. */
+/** Parse a provider's direct or wrapped list of address/name records. */
 export const parseNames = (
   value: JsonValue,
-): Result<readonly AddressedName[], HopperProtocolError> => {
+  operation = "list_names",
+): Result<readonly AddressedName[], AnalysisOutputError> => {
   const unwrapped = unwrapProperty(value, "names");
   const records = addressedNamesSchema.safeParse(unwrapped);
   if (records.success) return ok(records.data);
   const map = addressedNameMapSchema.safeParse(unwrapped);
   return map.success
     ? ok(Object.entries(map.data).map(([address, name]) => ({ address, name })))
-    : invalid("name list", map.error);
+    : invalid(operation, "name list", map.error);
 };
 
-/** Parse callee/caller strings from direct or wrapped Hopper results. */
+/** Parse callee/caller strings from direct or wrapped provider results. */
 export const parseRelatedAddresses = (
   value: JsonValue,
   relation: "callees" | "callers",
-): Result<readonly string[], HopperProtocolError> => {
+  operation = relation === "callees"
+    ? "procedure_callees"
+    : "procedure_callers",
+): Result<readonly string[], AnalysisOutputError> => {
   const parsed = z.array(z.string()).safeParse(unwrapProperty(value, relation));
   return parsed.success
     ? ok(parsed.data)
-    : invalid(`${relation} list`, parsed.error);
+    : invalid(operation, `${relation} list`, parsed.error);
 };
 
-/** Parse direct or wrapped Hopper segment records. */
+/** Preserve reported address context in direct or wrapped provider segments. */
 export const parseSegments = (
   value: JsonValue,
-): Result<readonly SegmentSummary[], HopperProtocolError> => {
+  operation = "list_segments",
+): Result<readonly SegmentSummary[], AnalysisOutputError> => {
   const parsed = z
     .array(segmentSchema)
     .safeParse(unwrapProperty(value, "segments"));
   return parsed.success
     ? ok(parsed.data)
-    : invalid("segment list", parsed.error);
+    : invalid(operation, "segment list", parsed.error);
 };
 
-/** Return a provider-reported image base only when every segment agrees on it. */
-export const parseSegmentImageBase = (value: JsonValue): string | undefined => {
-  const parsed = z
-    .array(segmentImageBaseSchema)
-    .safeParse(unwrapProperty(value, "segments"));
-  if (!parsed.success) return undefined;
-  const bases = new Set(parsed.data.map(({ image_base }) => image_base));
-  return bases.size === 1 ? parsed.data[0]?.image_base : undefined;
+/** Return a reported overview base only when every parsed segment agrees. */
+export const parseSegmentImageBase = (
+  segments: readonly SegmentSummary[],
+): string | undefined => {
+  const base = segments[0]?.image_base;
+  return base !== undefined &&
+    segments.every((segment) => segment.image_base === base)
+    ? base
+    : undefined;
 };
 
-/** Parse direct or wrapped Hopper document names. */
+/** Project the same overview from complete lists or provider-owned aggregates. */
+export const projectBinaryOverview = (input: {
+  readonly document: string;
+  readonly procedure_count: number;
+  readonly string_count: number;
+  readonly segments?: readonly SegmentSummary[];
+}): JsonValue => {
+  const { document, procedure_count, string_count, segments } = input;
+  const imageBase =
+    segments === undefined ? undefined : parseSegmentImageBase(segments);
+  return {
+    document,
+    ...(imageBase === undefined ? {} : { image_base: imageBase }),
+    ...(segments === undefined
+      ? {}
+      : {
+          segments: segments.map(
+            ({ name, start, end, image_base, address_space }) => ({
+              name,
+              start,
+              end,
+              length: addressDistance(start, end),
+              ...(image_base === undefined ? {} : { image_base }),
+              ...(address_space === undefined ? {} : { address_space }),
+            }),
+          ),
+          segment_count: segments.length,
+        }),
+    procedure_count,
+    string_count,
+  };
+};
+
+/** Parse direct or wrapped provider document names. */
 export const parseDocuments = (
   value: JsonValue,
-): Result<readonly string[], HopperProtocolError> => {
+  operation = "list_documents",
+): Result<readonly string[], AnalysisOutputError> => {
   const parsed = z
     .array(z.string())
     .safeParse(unwrapProperty(value, "documents"));
   return parsed.success
     ? ok(parsed.data)
-    : invalid("document list", parsed.error);
+    : invalid(operation, "document list", parsed.error);
 };
 
 /** Parse a direct or wrapped list when only its cardinality is required. */
 export const parseListCount = (
   value: JsonValue,
   property: string,
-): Result<number, HopperProtocolError> => {
+  operation = property === "procedures" ? "list_procedures" : "list_strings",
+): Result<number, AnalysisOutputError> => {
   const unwrapped = unwrapProperty(value, property);
   const list = z.array(z.unknown()).safeParse(unwrapped);
   if (list.success) return ok(list.data.length);
   const map = z.record(z.string(), z.unknown()).safeParse(unwrapped);
   return map.success
     ? ok(Object.keys(map.data).length)
-    : invalid(`${property} list`, map.error);
+    : invalid(operation, `${property} list`, map.error);
 };
 
 const unwrapProperty = (value: JsonValue, property: string): JsonValue => {
@@ -476,11 +601,16 @@ const unwrapProperty = (value: JsonValue, property: string): JsonValue => {
 };
 
 const invalid = <T>(
+  operation: string,
   expected: string,
   cause: z.ZodError,
-): Result<T, HopperProtocolError> =>
+): Result<T, AnalysisOutputError> =>
   err(
-    new HopperProtocolError(`Hopper returned an invalid ${expected}`, {
-      cause,
-    }),
+    new AnalysisOutputError(
+      operation,
+      `Provider returned an invalid ${expected}`,
+      {
+        cause,
+      },
+    ),
   );

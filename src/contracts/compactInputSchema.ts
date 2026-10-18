@@ -2,7 +2,8 @@ import {
   schemaArrays,
   schemaChildren,
   schemaMaps,
-} from "./inputSchemaPresentation.js";
+  schemaLiteralValues,
+} from "./jsonSchemaKeywords.js";
 
 // Kimi expands schema-local references before sending tools to Moonshot.
 // Compact advertisements must fit after expansion, independently of client
@@ -11,8 +12,6 @@ import {
 /** Annotation keys that carry guidance but no validation semantics. */
 const annotationKeys = new Set(["description", "examples", "default", "title"]);
 
-/** Keys whose values are literal data, never nested schemas to rewrite. */
-const dataKeys = new Set(["const", "enum", "examples", "default"]);
 const definitionKeys = new Set(["$defs", "definitions"]);
 // An empty schema accepts every JSON value. Kimi otherwise infers string.
 const jsonValueTypes = [
@@ -23,8 +22,16 @@ const jsonValueTypes = [
   "number",
   "string",
 ];
+// An empty item schema accepts every JSON value, including arbitrarily nested
+// arrays, while satisfying clients that require `items` for array types.
+const jsonValueSchema = () => ({ type: [...jsonValueTypes], items: {} });
 
 export type AdvertisedInputSchemaPresentation = "inline" | "reduced";
+
+/** Budget selected by the caller for compact MCP input-schema presentation. */
+export interface CompactInputSchemaPresentation {
+  readonly budgetBytes: number;
+}
 
 export interface CompactedInputSchema {
   readonly schema: Record<string, unknown>;
@@ -37,6 +44,22 @@ const isSchemaObject = (value: unknown): value is Record<string, unknown> =>
 const serializedBytes = (value: unknown): number =>
   Buffer.byteLength(JSON.stringify(value), "utf8");
 
+const schemaDepth = (value: unknown, depth = 0): number => {
+  if (Array.isArray(value))
+    return Math.max(
+      depth,
+      ...value.map((child) => schemaDepth(child, depth + 1)),
+    );
+  if (!isSchemaObject(value)) return depth;
+  return Math.max(
+    depth,
+    ...Object.values(value).map((child) => schemaDepth(child, depth + 1)),
+  );
+};
+
+/** Strict clients commonly reject advertised schemas deeper than ten nodes. */
+const COMPACT_SCHEMA_MAX_DEPTH = 10;
+
 /** Rewrite every schema-valued position; literal data stays opaque. */
 const rebuildSchemaPositions = (
   node: unknown,
@@ -46,7 +69,7 @@ const rebuildSchemaPositions = (
   if (!isSchemaObject(node)) return node;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(node)) {
-    if (dataKeys.has(key)) {
+    if (schemaLiteralValues.has(key)) {
       out[key] = value;
       continue;
     }
@@ -136,7 +159,7 @@ const inlineWithinBudget = (
       yield "]";
     } else if (isSchemaObject(value)) {
       if (position === "schema" && Object.keys(value).length === 0) {
-        yield JSON.stringify({ type: jsonValueTypes });
+        yield JSON.stringify(jsonValueSchema());
         return;
       }
       if (position === "schema" && typeof value.$ref === "string") {
@@ -240,12 +263,24 @@ const reduceToShallowProperties = (
   const properties = isSchemaObject(schema.properties) ? schema.properties : {};
   const description = [
     typeof schema.description === "string" ? schema.description : undefined,
+    ...Object.entries(
+      isSchemaObject(schema.dependentRequired)
+        ? schema.dependentRequired
+        : isSchemaObject(schema.dependencies)
+          ? schema.dependencies
+          : {},
+    ).flatMap(([property, partners]) =>
+      Array.isArray(partners) &&
+      partners.every((partner) => typeof partner === "string")
+        ? [
+            `When ${property} is provided, also provide ${partners.join(" and ")}.`,
+          ]
+        : [],
+    ),
     REDUCED_ANNOTATION,
   ]
     .filter((text) => text !== undefined)
     .join(" ");
-  const $schema =
-    typeof schema.$schema === "string" ? { $schema: schema.$schema } : {};
   const shallow = Object.fromEntries(
     Object.entries(properties).map(([name, value]) => {
       const types = detectedTypes(value, schema);
@@ -256,12 +291,18 @@ const reduceToShallowProperties = (
           : {};
       return [
         name,
-        { ...(type === undefined ? {} : { type }), ...description },
+        {
+          ...(type === undefined ? {} : { type }),
+          // Reduced inputs intentionally omit nested validation, but clients
+          // still require an item schema to accept an array declaration.
+          ...(types?.includes("array") ? { items: jsonValueSchema() } : {}),
+          ...description,
+        },
       ];
     }),
   );
   return {
-    ...$schema,
+    ...(typeof schema.$schema === "string" ? { $schema: schema.$schema } : {}),
     type: "object",
     description,
     properties: shallow,
@@ -270,9 +311,6 @@ const reduceToShallowProperties = (
       : {}),
     ...(typeof schema.minProperties === "number"
       ? { minProperties: schema.minProperties }
-      : {}),
-    ...(isSchemaObject(schema.dependentRequired)
-      ? { dependentRequired: { ...schema.dependentRequired } }
       : {}),
     ...(schema.additionalProperties === false
       ? { additionalProperties: false }
@@ -292,7 +330,8 @@ export const compactAdvertisedInputSchema = (
   budgetBytes: number,
 ): CompactedInputSchema => {
   const inline = inlineWithinBudget(stripAnnotations(schema), budgetBytes);
-  if (inline !== undefined) return { schema: inline, presentation: "inline" };
+  if (inline !== undefined && schemaDepth(inline) <= COMPACT_SCHEMA_MAX_DEPTH)
+    return { schema: inline, presentation: "inline" };
   const reduced = reduceToShallowProperties(schema);
   if (serializedBytes(reduced) <= budgetBytes)
     return { schema: reduced, presentation: "reduced" };
@@ -309,3 +348,13 @@ export const compactAdvertisedInputSchema = (
     presentation: "reduced",
   };
 };
+
+/** Return the JSON schema clients receive for the selected input presentation. */
+export const presentAdvertisedInputSchema = (
+  schema: Record<string, unknown>,
+  compactPresentation: CompactInputSchemaPresentation | undefined,
+): Record<string, unknown> =>
+  compactPresentation === undefined
+    ? schema
+    : compactAdvertisedInputSchema(schema, compactPresentation.budgetBytes)
+        .schema;

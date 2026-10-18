@@ -1,9 +1,45 @@
 import { describe, expect, it } from "vitest";
-import { resolve } from "node:path";
+import { join } from "node:path";
 
 import { FakeSetupHost, options } from "./Setup.fixture.js";
 import { runSetup } from "./Setup.js";
 import { setupRegistrationCommand } from "./SetupHost.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
+import { discoverSetupState } from "./SetupPlan.js";
+import type { MsixPackageView } from "./MsixPackageStorage.js";
+import type { SetupClient } from "./SupportedClients.js";
+
+// Host joins keep containment checks meaningful on POSIX test hosts too.
+const PROFILE = String.raw`C:\Users\a`;
+const ROAMING = join(PROFILE, "AppData", "Roaming");
+const LOCAL = join(PROFILE, "AppData", "Local");
+const PRIVATE_CONFIG = join(
+  LOCAL,
+  "Packages",
+  "Claude_pzs8sxrjxfjjc",
+  "LocalCache",
+  "Roaming",
+  "Claude",
+  "claude_desktop_config.json",
+);
+const APPDATA_CONFIG = join(ROAMING, "Claude", "claude_desktop_config.json");
+
+/** Claude Desktop as setup resolves it from its MSIX package storage. */
+const msixClaudeDesktop = (
+  processView: MsixPackageView["processView"],
+): SetupClient => ({
+  name: "claude_desktop",
+  displayName: "Claude Desktop",
+  configPath: PRIVATE_CONFIG,
+  quitBeforeSetup: true,
+  msixPackage: {
+    packageFamilyName: "Claude_pzs8sxrjxfjjc",
+    privateConfigPath: PRIVATE_CONFIG,
+    appDataConfigPath: APPDATA_CONFIG,
+    virtualizedRoots: [ROAMING, LOCAL],
+    processView,
+  },
+});
 
 describe("setup workflow", () => {
   it("omits an aligned managed skill from an otherwise empty plan", async () => {
@@ -23,7 +59,7 @@ describe("setup workflow", () => {
       id: "ubuntu",
       versionId: "24.04",
       packageFamily: "deb",
-      supported: true,
+      hopperSetupSupported: true,
     };
     host.hopper = "/opt/hopper/bin/Hopper";
     host.linuxDemoRuntimeMissing = true;
@@ -45,7 +81,7 @@ describe("setup workflow", () => {
       id: "ubuntu",
       versionId: "24.04",
       packageFamily: "deb",
-      supported: true,
+      hopperSetupSupported: true,
     };
     host.hopper = "/custom/Hopper";
     host.unsupportedHopperVersion = true;
@@ -157,6 +193,53 @@ describe("setup workflow", () => {
   });
 });
 
+describe("configured Linux Hopper selection", () => {
+  it("keeps an explicitly configured launcher even when demo checks fail", async () => {
+    const host = new FakeSetupHost("linux");
+    host.distribution = {
+      id: "ubuntu",
+      versionId: "24.04",
+      packageFamily: "deb",
+      hopperSetupSupported: true,
+    };
+    host.hopper = "/opt/hopper/bin/Hopper";
+    host.hopperLauncherConfigured = true;
+    host.linuxDemoRuntimeMissing = true;
+    const doctor = await host.doctor();
+    const initial = await host.initialSetupState();
+    const discovery = await discoverSetupState({
+      host,
+      providerConfigured: initial.providerConfigured,
+      forceHopperInstall: false,
+      proposeHopper: true,
+      hopperLauncherConfigured: true,
+      initialDoctor: doctor,
+    });
+    expect(discovery.installHopper).toBe(false);
+  });
+
+  it("still offers repair for an unconfigured REA managed install", async () => {
+    const host = new FakeSetupHost("linux");
+    host.distribution = {
+      id: "ubuntu",
+      versionId: "24.04",
+      packageFamily: "deb",
+      hopperSetupSupported: true,
+    };
+    host.hopper = "/opt/hopper/bin/Hopper";
+    host.unsupportedHopperVersion = true;
+    const initial = await host.initialSetupState();
+    const discovery = await discoverSetupState({
+      host,
+      providerConfigured: initial.providerConfigured,
+      forceHopperInstall: false,
+      proposeHopper: true,
+      initialDoctor: await host.doctor(),
+    });
+    expect(discovery.installHopper).toBe(true);
+  });
+});
+
 describe("setup workflow action selection", () => {
   it("executes only actions selected by the interactive adapter", async () => {
     const host = new FakeSetupHost();
@@ -253,13 +336,13 @@ describe("setup workflow action selection", () => {
 
     expect(result.status).toBe("ready");
     expect(host.configuredCommands).toEqual([
-      setupRegistrationCommand("win32", undefined),
+      setupRegistrationCommand("win32", undefined, CURRENT_ENTRYPOINT_PATH),
     ]);
-    expect(setupRegistrationCommand("win32", undefined)).toEqual([
-      process.execPath,
-      resolve(process.argv[1] ?? "rea"),
-      "mcp",
-    ]);
+    expect(
+      setupRegistrationCommand("win32", undefined, CURRENT_ENTRYPOINT_PATH),
+    ).toEqual([process.execPath, CURRENT_ENTRYPOINT_PATH, "mcp"]);
+    expect(setupRegistrationCommand("win32", undefined, undefined)).toEqual([]);
+    expect(setupRegistrationCommand("win32", "npx", undefined)).not.toEqual([]);
   });
 
   it.each([
@@ -277,7 +360,7 @@ describe("setup workflow action selection", () => {
     ],
     [
       "readback",
-      "Agent configuration could not be verified after writing. Repair the configuration file or restore its `.rea.backup`, then rerun setup.",
+      "Agent configuration could not be verified. Repair the configuration file, then rerun setup.",
     ],
   ] as const)("explains %s configuration recovery", async (reason, message) => {
     const host = new FakeSetupHost();
@@ -291,5 +374,106 @@ describe("setup workflow action selection", () => {
     expect(result.status).toBe("needs_human");
     expect(result.remediation).toBe(message);
     expect(result.remediation).not.toContain("internal_client_key");
+  });
+
+  it("names the recovery backup that holds the restored original after a readback failure", async () => {
+    const host = new FakeSetupHost();
+    host.hopper = "/Applications/Hopper";
+    host.clients = [{ name: "cursor", configPath: "/agent.json" }];
+    const backupPath = `/agent.json.rea.backup.${"a".repeat(64)}.recovery`;
+    host.clientResults.set("cursor", {
+      status: "failed",
+      reason: "readback",
+      backupPath,
+    });
+    const result = await runSetup(
+      { ...options(true), clientIds: ["cursor"] },
+      host,
+    );
+    expect(result.remediation).toBe(
+      `Agent configuration could not be verified after writing. The original was restored and its backup at ${backupPath} was retained. Repair the configuration file or restore that backup, then rerun setup.`,
+    );
+  });
+});
+
+describe("MSIX Claude Desktop setup", () => {
+  it("discloses which file MSIX Claude Desktop reads and that it must be quit", async () => {
+    const host = new FakeSetupHost("win32");
+    host.hopper = join(PROFILE, "Hopper");
+    host.skill = "unchanged";
+    host.clients = [msixClaudeDesktop("direct")];
+
+    const result = await runSetup(
+      { ...options(false), clientIds: ["claude_desktop"], dryRun: true },
+      host,
+    );
+
+    expect(result.status).toBe("planned");
+    const [action] = result.plannedActions;
+    expect(action?.target).toBe(PRIVATE_CONFIG);
+    expect(action?.detail).toContain(
+      `Claude Desktop is installed as MSIX package Claude_pzs8sxrjxfjjc, which reads this package-private file instead of ${APPDATA_CONFIG}.`,
+    );
+    expect(action?.detail).toContain(
+      "Quit Claude Desktop fully before approving; closing its window is not enough.",
+    );
+  });
+
+  it("refuses AppData writes from a process the MSIX package started", async () => {
+    const host = new FakeSetupHost("win32");
+    host.hopper = join(PROFILE, "Hopper");
+    host.skill = "unchanged";
+    const vscode = join(ROAMING, "Code", "User", "mcp.json");
+    host.clients = [
+      msixClaudeDesktop("redirected"),
+      { name: "vscode", displayName: "VS Code", configPath: vscode },
+      {
+        name: "codex",
+        displayName: "Codex",
+        configPath: join(PROFILE, ".codex", "config.toml"),
+      },
+    ];
+
+    const blocked = await runSetup(
+      { ...options(true), clientIds: ["vscode", "codex"] },
+      host,
+    );
+    expect(blocked.status).toBe("needs_human");
+    expect(blocked.remediation).toContain(
+      `Changes to ${vscode} would not reach the files other apps read.`,
+    );
+    expect(host.configurations).toBe(0);
+
+    const homeOnly = await runSetup(
+      { ...options(true), clientIds: ["codex"] },
+      host,
+    );
+    expect(homeOnly.status).toBe("ready");
+    expect(host.configurations).toBe(1);
+  });
+
+  it("refuses registrations whose launcher only one MSIX package can see", async () => {
+    const host = new FakeSetupHost("win32");
+    host.hopper = join(PROFILE, "Hopper");
+    host.registrationCommandBlocker = "Install REA outside the package.";
+    host.clients = [
+      { name: "codex", displayName: "Codex", configPath: "/codex.toml" },
+    ];
+
+    const blocked = await runSetup(
+      { ...options(true), clientIds: ["codex"] },
+      host,
+    );
+    expect(blocked.status).toBe("needs_human");
+    expect(blocked.remediation).toBe("Install REA outside the package.");
+    expect(host.configurations).toBe(0);
+    expect(host.skillInstalls).toBe(0);
+
+    const skillOnly = await runSetup(
+      { ...options(true), clientIds: [], installSkill: true },
+      host,
+    );
+    expect(skillOnly.status).toBe("ready");
+    expect(host.skillInstalls).toBe(1);
   });
 });

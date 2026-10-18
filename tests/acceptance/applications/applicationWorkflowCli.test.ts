@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -27,6 +28,8 @@ import { parseJavaScriptApplicationGraph } from "../../../src/domain/javascript/
 import { z } from "zod";
 
 import { ELECTRON_IDENTITY_LIMITATION } from "../../../src/domain/javascript/javascriptElectronMemberWrites.js";
+import { javaScriptSemanticTraceResultSchema } from "../../../src/domain/javascript/javascriptSemanticTraceSchemas.js";
+import type { JavaScriptSemanticQueryInput } from "../../../src/domain/javascript/javascriptSemanticQuerySchemas.js";
 
 const execute = promisify(execFile);
 const requireFixture = createRequire(import.meta.url);
@@ -485,6 +488,7 @@ it("preserves complete line-comment source-map URLs through CLI and MCP", async 
           declared_url: declaredUrl,
           declared_url_sha256: digest,
           resolved_path: "app.js.map",
+          resolution_status: "resolved",
           available: true,
         },
         evidence: expect.objectContaining({
@@ -507,6 +511,7 @@ it("preserves complete line-comment source-map URLs through CLI and MCP", async 
         properties: {
           declared_url_sha256: digest,
           resolved_path: "app.js.map",
+          resolution_status: "resolved",
         },
       }),
     );
@@ -539,7 +544,7 @@ it("resolves source-map URL paths once without changing their declarations", asy
   await writeFile(
     join(root, "app.js"),
     cases.map(([url]) => `//# sourceMappingURL=${url}\n`).join("") +
-      'new Worker("./worker%20file.js");\n' +
+      'new Worker(new URL("./worker%20file.js", import.meta.url));\n' +
       'navigator.serviceWorker.register("./service%20worker.js");\n',
   );
   await writeFile(join(root, "worker file.js"), "export const worker = 1;\n");
@@ -565,6 +570,7 @@ it("resolves source-map URL paths once without changing their declarations", asy
           declared_url: declaredUrl,
           declared_url_sha256: digest,
           resolved_path: path,
+          resolution_status: "resolved",
           available: true,
         },
         evidence: expect.objectContaining({
@@ -587,31 +593,49 @@ it("resolves source-map URL paths once without changing their declarations", asy
       expect.objectContaining({
         relation: "maps_to",
         target_node_id: map?.node_id,
-        properties: { declared_url_sha256: digest, resolved_path: path },
-      }),
-    );
-  }
-  for (const [kind, specifier, path] of [
-    ["worker", "./worker%20file.js", "worker file.js"],
-    ["service-worker", "./service%20worker.js", "service worker.js"],
-  ]) {
-    const worker = graph.nodes.find((node) => node.kind === kind);
-    expect(worker?.observations).toContainEqual(
-      expect.objectContaining({
-        properties: expect.objectContaining({
-          declared_specifier: specifier,
+        properties: {
+          declared_url_sha256: digest,
           resolved_path: path,
-        }),
-      }),
-    );
-    expect(graph.edges).toContainEqual(
-      expect.objectContaining({
-        source_node_id: worker?.node_id,
-        relation: "maps_to",
-        properties: { resolved_path: path },
+          resolution_status: "resolved",
+        },
       }),
     );
   }
+  const worker = graph.nodes.find((node) => node.kind === "worker");
+  expect(worker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: "./worker%20file.js",
+        resolved_path: "worker file.js",
+      }),
+    }),
+  );
+  expect(graph.edges).toContainEqual(
+    expect.objectContaining({
+      source_node_id: worker?.node_id,
+      relation: "maps_to",
+      properties: { resolved_path: "worker file.js" },
+    }),
+  );
+  // A service worker script URL is relative to the unestablished document base.
+  const serviceWorker = graph.nodes.find(
+    (node) => node.kind === "service-worker",
+  );
+  expect(serviceWorker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: null,
+        expression: 'navigator.serviceWorker.register("./service%20worker.js")',
+        resolved_path: null,
+      }),
+    }),
+  );
+  expect(
+    graph.edges.some(
+      ({ source_node_id, relation }) =>
+        source_node_id === serviceWorker?.node_id && relation === "maps_to",
+    ),
+  ).toBe(false);
   expect((await analyzeThroughStdioMcp(root)).graph).toEqual(graph);
 }, 20_000);
 
@@ -829,18 +853,18 @@ describe("application workflow CLI parity", () => {
     if (seed === undefined)
       throw new TypeError("Expected at least one semantic relation");
 
-    const traced = await runCli([
+    const traced = await runCliWithRequestFile(
+      root,
       "trace-javascript-semantics",
-      JSON.stringify({
+      {
         application: analyzed.value,
         query: {
           seed: { kind: "semantic-node", node_id: seed },
           direction: "forward-influence",
           include_ambiguous_dynamic_edges: true,
         },
-      }),
-      "--json",
-    ]);
+      },
+    );
     expect(traced).toMatchObject({
       operation: "trace_javascript_semantics",
       predicate_type: "rea.javascript-semantic-trace",
@@ -851,6 +875,110 @@ describe("application workflow CLI parity", () => {
     });
   }, 20_000);
 });
+
+it("traces all endpoint carriers and their response consumers through CLI and MCP", async () => {
+  const root = await createTestTempDirectory("rea-endpoint-response-trace-");
+  const endpoint = "https://example.invalid/v1/data";
+  const source = `export async function load() {
+    const response = await fetch(${JSON.stringify(endpoint)});
+    return await response.json();
+  }`;
+  const sourcePath = join(root, "app.js");
+  await writeFile(sourcePath, source);
+  const application = parseEvidence(
+    await runCli(["analyze-javascript-application", root, "--json"]),
+  );
+  const graph = javascriptApplicationAnalysisResultSchema.parse(
+    application.normalized_result,
+  ).semantic_graph;
+  const carriers = graph.nodes.filter(
+    ({ properties }) => properties.endpoint === endpoint,
+  );
+  expect(carriers.map(({ kind }) => kind).toSorted()).toEqual([
+    "request",
+    "response",
+  ]);
+  const response = carriers.find(({ kind }) => kind === "response");
+  if (response === undefined) throw new Error("Expected matching response");
+  const consumer = graph.relations.find(
+    ({ source_node_id, relation }) =>
+      source_node_id === response.node_id && relation === "consumed-by",
+  );
+  expect(consumer).toMatchObject({ resolution: "resolved" });
+  const client = await connectedMcpClient();
+  const trace = async (seed: JavaScriptSemanticQueryInput["seed"]) => {
+    const input = {
+      application,
+      query: { seed, direction: "forward-influence" },
+    };
+    const cliEvidence = parseEvidence(
+      await runCliWithRequestFile(root, "trace-javascript-semantics", input),
+    );
+    const mcpResponse = await client.callTool({
+      name: "trace_javascript_semantics",
+      arguments: input,
+    });
+    expect(mcpResponse.isError).not.toBe(true);
+    expect(parseEvidence(mcpResponse.structuredContent)).toEqual(cliEvidence);
+    const result = javaScriptSemanticTraceResultSchema.parse(
+      cliEvidence.normalized_result,
+    );
+    expect(result.source_evidence_id).toBe(application.evidence_id);
+    expect(result.source_graph_id).toBe(graph.graph_id);
+    return result;
+  };
+  const selected = await trace({ kind: "endpoint", value: endpoint });
+  expect(selected.seed_node_ids).toEqual(
+    carriers.map(({ node_id }) => node_id).toSorted(),
+  );
+  const exactNodes = new Map<string, (typeof selected.nodes)[number]>();
+  const exactRelations = new Map<string, (typeof selected.relations)[number]>();
+  for (const carrier of carriers) {
+    const exact = await trace({
+      kind: "semantic-node",
+      node_id: carrier.node_id,
+    });
+    for (const node of exact.nodes) exactNodes.set(node.node_id, node);
+    for (const relation of exact.relations)
+      exactRelations.set(relation.relation_id, relation);
+  }
+  expect(new Map(selected.nodes.map((node) => [node.node_id, node]))).toEqual(
+    exactNodes,
+  );
+  expect(
+    new Map(
+      selected.relations.map((relation) => [relation.relation_id, relation]),
+    ),
+  ).toEqual(exactRelations);
+  expect(selected.nodes.map(({ kind }) => kind).toSorted()).toEqual([
+    "call-site",
+    "request",
+    "response",
+  ]);
+  expect(selected.relations).toEqual([consumer]);
+  expect(selected).toMatchObject({
+    status: "ambiguous",
+    summary: {
+      total_seed_matches: 2,
+      traversed_nodes: 3,
+      traversed_relations: 1,
+    },
+    coverage: { status: "partial" },
+  });
+  expect(graph.coverage.status).toBe("unknown");
+  const absent = await trace({
+    kind: "endpoint",
+    value: `${endpoint}/missing`,
+  });
+  expect(absent).toMatchObject({
+    status: "partial",
+    seed_node_ids: [],
+    nodes: [],
+    relations: [],
+    coverage: { status: "partial" },
+  });
+  expect(await readFile(sourcePath, "utf8")).toBe(source);
+}, 20_000);
 
 describe("rest parameter semantic trace CLI", () => {
   it("traces each ordinary rest argument to its parameter through public application Evidence", async () => {
@@ -873,8 +1001,9 @@ describe("rest parameter semantic trace CLI", () => {
           kind === "expression" && label === `argument ${String(index)}`,
       );
       if (argument === undefined) throw new Error("Missing argument node");
-      const traced = await runCli([
-        "trace-javascript-semantics",
+      const requestPath = join(root, `trace-request-${index}.json`);
+      await writeFile(
+        requestPath,
         JSON.stringify({
           application,
           query: {
@@ -884,6 +1013,10 @@ describe("rest parameter semantic trace CLI", () => {
             expected: { role: "sink", classes: ["parameter"] },
           },
         }),
+      );
+      const traced = await runCli([
+        "trace-javascript-semantics",
+        requestPath,
         "--json",
       ]);
       expect(traced).toMatchObject({
@@ -1157,7 +1290,9 @@ describe("application workflow CLI copy boundaries", () => {
 
 describe("application workflow CLI and MCP capture lifetimes", () => {
   it("compares captured primitives and source values after aliases are replaced", async () => {
-    const root = await createTestTempDirectory("rea-capture-lifetime-cli-");
+    const parent = await createTestTempDirectory("rea-capture-lifetime-cli-");
+    const root = join(parent, "fixtures # capture");
+    await mkdir(root);
     const fields = [
       "rebound",
       "rest",
@@ -1221,7 +1356,9 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
         "--input-type=module",
         "--eval",
         "const module = await import(process.argv[1]); console.log(JSON.stringify(module.default()));",
-        join(root, String(index), "parser.mjs"),
+        // ESM import() takes a URL specifier; a Windows drive path parses as a
+        // `c:` URL scheme and is rejected.
+        pathToFileURL(join(root, String(index), "parser.mjs")).href,
       ]);
       expect(JSON.parse(stdout)).toEqual({
         kind: "capture-boundary",
@@ -1274,18 +1411,18 @@ describe("application workflow CLI export Evidence", () => {
       'export default async function make() { return { kind: "record", extra: 1 }; }',
     ];
     const [left, right] = await analyzeComparisonSources(root, sources);
-    const compared = await runCli([
+    const compared = await runCliWithRequestFile(
+      root,
       "compare-javascript-export-shapes",
-      JSON.stringify({
+      {
         left,
         right,
         left_module_path: "parser.mjs",
         left_export_name: "default",
         right_module_path: "parser.mjs",
         right_export_name: "default",
-      }),
-      "--json",
-    ]);
+      },
+    );
     expect(compared).toMatchObject({
       operation: "compare_javascript_export_shapes",
       normalized_result: {
@@ -1571,8 +1708,11 @@ it("retains bundled isolated-world contextBridge APIs through dedicated and gene
           world: "isolated",
           world_id: { status: "literal", value: 1001, expression: null },
           api_key: "isolatedApi",
+          api_status: "object-literal",
           members: ["ping"],
-          resolution_basis: "wrapper-substitution",
+          unknown_members: 0,
+          // The proven Webpack bootstrap resolves `load(2)` directly.
+          resolution_basis: "direct-syntax",
         }),
         evidence: expect.objectContaining({
           location: expect.objectContaining({
@@ -1610,4 +1750,20 @@ const runCli = async (
       return JSON.parse(cause.stdout);
     throw cause;
   }
+};
+
+/**
+ * Pass a request carrying complete Evidence through the CLI's file-backed JSON
+ * input. Serialized Evidence exceeds the Windows command-line limit when it is
+ * passed as one argument, so spawn fails with ENAMETOOLONG before the workflow
+ * starts. Inline JSON transport keeps its own coverage in the parity tests.
+ */
+const runCliWithRequestFile = async (
+  root: string,
+  command: string,
+  request: unknown,
+): Promise<unknown> => {
+  const requestPath = join(root, "request.json");
+  await writeFile(requestPath, JSON.stringify(request));
+  return runCli([command, requestPath, "--json"]);
 };

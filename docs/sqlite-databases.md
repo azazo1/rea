@@ -57,7 +57,10 @@ triggers or arbitrary SQL.
 Rows are optional. `table` selects one exact ordinary-table name. `columns`
 (CLI repeated `--column`) selects exact visible column names in the requested
 order; omission selects all visible columns, including generated columns.
-Unselected cells are not evaluated or projected. Column selection requires a
+Unselected cells are not evaluated or projected. Malformed column-name bytes
+cause a format refusal when all columns are requested. In inventory scope, an explicit valid subset can
+still be sampled without decoding unrelated malformed column names.
+Column selection requires a
 table and at least one name; empty-string identifiers are valid. `row_limit`
 requires `table`, defaults to 20 and accepts positive safe integers. Samples
 remain subject to the byte and worker resource limits below, regardless of row count. The result reports
@@ -104,6 +107,20 @@ deadline. SQLite native allocations are separate from the JavaScript heap;
 overall native heap and total resident memory are not capped. Row limits do not
 override these byte and resource limits. Resource-limit failures do not return
 an incomplete schema as successful complete evidence.
+
+If the combined database and WAL exceed the snapshot budget, the refusal is a
+`resource_constraint` and reports both the configured byte limit and the exact
+observed combined size as a decimal string. The remediation directs callers to
+create a smaller consistent offline snapshot containing only relevant data
+through the application's supported export workflow. A generic backup or copy
+does not guarantee a smaller result; REA does not truncate or modify the
+selected source.
+
+On hosts that cannot address the derived WAL or rollback-journal path for a
+long selected database name, REA reports that the SQLite capability is
+unavailable. It does not assume an inaccessible sidecar is absent. Use the
+application's supported consistent offline export or copy workflow to place
+the complete known file set at a shorter path.
 
 MCP also applies its configured response budget to the complete Evidence
 envelope. If delivery exceeds that budget, it reports a transport constraint

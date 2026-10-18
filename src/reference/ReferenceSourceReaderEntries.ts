@@ -25,7 +25,7 @@ import {
 import type {
   PendingDirectory,
   ReferenceSourceEntry,
-  ReferenceSourceEntryKind,
+  ReferenceSourceExclusionKind,
   ReferenceSourceResult,
   TraversalState,
 } from "./ReferenceSourceReaderTypes.js";
@@ -134,6 +134,7 @@ export const traverseDirectory = async (
         readFailure,
       ),
     );
+    scheduleObservedDirectories(state, directories);
     return { ok: true, value: undefined };
   }
   const after = await validateDirectory(
@@ -152,6 +153,7 @@ export const traverseDirectory = async (
         "Directory changed while it was read",
       ),
     );
+    scheduleObservedDirectories(state, directories);
     return { ok: true, value: undefined };
   }
   if (current.path !== state.root)
@@ -160,9 +162,16 @@ export const traverseDirectory = async (
       kind: "directory",
       path: pathFromRoot(state.root, current.path),
     });
+  scheduleObservedDirectories(state, directories);
+  return { ok: true, value: undefined };
+};
+
+const scheduleObservedDirectories = (
+  state: TraversalState,
+  directories: PendingDirectory[],
+): void => {
   directories.reverse();
   state.pending.push(...directories);
-  return { ok: true, value: undefined };
 };
 
 const directoryReadFailure = (cause: unknown): string => {
@@ -201,6 +210,16 @@ const processEntry = async (
   const metadata = await readMetadata(absolute);
   if (isAborted(state.signal)) return { ok: false, error: cancelled() };
   if (!metadata.ok) {
+    const excluded = applyExclusion(state.shouldExclude, path, "unknown");
+    if (!excluded.ok)
+      return {
+        ok: false,
+        error: failure("io", "Reference source exclusion check failed"),
+      };
+    if (excluded.value) {
+      state.exclusions.push({ path, kind: "unknown" });
+      return { ok: true, value: undefined };
+    }
     state.entries.push(entryFailure(path, "unknown", "io", metadata.message));
     return { ok: true, value: undefined };
   }
@@ -221,7 +240,10 @@ const processEntry = async (
         message: "Reference source exclusion check failed",
       },
     };
-  if (excluded.value) return { ok: true, value: undefined };
+  if (excluded.value) {
+    state.exclusions.push({ path, kind });
+    return { ok: true, value: undefined };
+  }
   if (isAborted(state.signal)) return { ok: false, error: cancelled() };
   if (kind === "symlink")
     state.entries.push(
@@ -350,7 +372,7 @@ const readSymlinkTarget = async (
   } catch (cause: unknown) {
     const code =
       cause instanceof Error ? Reflect.get(cause, "code") : undefined;
-    if (code !== "ENOENT") throw cause;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw cause;
     return {
       status: "read",
       kind: "symlink",
@@ -371,10 +393,10 @@ const readSymlinkTarget = async (
 
 const applyExclusion = (
   shouldExclude:
-    | ((path: string, kind: ReferenceSourceEntryKind) => boolean)
+    | ((path: string, kind: ReferenceSourceExclusionKind) => boolean)
     | undefined,
   path: string,
-  kind: ReferenceSourceEntryKind,
+  kind: ReferenceSourceExclusionKind,
 ): { readonly ok: true; readonly value: boolean } | { readonly ok: false } => {
   try {
     return { ok: true, value: shouldExclude?.(path, kind) === true };

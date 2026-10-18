@@ -1,3 +1,4 @@
+import { err, ok, type Result } from "../domain/result.js";
 import type { ObjcSwiftMetadata } from "../domain/native/objcSwiftMetadata.js";
 import type { Segment, Section } from "./AppleMachoSelection.js";
 import { boundClassName, decodeObjcCategories } from "./AppleObjcCategories.js";
@@ -30,9 +31,16 @@ export interface ObjcDispatchReaders {
 const hex = (value: bigint) => `0x${value.toString(16)}`;
 const decoded = { status: "decoded" as const, reason: null };
 
-/** Name of a class defined in this image, from its class_ro_t. */
-const localClassName = (read: ObjcDispatchReaders, address: bigint): string =>
-  read.string(read.pointer((read.pointer(address + 32n) & ~7n) + 24n));
+/** Admit the local class identity once for classes, superclasses and categories. */
+const readLocalClass = (read: ObjcDispatchReaders, address: bigint) => {
+  const ro = read.pointer(address + 32n) & ~7n;
+  const name = read.string(read.pointer(ro + 24n));
+  if (name.length === 0)
+    throw new TypeError(
+      `Objective-C class at ${hex(address)} has an empty name`,
+    );
+  return { ro, name };
+};
 
 /**
  * Resolve a class's superclass: a bind to `_OBJC_CLASS_$_Name` names a class
@@ -49,12 +57,13 @@ const resolveSuperclass = (
   const superclass = read.pointer(address + 8n);
   if (superclass === 0n) return { name: null, address: null };
   try {
-    return { name: localClassName(read, superclass), address: hex(superclass) };
+    return {
+      name: readLocalClass(read, superclass).name,
+      address: hex(superclass),
+    };
   } catch (cause: unknown) {
-    // Superclass resolution failure is recorded; the cause adds no identity.
-    void cause;
     failures.push(
-      `Superclass pointer ${hex(superclass)} of ${className} requires unsupported binding/fixup resolution`,
+      `Superclass pointer ${hex(superclass)} of ${className} could not be decoded: ${cause instanceof Error ? cause.message : String(cause)}`,
     );
     return { name: null, address: hex(superclass) };
   }
@@ -67,14 +76,25 @@ export const decodeObjcDispatchFacets = (input: {
   segments: readonly Segment[];
   readers: ObjcDispatchReaders;
   budget: DispatchRecordBudget;
+  maxListSlots: number;
   result: ObjcSwiftMetadata;
 }): {
   failures: string[];
   categoryIssues: DecodeIssue[];
   examined: number;
   categoriesExamined: number;
+  objcListScanTruncated: boolean;
+  objcClassListScanTruncated: boolean;
 } => {
-  const { bytes, sections, segments, readers: read, budget, result } = input;
+  const {
+    bytes,
+    sections,
+    segments,
+    readers: read,
+    budget,
+    maxListSlots,
+    result,
+  } = input;
   const failures: string[] = [];
   const categoryIssues: DecodeIssue[] = [];
   let examined = 0;
@@ -151,6 +171,8 @@ export const decodeObjcDispatchFacets = (input: {
         void cause;
       }
       const selector = read.string(selectorAddress);
+      if (selector.length === 0)
+        throw new TypeError("Objective-C method has an empty selector");
       selectors.push(selector);
       result.objc_dispatch_implementations.push({
         class_name: className,
@@ -190,6 +212,33 @@ export const decodeObjcDispatchFacets = (input: {
     result,
     failures,
   });
+  // Each list scan has its own slot bound: zero and duplicate pointers do
+  // not produce records, but still consume pointer-reading work. The bound
+  // is per list so one list's slots cannot starve the other list's scan.
+  // Record decoders retain their existing admission ownership.
+  let objcListScanTruncated = false;
+  let objcClassListScanTruncated = false;
+  const createListSlotReader = () => {
+    let listSlotsExamined = 0;
+    return (field: bigint): Result<bigint, "unmapped" | "exhausted"> => {
+      if (listSlotsExamined >= maxListSlots) {
+        objcListScanTruncated = true;
+        return err("exhausted");
+      }
+      listSlotsExamined++;
+      try {
+        return ok(read.pointer(field));
+      } catch (cause: unknown) {
+        const admitted = budget.admit();
+        failures.push(
+          `${hex(field)}: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+        return err(admitted ? "unmapped" : "exhausted");
+      }
+    };
+  };
+  const readProtocolListSlot = createListSlotReader();
+  const readClassListSlot = createListSlotReader();
   for (const section of sections.filter(
     ({ name }) => name === "__objc_protolist",
   )) {
@@ -200,15 +249,28 @@ export const decodeObjcDispatchFacets = (input: {
         budget.markTruncated();
         break;
       }
-      protocolReader.record(read.pointer(section.address + BigInt(index * 8)));
+      const field = section.address + BigInt(index * 8);
+      const pointer = readProtocolListSlot(field);
+      if (!pointer.ok) {
+        if (pointer.error === "exhausted") break;
+        continue;
+      }
+      try {
+        protocolReader.record(pointer.value);
+      } catch (cause) {
+        // record() admits the slot itself before decoding, so admitting
+        // again here would count one protocol twice.
+        failures.push(
+          `${hex(field)}: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
     }
   }
   const visited = new Set<string>();
   const readClass = (address: bigint, meta = false) => {
     if (address === 0n || visited.has(hex(address)) || !budget.admit()) return;
     visited.add(hex(address));
-    const ro = read.pointer(address + 32n) & ~7n;
-    const name = read.string(read.pointer(ro + 24n));
+    const { ro, name } = readLocalClass(read, address);
     const root = (read.u32(ro) & 2) !== 0;
     const superclass = resolveSuperclass(read, address, name, failures);
     if (superclass.name === null && superclass.address === null && !root)
@@ -235,14 +297,23 @@ export const decodeObjcDispatchFacets = (input: {
           void cause;
           failures.push(`Unresolved ivar offset pointer ${hex(encodedOffset)}`);
         }
+        const ivarName = read.string(read.pointer(entry + 8n));
+        if (ivarName.length === 0)
+          throw new TypeError("Objective-C ivar has an empty name");
+        const alignment = read.u32(entry + 24n);
         result.objc_ivars.push({
           class_name: name,
-          name: read.string(read.pointer(entry + 8n)),
+          name: ivarName,
           type_encoding: read.string(read.pointer(entry + 16n)),
           offset: value,
           size: read.u32(entry + 28n),
+          // objc4 ivar_t::alignment(): ~0 means word alignment (8 for 32-byte entries).
           alignment:
-            read.u32(entry + 24n) < 31 ? 2 ** read.u32(entry + 24n) : null,
+            alignment === 0xffffffff
+              ? 8
+              : alignment < 31
+                ? 2 ** alignment
+                : null,
           location: read.location(entry),
           decode:
             value === null
@@ -320,11 +391,24 @@ export const decodeObjcDispatchFacets = (input: {
         budget.markTruncated();
         break;
       }
-      examined++;
       const field = section.address + BigInt(index * 8);
+      const pointer = readClassListSlot(field);
+      if (pointer.ok || pointer.error === "unmapped") examined++;
+      if (!pointer.ok) {
+        if (pointer.error === "exhausted") {
+          objcClassListScanTruncated = true;
+          break;
+        }
+        continue;
+      }
       try {
-        readClass(read.pointer(field));
+        readClass(pointer.value);
       } catch (cause) {
+        // The slot was already admitted inside readClass before anything
+        // could throw (its admit runs before the first pointer read), so
+        // admitting again here would count one class twice: at the budget
+        // boundary it would break before appending the failure reason, and
+        // with larger limits malformed classes would starve valid ones.
         failures.push(
           `${hex(field)}: ${cause instanceof Error ? cause.message : String(cause)}`,
         );
@@ -335,12 +419,18 @@ export const decodeObjcDispatchFacets = (input: {
     sections,
     read,
     result,
-    failures,
     issues: categoryIssues,
     admit: () => budget.admit(),
     methods,
     protocols: (list) => protocolReader.list(list),
-    localClassName: (address) => localClassName(read, address),
+    localClassName: (address) => readLocalClass(read, address).name,
   });
-  return { failures, categoryIssues, examined, categoriesExamined };
+  return {
+    failures,
+    categoryIssues,
+    examined,
+    categoriesExamined,
+    objcListScanTruncated,
+    objcClassListScanTruncated,
+  };
 };

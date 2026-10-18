@@ -51,6 +51,9 @@ export const addElectronCallPaths = (
               properties: {
                 path_id: pathId,
                 entry: path.entry,
+                ...(path.entry_path === undefined
+                  ? {}
+                  : { entry_path: [...path.entry_path] }),
                 entry_kind: path.entry_kind,
                 channel: path.channel,
                 terminal: path.terminal,
@@ -97,6 +100,9 @@ export const addElectronCallPaths = (
           properties: {
             path_id: pathId,
             entry: path.entry,
+            ...(path.entry_path === undefined
+              ? {}
+              : { entry_path: [...path.entry_path] }),
             resolution: "candidate",
           },
         });
@@ -119,6 +125,9 @@ export const addElectronCallPaths = (
           properties: {
             path_id: pathId,
             entry: path.entry,
+            ...(path.entry_path === undefined
+              ? {}
+              : { entry_path: [...path.entry_path] }),
             channel: path.channel,
             resolution: "candidate",
             conditions: path.conditions,
@@ -156,7 +165,8 @@ export const addElectronCallPaths = (
             pairing_basis: "unique-exact-literal-channel",
             resolution: "candidate",
             handler_path: to.file.path,
-            conditions: to.path.conditions,
+            bridge_conditions: from.path.conditions,
+            handler_conditions: to.path.conditions,
           },
           limitations: [
             "The unique static channel match does not establish runtime registration, sender acceptance, or dispatch.",

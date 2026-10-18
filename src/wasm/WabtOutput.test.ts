@@ -3,6 +3,7 @@ import { expect, it } from "vitest";
 import { parseWabtOutput } from "./WabtOutput.js";
 import { parseWabtWat } from "./WabtWat.js";
 import { associateWasmGlue } from "./WasmGlueAdapter.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
 const golden = () =>
   readFile(
     new URL("../../tests/fixtures/wasm/objdump.txt", import.meta.url),
@@ -229,7 +230,7 @@ it("extracts escaped WAT import/export forms while retaining multiline producer 
     new URL("../../tests/fixtures/wasm/decoded.wat", import.meta.url),
     "utf8",
   );
-  expect(parseWabtWat(text)).toEqual({
+  expect(parseWabtWat(text)).toMatchObject({
     imports: ['(import "env" "foo" (func (;0;) (type 0)))'],
     exports: ['(export "memory" (memory 0))', '(export "run" (func 1))'],
     customSectionNames: ["test"],
@@ -239,7 +240,7 @@ it("extracts escaped WAT import/export forms while retaining multiline producer 
     parseWabtWat(
       '(module (import "a.b" "c\\0aline" (func)) (export "fake\\22Export[1]:" (func 0)))',
     ),
-  ).toEqual({
+  ).toMatchObject({
     imports: ['(import "a.b" "c\\0aline" (func))'],
     exports: ['(export "fake\\22Export[1]:" (func 0))'],
     customSectionNames: [],
@@ -281,4 +282,68 @@ it("keeps exact local, ambiguous URL, computed and unparseable glue distinct", (
     parse_status: "failed",
     references: [],
   });
+});
+
+it("retains directive literals and matches their cooked escaped path", () => {
+  const candidates = ["/app/module.wasm"];
+  const directive = associateWasmGlue(
+    '"module.wasm";\n',
+    "/app/glue.js",
+    candidates,
+  );
+  expect(directive.references).toMatchObject([
+    {
+      value: "module.wasm",
+      line: 1,
+      column: 0,
+      candidate_paths: candidates,
+      association: "local-path-candidate",
+      evidence_kind: "static-literal",
+    },
+  ]);
+
+  const escaped = String.raw`"mod\u0075le\x2ewasm";`;
+  expect(
+    associateWasmGlue(escaped, "/app/glue.js", candidates).references,
+  ).toMatchObject([
+    {
+      value: "module.wasm",
+      line: 1,
+      column: 0,
+      candidate_paths: candidates,
+      association: "local-path-candidate",
+      evidence_kind: "static-literal",
+    },
+  ]);
+  expect(
+    associateWasmGlue(`;${escaped}`, "/app/glue.js", candidates).references,
+  ).toMatchObject([
+    {
+      value: "module.wasm",
+      line: 1,
+      column: 1,
+      candidate_paths: candidates,
+      association: "local-path-candidate",
+      evidence_kind: "static-literal",
+    },
+  ]);
+});
+
+it("matches a CLI-selected ./ module exactly against its glue reference", () => {
+  // The CLI makes `./module.wasm` absolute from /app with absoluteCallerPath.
+  const selected = absoluteCallerPath("./module.wasm", {
+    cwd: "/app",
+    platform: "linux",
+  });
+  expect(
+    associateWasmGlue('fetch("./module.wasm");', "/app/glue.js", [
+      selected,
+      "/other/module.wasm",
+    ]).references,
+  ).toMatchObject([
+    {
+      association: "local-path-candidate",
+      candidate_paths: ["/app/module.wasm"],
+    },
+  ]);
 });

@@ -4,22 +4,65 @@ import {
   type DoctorHost,
 } from "./application/Doctor.js";
 import { fileURLToPath } from "node:url";
+import { inspectJadxProvider } from "./android/JadxDoctor.js";
 import { inspectSystemGhidraProvider } from "./ghidra/GhidraDoctor.js";
 import { inspectIdaRegistration } from "./ida/IdaDoctor.js";
+import { inspectKunaProvider } from "./kuna/KunaDoctor.js";
+import { readIdaConfiguration } from "./ida/IdaConfiguration.js";
+import { parseJebMcpEndpoint } from "./jeb/JebMcpEndpoint.js";
 import { selectLinuxPrivateDisplayStrategy } from "./hopper/LinuxPrivateDisplayProbe.js";
+import { ok } from "./domain/result.js";
 
 /** Compose provider diagnostics at the outer CLI adapter boundary. */
 export const createSystemDoctorHost = (
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
-): DoctorHost =>
-  systemDoctorHost({
+  signal?: AbortSignal,
+): DoctorHost => {
+  const selectedJebEndpoint = environment.REA_JEB_MCP_URL;
+  const selectedJebRegistrationEnvironment: Readonly<Record<string, string>> =
+    selectedJebEndpoint !== undefined &&
+    selectedJebEndpoint.length > 0 &&
+    parseJebMcpEndpoint(selectedJebEndpoint).ok
+      ? { REA_JEB_MCP_URL: selectedJebEndpoint }
+      : {};
+  return systemDoctorHost({
     environment,
-    providerInspections: async () => [
-      await inspectSystemGhidraProvider(environment),
+    ...(signal === undefined ? {} : { signal }),
+    providerRegistrationEnvironment: () => selectedJebRegistrationEnvironment,
+    resolveProviderRequestBudget: (
+      analysisProvider,
+      registrationEnvironment,
+    ) => {
+      if (analysisProvider !== "ida" && analysisProvider !== "auto")
+        return ok(undefined);
+      const path = registrationEnvironment.REA_IDA_MCP_CONFIG;
+      if (path === undefined) return ok(undefined);
+      const registration = readIdaConfiguration(path);
+      if (registration.ok) return ok(registration.value.timeoutMs);
+      // An invalid IDA registration cannot be selected automatically. Keep it
+      // out of recommendations for another available provider, but surface the
+      // parser-owned error when IDA itself was explicitly selected.
+      return analysisProvider === "ida" ? registration : ok(undefined);
+    },
+    providerInspections: async (fileCloseResources, inspectionSignal) => [
+      await inspectSystemGhidraProvider(
+        environment,
+        fileCloseResources,
+        inspectionSignal,
+      ),
       inspectIdaRegistration(environment.REA_IDA_MCP_CONFIG),
+      await inspectJadxProvider(
+        environment,
+        fileCloseResources,
+        inspectionSignal,
+      ),
+      await inspectKunaProvider(environment, process.platform, {
+        fileCloseResources,
+      }),
     ],
     linuxDemoRuntimeCheck: () => inspectLinuxPrivateDisplay(environment),
   });
+};
 
 const HOPPER_DEMO_HELPER_PATH = fileURLToPath(
   new URL("../scripts/hopper-demo-x11.py", import.meta.url),

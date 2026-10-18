@@ -2,6 +2,7 @@ import * as t from "@babel/types";
 
 import {
   semanticObjectPatternKeys,
+  runtimeFunctionParameters,
   semanticStaticPropertyKey,
 } from "./javascriptAstValues.js";
 import {
@@ -19,6 +20,7 @@ interface IterationSourceValue {
 export interface SemanticIterationSource extends IterationSourceValue {
   readonly kind: "iteration" | "reference-store";
   readonly mutation: t.Node;
+  readonly target?: t.MemberExpression;
   readonly fallbackSources?: readonly IterationSourceValue[];
   readonly requiredSources?: readonly IterationSourceValue[];
 }
@@ -39,6 +41,7 @@ const add = (
   mutation: t.Node,
   guards: SourceGuards,
   kind: SemanticIterationSource["kind"] = "iteration",
+  target?: t.MemberExpression,
 ): void => {
   sources.push({
     kind,
@@ -46,6 +49,7 @@ const add = (
     projection: source.projection,
     mutation,
     ...guards,
+    ...(target === undefined ? {} : { target }),
   });
 };
 const project = (
@@ -94,6 +98,7 @@ const visit = (
         mutation,
         guards,
         "reference-store",
+        pattern,
       );
     return;
   }
@@ -212,7 +217,8 @@ export const semanticIterationSources = (
   else if (t.isYieldExpression(node) && node.delegate && node.argument != null)
     add(sources, { node: node.argument, projection: [] }, node, {});
   else if (t.isFunction(node))
-    for (const parameter of node.params) visit(context, parameter, undefined);
+    for (const parameter of runtimeFunctionParameters(node))
+      visit(context, parameter, undefined);
 
   return sources;
 };

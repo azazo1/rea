@@ -1,9 +1,116 @@
 import { expect, it } from "vitest";
-import { readGoBinaryImage } from "../../../src/go/GoBinaryImage.js";
+import { javaClassFile } from "../../fixtures/javaClassFile.js";
+import {
+  CPU,
+  fatImage,
+  machoImage,
+} from "../../../src/artifacts/apple/MachoImage.fixture.js";
+import {
+  readGoBinaryImage,
+  GoBinaryResourceFailure,
+} from "../../../src/go/GoBinaryImage.js";
+import { readGoMachoImage } from "../../../src/go/GoMachoImage.js";
 import {
   createGoBinaryFixture,
+  createGoSplitElfFixture,
+  createGoOverlappingElfFixture,
   GO_MODULE_TEXT,
 } from "../../fixtures/go/image.js";
+
+it("bounds cumulative header searches across overlapping ELF file spans", () => {
+  const bytes = createGoOverlappingElfFixture();
+  expect(() => readGoBinaryImage(bytes)).toThrow(GoBinaryResourceFailure);
+  expect(() => readGoBinaryImage(bytes)).toThrow(/256 MiB.*search/);
+});
+
+it("does not charge duplicate ELF search spans repeatedly", () => {
+  expect(
+    readGoBinaryImage(createGoOverlappingElfFixture(true)).build_info,
+  ).toBeNull();
+});
+
+it("accepts a search exactly at the cumulative byte limit", () => {
+  const bytes = createGoOverlappingElfFixture();
+  bytes.writeUInt16LE(256, 56);
+  expect(readGoBinaryImage(bytes).build_info).toBeNull();
+});
+
+it("keeps different virtual alignments distinct when file spans match", () => {
+  const fixture = createGoBinaryFixture({ sectionless: true });
+  fixture.bytes.copy(fixture.bytes, 184, 128, 184);
+  fixture.bytes.writeUInt16LE(2, 56);
+  fixture.bytes.writeBigUInt64LE(0x200001n, 128 + 16);
+  expect(readGoBinaryImage(fixture.bytes).build_info?.header_offset).toBe(
+    fixture.headerOffset,
+  );
+});
+
+it.each([
+  [32, "little", "inline"],
+  [32, "little", "pointer"],
+  [32, "big", "inline"],
+  [32, "big", "pointer"],
+  [64, "little", "inline"],
+  [64, "little", "pointer"],
+  [64, "big", "inline"],
+  [64, "big", "pointer"],
+] as const)(
+  "retains later-load ELF metadata without sections (%d %s %s)",
+  (bits, byteOrder, encoding) => {
+    const original = createGoSplitElfFixture({ bits, byteOrder, encoding });
+    const sectionless = createGoSplitElfFixture({
+      bits,
+      byteOrder,
+      encoding,
+      sectionless: true,
+    });
+    const expected = readGoBinaryImage(original.bytes).build_info;
+    expect(expected).not.toBeNull();
+    expect(readGoBinaryImage(sectionless.bytes).build_info).toEqual(expected);
+  },
+);
+
+it("continues past an empty file-backed ELF data load", () => {
+  const fixture = createGoSplitElfFixture({ sectionless: true });
+  const expected = readGoBinaryImage(fixture.bytes).build_info;
+  fixture.bytes.writeBigUInt64LE(0n, 128 + 32);
+  expect(readGoBinaryImage(fixture.bytes).build_info).toEqual(expected);
+});
+
+it.each([4, 5, 7])(
+  "does not search a later non-data ELF load with flags %d",
+  (flags) => {
+    const fixture = createGoSplitElfFixture({ sectionless: true });
+    fixture.bytes.writeUInt32LE(flags, 184 + 4);
+    expect(readGoBinaryImage(fixture.bytes).build_info).toBeNull();
+  },
+);
+
+it("prefers the named ELF section to an earlier writable-load marker", () => {
+  const fixture = createGoSplitElfFixture();
+  const expected = readGoBinaryImage(fixture.bytes).build_info;
+  fixture.bytes.copy(
+    fixture.bytes,
+    512,
+    fixture.headerOffset,
+    fixture.headerOffset + 32,
+  );
+  expect(readGoBinaryImage(fixture.bytes).build_info).toEqual(expected);
+});
+
+it("does not skip malformed earlier metadata to report a later valid record", () => {
+  const fixture = createGoSplitElfFixture({ sectionless: true });
+  fixture.bytes.copy(
+    fixture.bytes,
+    512,
+    fixture.headerOffset,
+    fixture.headerOffset + 32,
+  );
+  fixture.bytes[512 + 15] = 0xff;
+  expect(() => readGoBinaryImage(fixture.bytes)).toThrow(
+    /unsupported format bit/,
+  );
+});
 
 it.each([
   ["elf", 32, "little"],
@@ -219,6 +326,35 @@ it("distinguishes unsupported containers from malformed recognized images", () =
   const pe = createGoBinaryFixture({ format: "pe" });
   pe.bytes.writeUInt32LE(0xfffffff0, 60);
   expect(() => readGoBinaryImage(pe.bytes)).toThrowError(/range|truncated/i);
+});
+
+it("reports JVM class files as unsupported images instead of fat Mach-O containers", () => {
+  expect(() => readGoBinaryImage(javaClassFile())).toThrowError(
+    /Only ELF, PE, and thin Mach-O native images are supported/,
+  );
+  expect(() => readGoBinaryImage(javaClassFile(4000))).toThrowError(
+    /Only ELF, PE, and thin Mach-O native images are supported/,
+  );
+  expect(() => readGoBinaryImage(javaClassFile(4000, true))).toThrowError(
+    /Only ELF, PE, and thin Mach-O native images are supported/,
+  );
+});
+
+it("keeps the thin-slice failure for confirmed universal Mach-O containers", () => {
+  const slices = [
+    { cpu: CPU.x86_64, bytes: machoImage({ cpu: CPU.x86_64 }) },
+    { cpu: CPU.arm64, bytes: machoImage({ cpu: CPU.arm64 }) },
+  ];
+  for (const universal of [
+    fatImage(slices),
+    fatImage(slices, true),
+    fatImage(slices, false, true),
+    fatImage(slices, true, true),
+  ]) {
+    expect(() => readGoBinaryImage(Buffer.from(universal))).toThrowError(
+      /fat Mach-O containers require selecting a thin slice/,
+    );
+  }
 });
 
 it("rejects ELF header tables overlapping the native header", () => {
@@ -482,6 +618,26 @@ it("rejects build-info declared inside an unmapped Mach-O segment", () => {
   fixture.bytes.writeBigUInt64LE(0n, section + 40);
   fixture.bytes.writeUInt32LE(3072, section + 48);
   expect(() => readGoBinaryImage(fixture.bytes)).toThrowError(/unmapped/i);
+});
+
+it("does not mark Mach-O section bytes outside their owning segment as read-only", () => {
+  const fixture = createGoBinaryFixture({ format: "macho" });
+  const command = 32;
+  const section = command + 72;
+  fixture.bytes.write("__TEXT", command + 8, "ascii");
+  fixture.bytes.writeBigUInt64LE(1024n, command + 48);
+  fixture.bytes.writeUInt32LE(1, command + 56);
+  fixture.bytes.writeUInt32LE(1, command + 60);
+  fixture.bytes.write("__debug_info", section, "ascii");
+  fixture.bytes.write("__TEXT", section + 16, "ascii");
+  fixture.bytes.writeBigUInt64LE(0x10c00n, section + 32);
+  fixture.bytes.writeBigUInt64LE(128n, section + 40);
+  fixture.bytes.writeUInt32LE(3072, section + 48);
+  const image = readGoMachoImage(fixture.bytes);
+  expect(image.sections[0]).toMatchObject({
+    file_backed: false,
+    read_only: false,
+  });
 });
 
 it.each(["elf", "pe", "macho"] as const)(

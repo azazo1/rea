@@ -1,9 +1,12 @@
 import {
   AnalysisAccessDeniedError,
   AnalysisArtifactChangedError,
+  AnalysisCapabilityUnavailableError,
   AnalysisInputError,
+  AnalysisOutputError,
   AnalysisUnsupportedTargetError,
   AnalysisResourceConstraintError,
+  AnalysisTimeoutError,
 } from "./analysisErrorCore.js";
 import { ArtifactOperationError } from "./artifactOperationError.js";
 import {
@@ -25,14 +28,33 @@ import {
   HopperTimeoutError,
 } from "./hopperErrors.js";
 import { ProviderSelectionError } from "./providerSelectionError.js";
+import { ProviderAdapterError } from "./providerAdapterError.js";
 import { UnknownRegistryError } from "./unknownRegistryError.js";
 import { providerRetryAction } from "./providerOperationHealth.js";
-import type { AnalysisError, AnalysisErrorTag } from "./analysisErrorBase.js";
+import {
+  resolvedAnalysisError,
+  type AnalysisError,
+  type AnalysisErrorTag,
+} from "./analysisErrorBase.js";
 import type { AnalysisErrorProjection } from "./analysisErrorProjection.js";
 
 export const analysisErrorRemediationAction = (
   error: AnalysisError,
 ): string => {
+  error = resolvedAnalysisError(error);
+  if (
+    (error instanceof ProviderAdapterError ||
+      error instanceof AnalysisCapabilityUnavailableError) &&
+    error.remediationAction !== undefined
+  )
+    return error.remediationAction;
+  if (
+    error instanceof BrowserObservationError &&
+    error.reason === "service_worker_blocked"
+  )
+    return "Set environment.service_workers to allow to permit this capture, or remove the service worker registration through the browser. REA never removes existing registrations.";
+  if (error instanceof AnalysisCapabilityUnavailableError && error.retryable)
+    return "Review details.reason, then retry the same analysis after the condition clears.";
   if (error instanceof EvidenceFileError && error.published !== undefined)
     return "Use the published file at details.published_path and resolve the reported staging cleanup failure.";
   if (error instanceof AnalysisSnapshotMismatchError)
@@ -55,9 +77,14 @@ export const analysisErrorRemediationAction = (
               ? "Review the reported worker file-size limits and write failure. Retry with a sufficient file-size allowance for the evidence reply; REA retains tighter inherited limits."
               : "Review the reported worker memory limits and available host memory. Retry with sufficient memory or a smaller artifact; REA retains tighter inherited limits.")
     );
+  if (
+    error instanceof AnalysisTimeoutError &&
+    error.remediationAction !== undefined
+  )
+    return error.remediationAction;
   if (error instanceof HopperTimeoutError)
     return error.operation === undefined
-      ? "Inspect Hopper for a loader or license dialog and review details.launcher. Correct the loader configuration or complete Hopper setup, then open the target again."
+      ? "Review details.launcher and inspect Hopper for ongoing initial analysis or a pending loader, demo, or license dialog. For a large target, increase REA_HOPPER_STARTUP_TIMEOUT_MS in the environment that starts REA and allow at least that long in the MCP client. Resolve retained cleanup before reopening."
       : error.providerState === "busy"
         ? "Check binary_session.analysis_activity, wait for the active Hopper request to finish, then retry."
         : "Check binary_session for Hopper health, then retry the operation.";
@@ -104,6 +131,11 @@ export const analysisErrorRemediationAction = (
     return `Correct ${[...new Set(error.settings.map(({ setting }) => setting))].join(", ")} in the environment that starts REA (your shell or the MCP client's registration), then rerun.`;
   if (error instanceof AnalysisInputError)
     return "Correct the listed arguments and retry.";
+  if (
+    error instanceof AnalysisOutputError &&
+    error.remediationAction !== undefined
+  )
+    return error.remediationAction;
   if (error instanceof UnknownRegistryError && error.reason === "not-found")
     return "Check that the unknown_id belongs to this session, then retry.";
   return analysisErrorUserMessage(error);
@@ -112,6 +144,9 @@ export const analysisErrorRemediationAction = (
 export const analysisErrorCategory = (
   error: AnalysisError,
 ): AnalysisErrorProjection["category"] => {
+  error = resolvedAnalysisError(error);
+  if (error instanceof AnalysisCapabilityUnavailableError && error.retryable)
+    return "unavailable";
   if (
     error instanceof BinaryTargetError &&
     error.constraint === "load_selection_rejected"
@@ -166,6 +201,7 @@ const browserErrorCategory = (
   if (
     reason === "target_not_found" ||
     reason === "target_not_allowed" ||
+    reason === "service_worker_blocked" ||
     reason === "target_changed" ||
     reason === "endpoint_unreachable" ||
     reason === "disconnected"
@@ -205,6 +241,7 @@ const STATIC_ERROR_CATEGORIES: Readonly<
 };
 
 export const analysisErrorUserMessage = (error: AnalysisError): string => {
+  error = resolvedAnalysisError(error);
   if (error instanceof AnalysisSnapshotMismatchError) return error.message;
   if (error instanceof AnalysisUnsupportedTargetError) return error.message;
   if (error instanceof AnalysisResourceConstraintError) return error.reason;
@@ -220,6 +257,8 @@ export const analysisErrorUserMessage = (error: AnalysisError): string => {
   const hopperMessage = hopperErrorUserMessage(error);
   if (hopperMessage !== undefined) return hopperMessage;
   if (error.userMessage !== undefined) return error.userMessage;
+  if (error instanceof AnalysisCapabilityUnavailableError && error.retryable)
+    return "Required runtime controls are unavailable for this attempt.";
   const standardMessage = standardErrorMessage(error._tag);
   if (standardMessage !== undefined) return standardMessage;
   if (error instanceof ArtifactOperationError) return artifactMessage(error);
@@ -268,7 +307,7 @@ export const analysisErrorUserMessage = (error: AnalysisError): string => {
 const hopperErrorUserMessage = (error: AnalysisError): string | undefined => {
   if (error instanceof HopperTimeoutError) {
     if (error.operation === undefined)
-      return "REA timed out waiting for Hopper bridge readiness. Hopper may be waiting for a loader or license dialog; inspect its window and the captured launcher outcome before retrying.";
+      return "REA timed out waiting for Hopper bridge readiness, which includes initial analysis. Hopper may still be analyzing the target or waiting for a loader, demo, or license dialog. Review the captured launcher outcome and resolve retained cleanup before retrying.";
     const request = error.operation;
     return error.providerState === "busy"
       ? `Hopper timed out during ${request} while the provider remained busy. Check binary_session.analysis_activity, wait for the active request to finish, then retry.`
@@ -287,12 +326,14 @@ const hopperErrorUserMessage = (error: AnalysisError): string | undefined => {
 
 const RESTART_OWNED_PROVIDER =
   "Restart the owned provider by calling close_binary, then open the target again and retry.";
+const RESTART_UNREACHABLE_HOPPER = `${RESTART_OWNED_PROVIDER} If Hopper may have exited, call export_evidence_bundle before close_binary; closing clears retained records.`;
 
 const hopperProcessRemediation = (error: HopperProcessError): string => {
   if (error.failureCode !== undefined && error.userMessage !== undefined)
     return error.userMessage;
   if (error.stage === "launch")
     return "Review the captured launcher diagnostics and Hopper setup, then retry opening the target.";
+  if (error.providerState === "unreachable") return RESTART_UNREACHABLE_HOPPER;
   if (providerRetryAction(error.providerState) === "restart_provider")
     return RESTART_OWNED_PROVIDER;
   return "Read binary_session.provider_operation_health for this request before retrying or restarting the owned provider.";
@@ -322,7 +363,7 @@ const hopperProcessMessage = (error: HopperProcessError): string => {
     return `Hopper exited during ${where} (${exit}).${startup}${recovery}${request}`;
   }
   if (error.providerState === "unreachable")
-    return `Hopper became unreachable during ${where}; its process exit was not observed. ${RESTART_OWNED_PROVIDER}${startup}${request}`;
+    return `Hopper became unreachable during ${where}; its process exit was not observed. ${RESTART_UNREACHABLE_HOPPER}${startup}${request}`;
   return `Hopper failed during ${where} and REA could not determine whether the provider is busy, exited, or unreachable.${startup} Read binary_session.provider_operation_health for this request before retrying or restarting.${request}`;
 };
 

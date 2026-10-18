@@ -35,10 +35,10 @@ const tableRow = z.object({
 });
 const columnRow = z.object({
   cid: natural,
-  name: z.string(),
-  type: z.string(),
+  name: z.instanceof(Uint8Array),
+  type: z.instanceof(Uint8Array),
   notnull: z.bigint(),
-  dflt_value: z.string().nullable(),
+  dflt_value: z.instanceof(Uint8Array).nullable(),
   pk: natural,
   hidden: z
     .bigint()
@@ -109,6 +109,11 @@ class OutputBudget {
 }
 const quoteIdentifier = (name: string): string =>
   `"${name.replaceAll('"', '""')}"`;
+const missingSelectedTable = (name: string): SqliteInspectionFailure =>
+  new SqliteInspectionFailure(
+    "selection",
+    `Selected ordinary table does not exist with that exact name: ${name}`,
+  );
 // SQLite folds only ASCII letters when matching virtual/shadow table names.
 const sqliteIdentifierKey = (name: string): string =>
   name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
@@ -181,27 +186,46 @@ const cell = (
 const readColumns = (
   db: DatabaseSync,
   name: string,
-  budget: OutputBudget,
+  context: {
+    readonly budget: OutputBudget;
+    readonly encoding: DatabaseEncoding;
+    readonly selectedColumns?: readonly string[] | undefined;
+  },
 ): SqliteDatabase["schema"]["tables"][number]["columns"] => {
+  const { budget, encoding, selectedColumns } = context;
   const columns: SqliteDatabase["schema"]["tables"][number]["columns"] = [];
-  // Direct PRAGMA syntax cannot be shadowed by a stored table or view.
+  // This private read-only connection has an empty temp schema. Qualifying the
+  // built-in there prevents stored main tables/views from shadowing it; the
+  // final argument selects main's metadata. Decode bytes before names become
+  // SQL identifiers. Inventory-only row subsets compare exact encoded names
+  // first, so an unrelated malformed identifier cannot alias a requested one.
+  const selection =
+    selectedColumns === undefined
+      ? ""
+      : ` WHERE CAST(name AS BLOB) IN (${selectedColumns.map(() => "CAST(? AS BLOB)").join(", ")})`;
   for (const raw of db
-    .prepare(`PRAGMA main.table_xinfo(${quoteIdentifier(name)})`)
-    .iterate()) {
+    .prepare(
+      `SELECT cid, CAST(name AS BLOB) AS name, CAST(type AS BLOB) AS type, "notnull", CAST(dflt_value AS BLOB) AS dflt_value, pk, hidden FROM temp.pragma_table_xinfo(?, 'main')${selection}`,
+    )
+    .iterate(name, ...(selectedColumns ?? []))) {
     const value = columnRow.parse(raw);
     const column = {
       cid: value.cid,
-      name: value.name,
-      declared_type: value.type,
+      name: decodeSchemaText(value.name, encoding, "column name"),
+      declared_type: decodeSchemaText(value.type, encoding, "column type"),
       not_null: value.notnull !== 0n,
-      default_sql: value.dflt_value,
+      default_sql:
+        value.dflt_value === null
+          ? null
+          : decodeSchemaText(value.dflt_value, encoding, "column default"),
       primary_key_position: value.pk,
       hidden: value.hidden,
     };
     budget.retain(column);
     columns.push(column);
   }
-  return columns;
+  // Sort only retained facts, without copying untrusted text into native sorter records.
+  return columns.sort((left, right) => left.cid - right.cid);
 };
 
 const readSchema = (
@@ -236,12 +260,49 @@ const readSchema = (
       metadata.set(value.name, value);
     }
   }
+  // A trigger stores its target as written in CREATE TRIGGER, which SQLite
+  // resolves by ASCII case folding; report the stored table or view name.
+  // A selected-table scan returns only the selected table's dependents, and
+  // other scopes fold stored names once, only when a spelling differs.
+  let foldedNames: Map<string, string> | undefined;
+  const triggerTable = (written: string): string => {
+    if (selectedName !== undefined) return selectedName;
+    if (metadata.has(written)) return written;
+    foldedNames ??= new Map(
+      [...metadata.keys()].map((name) => [sqliteIdentifierKey(name), name]),
+    );
+    return foldedNames.get(sqliteIdentifierKey(written)) ?? written;
+  };
   const unresolvedVirtualTables = [...metadata.values()]
     .filter((value) => value.type === "virtual" && value.ncol === 0)
     .map((value) => ({
       name: value.name,
       prefix: sqliteIdentifierKey(`${value.name}_`),
     }));
+  const shadowParentOf = (
+    name: string,
+    listed: z.output<typeof tableRow>,
+  ): (typeof unresolvedVirtualTables)[number] | undefined => {
+    if (listed.type !== "table") return undefined;
+    const identifier = sqliteIdentifierKey(name);
+    return unresolvedVirtualTables.find((parent) =>
+      identifier.startsWith(parent.prefix),
+    );
+  };
+  const selected =
+    selectedName === undefined ? undefined : metadata.get(selectedName);
+  if (selectedName !== undefined && selected === undefined)
+    throw missingSelectedTable(selectedName);
+  const selectedShadowParent =
+    selectedName === undefined || selected === undefined
+      ? undefined
+      : shadowParentOf(selectedName, selected);
+  // NOCASE folds only ASCII letters, as SQLite does when it resolves the
+  // table named by an index or trigger. Fold only for an ordinary table whose
+  // rows can be selected; a selection refused later keeps the exact filter,
+  // so its failure does not depend on declarations under another spelling.
+  const foldDependents =
+    selected?.type === "table" && selectedShadowParent === undefined;
   const schema: SqliteDatabase["schema"] = {
     scope,
     completeness: "complete",
@@ -254,7 +315,9 @@ const readSchema = (
   // duplicate large names or definitions beyond SQLite's native record limit.
   const declaration = scope === "inventory" ? "" : ", CAST(sql AS BLOB) AS sql";
   const selection =
-    scope === "selected_table" ? " WHERE tbl_name = ? COLLATE BINARY" : "";
+    scope === "selected_table"
+      ? ` WHERE tbl_name = ? COLLATE ${foldDependents ? "NOCASE" : "BINARY"}`
+      : "";
   const statement = db.prepare(
     `SELECT type, CAST(name AS BLOB) AS name, CAST(tbl_name AS BLOB) AS tbl_name, rootpage${declaration} FROM main.sqlite_schema${selection}`,
   );
@@ -280,13 +343,10 @@ const readSchema = (
           "format",
           `SQLite schema/table inventory mismatch: ${value.name}`,
         );
-      const identifier = sqliteIdentifierKey(value.name);
       const possibleShadowParent =
-        listed.type === "table"
-          ? unresolvedVirtualTables.find((parent) =>
-              identifier.startsWith(parent.prefix),
-            )
-          : undefined;
+        value.name === selectedName
+          ? selectedShadowParent
+          : shadowParentOf(value.name, listed);
       const table: SqliteDatabase["schema"]["tables"][number] = {
         name: value.name,
         ...(scope === "inventory" ? {} : { sql: value.sql }),
@@ -314,11 +374,11 @@ const readSchema = (
         listed.type !== "virtual" &&
         (scope !== "inventory" || input.table === value.name)
       ) {
-        const columns = readColumns(
-          db,
-          value.name,
-          scope === "inventory" ? new OutputBudget() : budget,
-        );
+        const columns = readColumns(db, value.name, {
+          budget: scope === "inventory" ? new OutputBudget() : budget,
+          encoding,
+          selectedColumns: scope === "inventory" ? input.columns : undefined,
+        });
         if (input.table === value.name)
           selectedTable = { name: table.name, kind: table.kind, columns };
         if (scope !== "inventory") table.columns = columns;
@@ -349,7 +409,7 @@ const readSchema = (
     } else {
       const trigger = {
         name: value.name,
-        table: value.tbl_name,
+        table: triggerTable(value.tbl_name),
         ...(scope === "inventory" ? {} : { sql: value.sql }),
       };
       budget.retain(trigger);
@@ -370,11 +430,7 @@ const readRows = (
 ): SqliteDatabase["rows"] => {
   const { encoding, budget } = context;
   if (input.table === undefined) return null;
-  if (table === undefined)
-    throw new SqliteInspectionFailure(
-      "selection",
-      `Selected ordinary table does not exist with that exact name: ${input.table}`,
-    );
+  if (table === undefined) throw missingSelectedTable(input.table);
   if (table.kind === "unknown")
     throw new SqliteInspectionFailure(
       "selection",
@@ -394,7 +450,7 @@ const readRows = (
   for (const name of columns)
     if (!available.has(name))
       throw new SqliteInspectionFailure(
-        "selection",
+        "column-selection",
         `Selected column does not exist with that exact name in table ${input.table}: ${name}`,
       );
   const projection = columns

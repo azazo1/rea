@@ -1,3 +1,4 @@
+import { closeOwnedWebResources } from "./closeOwnedWebResources.js";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
@@ -33,6 +34,7 @@ import type {
   WebSourceLocationArtifactPort,
   WebSourceMapPort,
 } from "./WebSourceLocationPorts.js";
+import { completeProviderEvidence } from "./ProviderOperationExecution.js";
 
 const OPERATION = "trace_web_source_location";
 const artifactsSchema = selectedWebScriptArtifactsSchema.extend({
@@ -71,7 +73,13 @@ export class WebSourceLocationService {
   ) {}
 
   close(): Promise<void> {
-    return this.decoder.close?.() ?? Promise.resolve();
+    return closeOwnedWebResources(
+      [
+        this.artifacts.close?.bind(this.artifacts),
+        this.decoder.close?.bind(this.decoder),
+      ],
+      "Web source-location cleanup failed",
+    );
   }
 
   /** Shared CLI/MCP workflow preserves raw declarations and every equal-position match. */
@@ -119,8 +127,6 @@ export class WebSourceLocationService {
     if (!traced.ok) return traced;
     const report = verifyReport(input, map.file.sha256, traced.value);
     if (!report.ok) return report;
-    if (options?.signal?.aborted)
-      return err(new AnalysisCancelledError(OPERATION));
     const limitations = [
       ...LIMITATIONS,
       codecBudgetLimitation(report.value.runtime),
@@ -140,7 +146,7 @@ export class WebSourceLocationService {
       limitations,
     });
     if (!normalized.success) return invalidOutput(normalized.error.message);
-    return ok(
+    return completeProviderEvidence(
       createEvidence(
         {
           path: data.sourceFile.path,
@@ -171,9 +177,11 @@ export class WebSourceLocationService {
               : [data.manifest.source_evidence_id],
         },
       ),
+      options?.signal,
     );
   }
 }
+
 const invalidOutput = (message: string): Result<never, AnalysisError> =>
   err(new AnalysisOutputError(OPERATION, message));
 const invalid = (

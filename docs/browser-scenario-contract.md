@@ -15,11 +15,17 @@ there is no separate origin allowlist or request-interception layer. Environment
 settings (including service workers blocked by default), empty storage, and a
 final sanitized URL capture are supplied by default. Set
 `environment.service_workers` to `allow` when the application requires them.
+For attached browsers, `block` rejects captures when the selected page or its
+frames are controlled by a service worker or already have a registration,
+including after navigation. Existing caller registrations are never removed.
+Navigation can run destination code before a newly discovered worker is rejected;
+that rejection does not roll back browser effects. REA removes its owned
+future-document scripts, restores live frame methods, then disconnects.
 Add secret declarations, storage seeds, and additional artifact or event
 capture only when needed. Action, secret, and storage counts are not capped.
-Duration, action, and navigation
-timeouts remain fixed provider-owned liveness limits; the request does not
-accept a caller-controlled `limits` object.
+Duration, action, and navigation timeouts remain fixed provider-owned liveness
+limits. `capture.limits` controls retained event and network-content budgets;
+it does not change those liveness deadlines.
 
 ## Minimal launch example
 
@@ -138,6 +144,36 @@ distinction: it closes and deletes provider-owned profiles, but only disconnects
 from an external CDP browser. Real-browser verification checks both outcomes and
 confirms that an attached external browser remains alive.
 
+That cleanup requires REA to remain running. Abrupt termination, including
+Windows process-tree termination or POSIX `SIGKILL`, can leave the launch
+profile and Playwright artifacts behind. A profile can retain cookies, history,
+cache and origin storage. Later REA runs currently do not reclaim these paths.
+Playwright 1.58.2 can also leave an artifacts directory when launch preparation
+fails before a browser process exists, such as for a missing executable.
+POSIX wrappers can request awaited cancellation with `SIGINT` or `SIGTERM`;
+Windows process termination is not an equivalent graceful-cancellation channel.
+Do not identify owned artifacts by directory prefix or creation time alone.
+See [#4659](https://github.com/morluto/rea/issues/4659) for the remaining recovery
+and wrapper-cancellation work.
+
+Keeping that browser alive does not guarantee its emulation state survives.
+Chromium can clear caller-owned `navigator.platform` emulation when a page CDP
+session disconnects, including sessions that sent no emulation commands. REA
+cannot snapshot the other client's complete user-agent/client-hint settings and
+does not replay a partial reconstruction. Use launch mode to keep this effect
+inside a provider-owned browser, or have the external owning client reapply its
+complete configuration after capture. Connected captures report this limitation;
+see [issue #4089](https://github.com/morluto/rea/issues/4089).
+
+`environment.locale` sets Intl formatting in both modes. Launch also sets
+`navigator.language`, `navigator.languages`, and the request `Accept-Language`.
+Connect preserves the caller's page and request languages; every attached
+capture identifies this locale limitation, including retained partial
+observations. Use launch mode when the application must select the requested
+language through navigator values or request headers. Artifact completeness
+covers the selected observations, not equivalence of launch and connect
+language environments.
+
 HTTP(S) URLs may include ordinary query values and fragments directly. Use
 ordered structured query entries when a value needs to reference a declared
 environment-backed secret. Form, storage, and cookie values are either literal
@@ -173,12 +209,44 @@ declared action. Each step reports action status, elapsed time, sanitized URLs,
 event bounds, and independently typed capture states for screenshot, DOM,
 accessibility, URL, history, and storage. Console, page-error, network,
 WebSocket, frame, worker, popup, and cancelled-download events are attributed to
-steps and all observed events and requested artifacts are returned inline.
-There are no event, frame, worker, popup, WebSocket, DOM-node,
-accessibility-node, storage-entry, screenshot-count, or cumulative
-metadata-byte caps. Requested artifacts and observed events are returned
-inline without application-defined size ceilings. Other missing sections
-remain explicit and make the capture ineligible for equality claims.
+steps. Retained events and requested artifacts are returned inline; omitted
+events are counted by kind and identify affected network transactions.
+Event and selected network-content retention have caller-selected limits under
+`capture.limits`. Omitted values use the defaults below; every supplied value
+must be a positive safe integer, and callers can raise or lower a default.
+Byte limits are conservative allocation-cost estimates for retained event
+values, including UTF-16 storage and JSON expansion, rather than serialized
+bytes or a promise about exact process memory. `events.omissions.by_kind`
+reports counts and reasons for omitted event kinds. Its
+`network_transactions` rows identify affected transaction IDs and omitted
+event kinds; `network_transaction_range` identifies the contiguous IDs beyond
+the transaction limit. Omission metadata is bounded by the selected
+transaction limit. Other missing sections remain explicit and make the capture
+ineligible for equality claims.
+
+The default limits are 10,000 events, 4 MiB estimated allocation for one
+event, 16 MiB estimated allocation across retained events, 1,024 network
+transactions, 64 KiB of body bytes per transaction phase, 1 MiB estimated
+allocation for body redaction/base64, 1 MiB for retained header values, and
+1 MiB for network metadata. The same limits are included in the capture
+Evidence. Playwright materializes response bodies before REA can inspect their
+byte length; `max_network_body_bytes` bounds subsequent retained copies and
+does not bound the browser API read itself. A body that exceeds its selected
+limit has an explicit `body-size-limit` or `body-allocation-limit` unavailable
+state with the observed and allowed values.
+
+Additional implementation bounds are 16 simultaneous network-content reads,
+a 5-second deadline for each provider API read, and 2,048 live event-listener
+owners. These are not caller-selectable. The concurrency bound queues admitted
+content jobs and does not itself omit observations; a provider read timeout
+produces a typed unavailable state, while exceeding listener capacity produces
+event-kind omission counts. A preflight avoids body redaction and base64 copies
+when the currently available event budget already rejects the body.
+Concurrent reads may each pass that check before their events are retained;
+their retained-copy work is bounded by 16 times the selected per-body
+allocation limit. The Playwright response Buffer itself is materialized before
+REA can apply that limit. Requested artifacts and retained events are returned
+inline within the declared limits.
 Attach-mode captures also declare the unavoidable pre-attach event gap.
 
 Selected event families are observed on the root page and discovered descendant
@@ -249,8 +317,12 @@ Each observed request object receives a capture-scoped `transaction_id`.
 Requests sharing a URL remain distinct. Redirects link to the preceding
 transaction only when it was observed; a null predecessor does not establish
 that no earlier hop existed. Request events require both transaction fields;
-an absent ID is malformed capture data, while a null redirect predecessor is
-an explicit unknown.
+an absent ID is malformed capture data. `redirected_from_transaction_state`
+records `root` when Playwright observed no predecessor and `unknown` when a
+predecessor exists but was outside the capture. A linked predecessor is carried
+by `redirected_from_transaction_id` with no state field. Older captures without
+the state field retain the conservative meaning that a null predecessor is
+unknown.
 
 `scenario.network_content` records the resolved content selection. Comparing
 captures with different selections reports network evidence as unknown with a
@@ -278,14 +350,21 @@ retained representation after redaction.
 
 Only completed responses are read. At the end of the final step, observation
 stops; requests still in flight emit `request-unfinished`, and their observed
-responses have explicitly unavailable bodies. This cutoff does not wait for
-long-lived streaming connections. Already-started content reads settle before
-browser cleanup, with a provider-owned five-second timeout per read and
-cancellation support. Failed or unexposed reads retain per-content states and make selected
-event coverage incomplete. Body events can arrive during later steps or final
-drain; event bounds describe receipt during the step, while the source event
-reference establishes the transaction phase. Comparison attributes content to
-its source event's step and excludes the sequence reference from normalization.
+responses have explicitly unavailable bodies. Already-admitted content reads
+drain before browser cleanup. At most 16 reads run at once; queued work is
+bounded by the selected network-transaction limit and by successful admission
+of its request or response event. Each provider API read has its own five-second
+timeout once it starts, so queue wait adds to total drain and cleanup time; this
+is not a five-second total capture cutoff. Cancellation interrupts active reads
+and queued jobs produce cancelled states without calling their provider APIs.
+This drain does not wait for long-lived unfinished streaming connections and
+does not refetch unfinished response bodies. Failed or unexposed reads retain
+per-content states and make selected event coverage incomplete. Body events can
+arrive during later steps or final drain; event bounds describe receipt during
+the step, while the source event reference establishes the transaction phase.
+Comparison attributes content, like every other event of its transaction, to
+the step that sent the request (the receipt step when that request was not
+observed) and excludes the sequence reference from normalization.
 Playwright scenario capture does not supply initiator stacks; passive CDP
 observation retains its own initiator evidence.
 
@@ -300,7 +379,22 @@ an unchanged claim; observed differences may still prove a changed result.
 The comparison records its full normalization commitment and SHA-256 digest.
 Built-in rules exclude step elapsed time and event sequence/index fields,
 compare screenshots by content digest, and compare DOM/accessibility captures
-by normalized text. Optional caller rules are bounded exact-literal
+by normalized text. Network events are grouped by transaction without their
+capture-local transaction IDs, attributed to the step that sent the request,
+and compared as an unordered collection after caller rules apply, because
+concurrent responses arrive in any order and can land in a later step; a
+redirect retains the complete predecessor ancestry, including each hop's own
+request, response outcome, and selected network content. Each transaction's
+capture-local IDs, sequence/index fields, and content source-sequence anchor
+are removed. Caller rules normalize retained strings before hashing. The
+`preserve_redirect_transaction_ancestry` built-in rule fingerprints each hop
+as canonical SHA-256 of `{ events, redirected_from }`: `events` is the sorted
+list of its normalized event SHA-256 digests, and `redirected_from` is its
+predecessor fingerprint or null for a root. Selected transaction fingerprints
+are sorted for the step's network comparison. Temporary numeric graph indices
+are lookup references only and do not enter the final digest. Missing or cyclic
+predecessor evidence yields unknown comparability instead of an unchanged claim.
+Other events keep receipt order. Optional caller rules are bounded exact-literal
 replacements over named artifact kinds. Rules and artifact-kind lists are
 sorted canonically before application, making the same policy reproducible
 regardless of input order. Rules operate only on already-redacted durable
@@ -318,3 +412,7 @@ selection. Captures with different selections report event evidence as unknown
 with a recovery instruction, even when no selected family emitted an event.
 Captures written before this field existed omit it, so their event evidence is
 also unknown.
+
+Network normalization also commits the removal of capture-local transaction IDs,
+attribution to the requesting step, and unordered transaction comparison. These
+built-in rule identities participate in the normalization digest.

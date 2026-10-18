@@ -48,10 +48,10 @@ const pinvokeVerificationContextShape = {
 };
 
 const observedCandidatesSchema = z
-  .tuple([nativeSymbolSchema])
-  .rest(nativeSymbolSchema);
+  .tuple([nativeSymbolSchema], nativeSymbolSchema)
+  .check(z.minLength(1));
 
-export const pinvokeVerificationSchema = z.discriminatedUnion("status", [
+export const pinvokeVerificationSchema = z.union([
   z.strictObject({
     ...pinvokeVerificationContextShape,
     status: z.literal("verified"),
@@ -78,6 +78,14 @@ export const pinvokeVerificationSchema = z.discriminatedUnion("status", [
   }),
   z.strictObject({
     ...pinvokeVerificationContextShape,
+    status: z.literal("unresolved"),
+    basis: z.literal("module-identity-unknown"),
+    confidence: z.literal("unknown"),
+    matched_native: nativeSymbolSchema,
+    candidates: observedCandidatesSchema,
+  }),
+  z.strictObject({
+    ...pinvokeVerificationContextShape,
     status: z.literal("contradicted"),
     basis: z.literal("module-mismatch"),
     confidence: z.literal("unknown"),
@@ -92,7 +100,10 @@ export type PinvokeVerification = z.infer<typeof pinvokeVerificationSchema>;
 export const managedNativeVerificationInputSchema = z
   .strictObject({
     managed_boundaries: evidenceSchema,
-    native_observations: z.array(evidenceSchema).min(1),
+    native_observations: z
+      .array(evidenceSchema)
+      .min(1)
+      .describe("Native function or export Evidence records"),
   })
   .superRefine((input, context) => {
     const ids = new Set<string>();

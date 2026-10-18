@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { workspaceCliTest } from "../../support/cli/workspaceCliFixture.js";
 
 import {
+  normalizeCliArguments,
   renderCliOutputArgumentError,
   renderEmptyFilteredCliOutput,
   validateCliOutputArguments,
@@ -58,13 +59,174 @@ describe("CLI output argument boundary", () => {
   });
 });
 
+describe("CLI output flag value forms", () => {
+  it.each(["--filter-output", "--format", "--token-limit", "--token-offset"])(
+    "preserves a flag-shaped spaced value owned by %s",
+    (flag) => {
+      expect(
+        normalizeCliArguments([flag, "--format=json", "providers", "--json"]),
+      ).toEqual([flag, "--format=json", "providers", "--json"]);
+    },
+  );
+
+  workspaceCliTest(
+    "keeps a flag-shaped filter value equivalent in spaced and equals forms",
+    async ({ cli }) => {
+      for (const filter of [
+        ["--filter-output", "--format=json"],
+        ["--filter-output=--format=json"],
+      ]) {
+        const result = await cli.run({
+          arguments: [...filter, "providers", "--json"],
+          timeoutMs: 10_000,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout)).toEqual({});
+        expect(result.stderr).toBe("");
+      }
+    },
+    CLI_INTEGRATION_TIMEOUT_MS,
+  );
+
+  it("splits only the equals forms of valued output flags", () => {
+    expect(
+      normalizeCliArguments([
+        "inspect-sqlite-database",
+        "--table=a=b",
+        "--format=json",
+        "--filter-output=a.b,c[0,1]",
+        "--token-limit=5",
+        "--token-offset=",
+        "--json",
+        "--format-hint=x",
+      ]),
+    ).toEqual([
+      "inspect-sqlite-database",
+      "--table=a=b",
+      "--format",
+      "json",
+      "--filter-output",
+      "a.b,c[0,1]",
+      "--token-limit",
+      "5",
+      "--token-offset",
+      "",
+      "--json",
+      "--format-hint=x",
+    ]);
+  });
+
+  it("reports a missing value only for a flag the parser did not consume", () => {
+    expect(
+      validateCliOutputArguments([
+        "capabilities",
+        "--json",
+        "--filter-output",
+        "--format",
+      ]),
+    ).toEqual({ ok: true });
+    expect(
+      validateCliOutputArguments(["capabilities", "--json", "--format"]),
+    ).toMatchObject({ ok: false, code: "MISSING_OUTPUT_VALUE" });
+  });
+});
+
+describe("unclosed CLI output filter slices", () => {
+  it.each([
+    "providers[",
+    "providers[0,1].name[",
+    "name,providers[",
+    "][,]",
+    "providers],name[0,1]",
+  ])("rejects %s before the filter parser runs", (filter) => {
+    expect(
+      validateCliOutputArguments([
+        "providers",
+        "--json",
+        "--filter-output",
+        filter,
+      ]),
+    ).toMatchObject({ ok: false, code: "INVALID_OUTPUT_FILTER" });
+  });
+
+  it("preserves effective-filter and earlier flag-error precedence", () => {
+    for (const arguments_ of [
+      [
+        "--filter-output",
+        "providers[",
+        "--filter-output",
+        "capabilities[0,1].provider.id,open",
+      ],
+      ["--filter-output", "capabilities[-1,].provider.id"],
+      ["--filter-output", "capabilities[[0,1]"],
+      ["--format", "invalid", "--filter-output", "providers["],
+      ["--token-limit", "invalid", "--filter-output", "providers["],
+    ])
+      expect(validateCliOutputArguments(arguments_)).toEqual({ ok: true });
+  });
+
+  workspaceCliTest(
+    "fails promptly across output formats without invoking the command",
+    async ({ cli }) => {
+      for (const format of ["json", "jsonl", "yaml", "toon", "md"]) {
+        const result = await cli.run({
+          arguments: [
+            "analyze",
+            "/absent/target",
+            "--format",
+            format,
+            "--filter-output",
+            "result[0,1].name[",
+          ],
+          timeoutMs: 3000,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toContain("INVALID_OUTPUT_FILTER");
+        expect(result.stdout).toContain("closing ]");
+        expect(result.stderr).toBe("");
+      }
+      const splitPath = await cli.run({
+        arguments: ["providers", "--json", "--filter-output", "][,]"],
+        timeoutMs: 3000,
+      });
+      expect(splitPath.exitCode).toBe(1);
+      expect(splitPath.json).toMatchObject({
+        ok: false,
+        error: { code: "INVALID_OUTPUT_FILTER" },
+      });
+    },
+    CLI_INTEGRATION_TIMEOUT_MS,
+  );
+
+  workspaceCliTest(
+    "retains closed slices and multiple filter paths",
+    async ({ cli }) => {
+      const result = await cli.run({
+        arguments: [
+          "providers",
+          "--json",
+          "--filter-output",
+          "capabilities[0,1].provider.id,open",
+        ],
+        timeoutMs: 3000,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.json).toEqual({
+        capabilities: [{ provider: { id: expect.any(String) } }],
+        open: false,
+      });
+    },
+    CLI_INTEGRATION_TIMEOUT_MS,
+  );
+});
+
 describe("CLI output valued-flag parsing", () => {
   workspaceCliTest(
     "preserves complete JSON errors when native builtin flags follow unusual arguments",
     async ({ cli }) => {
       for (const arguments_ of [
         ["providers", "--", "--json", "--token-limit", "5"],
-        ["providers", "--json", "--format=toon", "--token-limit", "5"],
+        ["providers", "--format=json", "--token-limit=5"],
       ]) {
         const result = await cli.run({ arguments: arguments_ });
         expect(result.exitCode).toBe(1);
@@ -94,22 +256,45 @@ describe("CLI output valued-flag parsing", () => {
   );
 
   workspaceCliTest(
-    "does not treat empty or equals-style output values as active builtins",
+    "names missing output values and honors equals-style output values",
     async ({ cli }) => {
-      for (const arguments_ of [
-        ["capabilities", "--json", "--format", ""],
-        ["capabilities", "--json", "--filter-output", ""],
-        ["capabilities", "--json", "--token-limit", ""],
-        ["capabilities", "--json", "--token-limit=5"],
-      ]) {
+      for (const [arguments_, flag] of [
+        [["capabilities", "--json", "--format", ""], "--format"],
+        [["capabilities", "--json", "--filter-output", ""], "--filter-output"],
+        [["capabilities", "--json", "--token-limit", ""], "--token-limit"],
+        [["capabilities", "--json", "--token-offset="], "--token-offset"],
+        [["capabilities", "--format"], "--format"],
+      ] as const) {
         const result = await cli.run({ arguments: arguments_ });
         expect(result.exitCode).toBe(1);
-        expect(result.json).toBeDefined();
         expect(result.stdout).not.toContain("[truncated:");
-        expect(JSON.stringify(result.json)).not.toContain(
-          "UNSUPPORTED_OUTPUT_COMBINATION",
-        );
+        expect(result.json).toMatchObject({
+          ok: false,
+          error: {
+            code: "MISSING_OUTPUT_VALUE",
+            message: expect.stringContaining(`${flag} requires a value`),
+          },
+        });
       }
+      const equalsForms = await cli.run({
+        arguments: [
+          "capabilities",
+          "--format=json",
+          "--filter-output=capabilities[0,1]",
+        ],
+      });
+      expect(equalsForms.exitCode).toBe(0);
+      expect(equalsForms.json).toMatchObject({
+        capabilities: [expect.any(Object)],
+      });
+      const equalsTokenWindow = await cli.run({
+        arguments: ["capabilities", "--json", "--token-limit=5"],
+      });
+      expect(equalsTokenWindow.exitCode).toBe(1);
+      expect(equalsTokenWindow.json).toMatchObject({
+        ok: false,
+        error: { code: "UNSUPPORTED_OUTPUT_COMBINATION" },
+      });
       const validTokenWindow = await cli.run({
         arguments: ["capabilities", "--json", "--token-limit", "5"],
       });
@@ -349,5 +534,62 @@ describe("compiled CLI artifact diagnostics", () => {
       expect(output).toContain('"unpacked":true');
     },
     CLI_INTEGRATION_TIMEOUT_MS,
+  );
+});
+
+describe("CLI update root alias", () => {
+  it.each([
+    [["--update"], ["update"]],
+    [
+      ["--json", "--update", "--filter-output=status"],
+      ["update", "--json", "--filter-output", "status"],
+    ],
+    [
+      ["--format=yaml", "--update", "--full-output"],
+      ["update", "--format", "yaml", "--full-output"],
+    ],
+    [
+      ["--update", "--token-limit=100", "--token-count"],
+      ["update", "--token-limit", "100", "--token-count"],
+    ],
+    [["--update", "--update"], ["update"]],
+    [
+      ["--filter-output", "--update"],
+      ["--filter-output", "--update"],
+    ],
+    [
+      ["--filter-output=--update", "--update"],
+      ["update", "--filter-output", "--update"],
+    ],
+    [
+      ["--update", "--help"],
+      ["--update", "--help"],
+    ],
+    [
+      ["--incur-update-check", "--update"],
+      ["--incur-update-check", "--update"],
+    ],
+    [
+      ["providers", "--update"],
+      ["providers", "--update"],
+    ],
+    [
+      ["--", "--update"],
+      ["--", "--update"],
+    ],
+    [
+      ["--config", "--update"],
+      ["--config", "--update"],
+    ],
+    [
+      ["update", "--json"],
+      ["update", "--json"],
+    ],
+  ])(
+    "routes only an unambiguous root update while retaining option data: %j",
+    (input, expected) => {
+      expect(normalizeCliArguments(input)).toEqual(expected);
+      expect(normalizeCliArguments(expected)).toEqual(expected);
+    },
   );
 });

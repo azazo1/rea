@@ -10,7 +10,10 @@ import type { Logger } from "pino";
 import { createEvidence } from "../domain/evidence.js";
 import type { Evidence } from "../domain/evidence.js";
 import type { NativeToolName } from "../contracts/native/nativeToolContracts.js";
-import type { ArtifactAnalysisOperation } from "../contracts/artifactToolContracts.js";
+import {
+  ARTIFACT_ANALYSIS_OPERATIONS,
+  type ArtifactAnalysisOperation,
+} from "../contracts/artifactToolContracts.js";
 import {
   isManagedToolName,
   type ManagedToolName,
@@ -23,6 +26,7 @@ import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import { access } from "node:fs/promises";
 import { readAnalysisSnapshot } from "./binary/AnalysisSnapshotFiles.js";
+import { requiresNativeSourceAdmissionBeforeReplay } from "./binary/AnalysisSnapshotCache.js";
 import { parseBinaryTarget } from "./BinaryTargetResolver.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
@@ -41,6 +45,7 @@ import {
   workflowAnalysisProfile,
 } from "./InvestigationProviders.js";
 import {
+  executeComposedWorkflow,
   createWorkflowEvidence,
   workflowSnapshotRecord,
   recordWorkflowUnknowns,
@@ -59,6 +64,7 @@ type DirectAnalysisTool =
   | "annotate_native_function"
   | "inspect_native_load_image"
   | "read_bytes"
+  | "search_bytes"
   | "address_to_file_offset"
   | "binary_overview"
   | "procedure_pseudo_code"
@@ -75,6 +81,20 @@ type DirectAnalysisTool =
   | "trace_feature"
   | "trace_native_ui_action"
   | "trace_native_values";
+
+// These one-shot CLI questions require native utilities, not a deep engine.
+// Runtime observation retains the ordinary session and authority checks.
+const NATIVE_INSPECTION_OPERATIONS: ReadonlySet<string> = new Set([
+  "inspect_macho",
+  "inspect_signature",
+  "list_architectures",
+  "inspect_plist",
+  "demangle_swift",
+] satisfies readonly NativeToolName[]);
+
+const ARTIFACT_ANALYSIS_OPERATION_SET: ReadonlySet<string> = new Set(
+  ARTIFACT_ANALYSIS_OPERATIONS,
+);
 
 /**
  * Open one binary, execute one tool, and always release provider resources.
@@ -126,16 +146,28 @@ export const runProviderAnalysis = async (
     logger?: Logger,
     signal?: AbortSignal,
   ]
-): Promise<JsonValue> =>
-  isManagedToolName(tool)
-    ? runManagedProviderAnalysis(dependencies, path, tool, arguments_, signal)
-    : withProcessCancellation(signal, (operationSignal) =>
-        runAnalysis(dependencies, path, tool, arguments_, {
-          logger,
-          snapshotPath: undefined,
-          signal: operationSignal,
-        }),
-      );
+): Promise<JsonValue> => {
+  if (isManagedToolName(tool))
+    return runManagedProviderAnalysis(
+      dependencies,
+      path,
+      tool,
+      arguments_,
+      signal,
+    );
+  return withProcessCancellation(signal, (operationSignal) =>
+    runAnalysis(dependencies, path, tool, arguments_, {
+      logger,
+      snapshotPath: undefined,
+      signal: operationSignal,
+      ...(ARTIFACT_ANALYSIS_OPERATION_SET.has(tool)
+        ? { createSession: dependencies.createArtifactBinarySession }
+        : NATIVE_INSPECTION_OPERATIONS.has(tool)
+          ? { createSession: dependencies.createNativeBinarySession }
+          : {}),
+    }),
+  );
+};
 
 /** Execute managed metadata inspection in an isolated managed-only session. */
 export const runManagedProviderExecution = async (
@@ -202,6 +234,7 @@ const runAnalysis = async (
     readonly logger: Logger;
     readonly snapshotPath: string | undefined;
     readonly signal: AbortSignal;
+    readonly createSession?: () => BinarySession | Promise<BinarySession>;
     readonly providerId?: AnalysisProviderSelector;
     readonly formatHint?: ExecutableFormatHint;
     readonly architecture?: BinaryArchitecture;
@@ -209,9 +242,18 @@ const runAnalysis = async (
   },
 ): Promise<JsonValue> => {
   const { logger, signal, snapshotPath } = options;
-  const config = dependencies.readConfiguration();
-  if (!config.ok) return cliError(config.error);
-  const session = await dependencies.createBinarySession(config.value, logger);
+  let session: BinarySession;
+  if (options.createSession !== undefined) {
+    session = await options.createSession();
+  } else {
+    const config = dependencies.readConfiguration();
+    if (!config.ok) return cliError(config.error);
+    session = await (
+      tool === "inspect_native_dispatch_metadata" && snapshotPath === undefined
+        ? dependencies.createNativeDispatchBinarySession
+        : dependencies.createBinarySession
+    )(config.value, logger);
+  }
   return withSessionCleanup(
     session,
     async () => {
@@ -254,9 +296,14 @@ const runAnalysis = async (
         const route = preview.value.route;
         const bindingProfile = route.profile ?? undefined;
         const evidenceProfile = analysisProfileForRoute(route, tool);
+        // A parsed Windows path does not prove Ghidra's native snapshot owner
+        // admitted the selected source; CLI replay must wait for that client.
         if (
           bindingProfile !== undefined &&
           evidenceProfile !== undefined &&
+          !requiresNativeSourceAdmissionBeforeReplay(
+            route.binding?.identity.id,
+          ) &&
           allowsSnapshotReplay(route, tool)
         ) {
           const cached = snapshotEvidenceForQuery(snapshot, {
@@ -394,18 +441,17 @@ const executeAnalysisTool = async (input: {
     tool === "trace_native_ui_action"
   ) {
     const { EnhancedTools } = await import("./EnhancedTools.js");
-    const result = await new EnhancedTools(session).execute(
-      tool,
-      input.arguments,
-      signal,
+    const result = await executeComposedWorkflow(session, (observed) =>
+      new EnhancedTools(observed).execute(tool, input.arguments, signal),
     );
     if (!result.ok) return { output: cliError(result.error) };
     const evidence = createWorkflowEvidence({
       target: input.openedTarget,
       operation: tool,
       parameters: input.arguments,
-      result: result.value,
+      result: result.value.result,
       upstreamProfile: evidenceProfile,
+      upstreamLimitations: result.value.limitations,
     });
     return { output: evidence, evidence };
   }

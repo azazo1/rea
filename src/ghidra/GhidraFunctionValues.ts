@@ -26,6 +26,11 @@ import {
 } from "../domain/jsonValue.js";
 import { nativeApiBoundarySchema } from "../domain/native/nativeApiBoundary.js";
 import { nativeValueFlowSchema } from "../domain/native/nativeValueFlow.js";
+import type { EvidenceLocation } from "../domain/evidence.js";
+import {
+  relationshipCoverageSchema,
+  type RelationshipCoverage,
+} from "../domain/relationshipCoverage.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import {
@@ -292,11 +297,21 @@ const ghidraFunctionDossier = functionDossierSchema
   })
   .strict()
   .superRefine((value, context) => {
+    if (
+      (value.swift_string_literals === undefined) !==
+      (value.swift_string_literal_omissions === undefined)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Ghidra dossier must record Swift literals and their omissions together",
+      });
     const addresses = [
       value.procedure.address,
       ...value.comments.map(({ address }) => address),
       ...value.callers.map(({ address }) => address),
       ...value.callees.map(({ address }) => address),
+      ...(value.unresolved_calls ?? []).map(({ address }) => address),
       ...value.incoming_references.flatMap(referenceAddresses),
       ...value.outgoing_references.flatMap(referenceAddresses),
       ...value.referenced_strings.flatMap(({ address, source_address }) => [
@@ -307,6 +322,14 @@ const ghidraFunctionDossier = functionDossierSchema
         address,
         source_address,
       ]),
+      ...(value.swift_string_literals ?? []).flatMap(
+        ({ address, source_address }) =>
+          address === null ? [source_address] : [address, source_address],
+      ),
+      ...(value.swift_string_literal_omissions ?? []).flatMap(
+        ({ address, source_address }) =>
+          address === null ? [source_address] : [address, source_address],
+      ),
       ...value.basic_blocks.flatMap(({ start, end, successors }) => [
         start,
         end,
@@ -391,19 +414,32 @@ const functionBoundaryObservationOperations: ReadonlySet<GhidraFunctionOperation
   new Set([
     "analyze_function",
     "procedure_assembly",
+    "procedure_callees",
+    "procedure_callers",
     "procedure_info",
     "procedure_pseudo_code",
+    "procedure_references",
     "read_function_instructions",
   ]);
 
 const functionObservationEnvelope = z.strictObject({
   value: z.unknown(),
   limitations: z.array(z.string()),
+  relationship_coverage: relationshipCoverageSchema.exactOptional(),
+  selection: z
+    .strictObject({
+      file_offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      mapped_address: ghidraCanonicalAddressSchema,
+      procedure_address: ghidraCanonicalAddressSchema,
+    })
+    .exactOptional(),
 });
 
 export interface ParsedGhidraFunctionResult {
   readonly value: JsonValue;
   readonly limitations: readonly string[];
+  readonly locations?: readonly EvidenceLocation[];
+  readonly relationshipCoverage?: RelationshipCoverage;
 }
 
 /** Require exact, bounded Java-bridge function output before creating Evidence. */
@@ -414,15 +450,27 @@ export const parseGhidraFunctionResult = (
   let observation: {
     readonly value: unknown;
     readonly limitations: readonly string[];
+    readonly relationship_coverage?: RelationshipCoverage;
+    readonly selection?: z.infer<
+      typeof functionObservationEnvelope
+    >["selection"];
   };
   if (functionBoundaryObservationOperations.has(operation)) {
     const envelope = functionObservationEnvelope.safeParse(value);
-    if (!envelope.success)
+    if (
+      !envelope.success ||
+      (operation !== "analyze_function" &&
+        operation !== "procedure_callers" &&
+        operation !== "procedure_callees" &&
+        envelope.data.relationship_coverage !== undefined) ||
+      (operation !== "procedure_pseudo_code" &&
+        envelope.data.selection !== undefined)
+    )
       return err(
         new AnalysisOutputError(
           operation,
-          "Ghidra bridge omitted the function observation envelope",
-          { cause: envelope.error },
+          "Ghidra bridge returned an invalid function observation envelope for this operation",
+          envelope.success ? undefined : { cause: envelope.error },
         ),
       );
     observation = envelope.data;
@@ -434,6 +482,27 @@ export const parseGhidraFunctionResult = (
     ? ok({
         value: jsonValueSchema.parse(parsed.data),
         limitations: observation.limitations,
+        ...(observation.relationship_coverage === undefined
+          ? {}
+          : { relationshipCoverage: observation.relationship_coverage }),
+        ...(observation.selection === undefined
+          ? {}
+          : {
+              locations: [
+                {
+                  kind: "file-offset" as const,
+                  offset: observation.selection.file_offset,
+                },
+                {
+                  kind: "address" as const,
+                  address: observation.selection.mapped_address,
+                },
+                {
+                  kind: "address" as const,
+                  address: observation.selection.procedure_address,
+                },
+              ],
+            }),
       })
     : err(
         new AnalysisOutputError(

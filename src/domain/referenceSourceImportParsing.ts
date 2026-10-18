@@ -11,6 +11,7 @@ import {
   parserPluginsForPath,
 } from "./javascript/javascriptSourceParser.js";
 import { unshadowedReferenceSourceRequireCalls } from "./referenceSourceRequireBindings.js";
+import { isRelativeJavaScriptModuleSpecifier } from "./javascript/javascriptModuleSpecifier.js";
 import {
   isCallExpression,
   isExportAllDeclaration,
@@ -46,6 +47,8 @@ interface ReferenceSourceImportRelationship {
   readonly kind: ReferenceSourceImportKind;
   readonly resolution: ReferenceSourceImportResolution;
   readonly parse_state: ReferenceSourceImportParseState;
+  /** Distinguishes call-form CommonJS require from TS import-equals `requires`. */
+  readonly resolutionStrategy?: "runtime-require";
 }
 
 interface ReferenceSourceParseFailure {
@@ -60,7 +63,8 @@ export interface ReferenceSourceImportParseResult {
   readonly limitations: readonly string[];
 }
 
-const codeSourceLanguages = new Set(["JavaScript", "TypeScript", "JSX", "TSX"]);
+export const PARSEABLE_REFERENCE_SOURCE_LANGUAGES: ReadonlySet<string> =
+  new Set(["JavaScript", "TypeScript", "JSX", "TSX"]);
 
 const safeModuleName = (node: Node | null | undefined): string | undefined => {
   if (isStringLiteral(node)) return node.value;
@@ -70,9 +74,11 @@ const safeModuleName = (node: Node | null | undefined): string | undefined => {
 const resolveSpecifier = (
   specifier: string,
 ): ReferenceSourceImportResolution => {
-  if (specifier.startsWith(".") || specifier.startsWith("/")) return "internal";
-  if (specifier.startsWith("node:") || specifier.startsWith("data:"))
-    return "external";
+  if (
+    isRelativeJavaScriptModuleSpecifier(specifier) ||
+    specifier.startsWith("/")
+  )
+    return "internal";
   return "external";
 };
 
@@ -110,6 +116,7 @@ const appendRelationship = (
     readonly kind: ReferenceSourceImportKind;
     readonly parseState: ReferenceSourceImportParseState;
     readonly resolution?: ReferenceSourceImportResolution;
+    readonly resolutionStrategy?: "runtime-require";
   },
 ): void => {
   if (input.to === undefined) return;
@@ -119,6 +126,9 @@ const appendRelationship = (
     kind: input.kind,
     resolution: input.resolution ?? resolveSpecifier(input.to),
     parse_state: input.parseState,
+    ...(input.resolutionStrategy === undefined
+      ? {}
+      : { resolutionStrategy: input.resolutionStrategy }),
   });
 };
 
@@ -249,6 +259,7 @@ const extractRequireAndDynamicImports = (
           to: result.specifier,
           kind: "requires",
           parseState: result.parseState,
+          resolutionStrategy: "runtime-require",
         });
       }
       continue;
@@ -314,7 +325,7 @@ export const parseReferenceSourceImports = (
   bytes: Uint8Array,
   language: string | null,
 ): ReferenceSourceImportParseResult => {
-  if (language !== null && !codeSourceLanguages.has(language))
+  if (language !== null && !PARSEABLE_REFERENCE_SOURCE_LANGUAGES.has(language))
     return { relationships: [], parse_failures: [], limitations: [] };
 
   let source: string;

@@ -1,9 +1,10 @@
+import { boundedViewMessages } from "./analysisViewCoverage.js";
 import { expect, it } from "vitest";
 
-import { resolveJavaScriptSourceMapReference } from "../javascript/javascriptSourceMapPaths.js";
 import { functionDossierSchema } from "../hopperValues.js";
 import { ghidraFunctionDossier } from "../ghidraValues.fixture.js";
 import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "../../contracts/javascript/javascriptRuntimeReconciliationExample.js";
+import { ARTIFACT_COMPARISON_EXAMPLE } from "../../contracts/artifactComparisonExample.js";
 import {
   analysisViewBindJavaScriptGraphs,
   analysisViewJavaScriptAnalysis,
@@ -24,13 +25,15 @@ import {
   completeWithinViewCoverage,
   pageViewCoverage,
 } from "./analysisViewCoverage.js";
+import { sourceMapReference } from "../javascript/javascriptApplicationGraph.fixture.js";
+import { createArtifactInspection } from "../artifactInspection.js";
 import { javascriptModulePath } from "./javascriptApplicationView.js";
-
 import {
   inspectAnalysisViewInputSchema,
   projectAnalysisView,
   type AnalysisViewParent,
 } from "./analysisView.js";
+
 const layoutParent = (): AnalysisViewParent => {
   const evidence = analysisViewLayoutEvidence();
   return {
@@ -161,6 +164,28 @@ it("preserves native API limitations and unavailable residual unknowns", () => {
   );
 });
 
+it("rejects artifact summary views when inspection substep coverage count disagrees", () => {
+  const source = ARTIFACT_COMPARISON_EXAMPLE.left;
+  const inspection = createArtifactInspection(source);
+  const parent: AnalysisViewParent = {
+    evidenceId: `ev_${"a".repeat(64)}`,
+    operation: "inspect_artifact",
+    normalizedResult: {
+      ...inspection,
+      coverage: {
+        ...inspection.coverage,
+        substeps_completed: inspection.substeps.length + 1,
+      },
+    },
+    subject: source.subject,
+    limitations: [],
+  };
+  expect(projectAnalysisView(parent, { kind: "summary" })).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisInputError" },
+  });
+});
+
 it("pages every retained dossier collection and the native API record", () => {
   const original = functionDossierSchema.parse(ghidraFunctionDossier());
   const page = (
@@ -169,7 +194,8 @@ it("pages every retained dossier collection and the native API record", () => {
       | "comments"
       | "unresolved_calls"
       | "referenced_strings"
-      | "referenced_names",
+      | "referenced_names"
+      | "swift_string_literals",
     result: unknown = original,
   ) => {
     const view = projectAnalysisView(nativeParent(result), {
@@ -195,6 +221,23 @@ it("pages every retained dossier collection and the native API record", () => {
     }),
   ).toMatchObject({ item: [{ text: "entry" }] });
   expect(page("referenced_names")).toMatchObject({ coverage: { total: 0 } });
+  const literal = {
+    source_address: "0x401004",
+    value: "SleepDisabled",
+    representation: "small",
+    address: null,
+    registers: ["x0", "x1"],
+    words: ["0x7369447065656c53", "0xed000064656c6261"],
+  };
+  expect(
+    page("swift_string_literals", {
+      ...original,
+      swift_string_literals: [literal],
+    }),
+  ).toMatchObject({ item: [literal], coverage: { total: 1 } });
+  expect(page("swift_string_literals")).toMatchObject({
+    item: { available: false, reason: "not recorded" },
+  });
   const { unresolved_calls: _omitted, ...withoutUnresolved } = original;
   expect(
     page("unresolved_calls", {
@@ -438,6 +481,240 @@ it("projects JavaScript summary and preserves selected module observations", () 
   });
 });
 
+it("projects typed module facts without source bodies and keeps source coverage independent of paging", () => {
+  const analysis = analysisViewJavaScriptAnalysisWithSource();
+  const parent = javascriptParent(analysis);
+  const input = inspectAnalysisViewInputSchema.parse({
+    source: { kind: "retained-evidence", evidence_id: parent.evidenceId },
+    view: {
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: { path: "renderer.js" },
+      limit: 1,
+    },
+  });
+  const projected = projectAnalysisView(parent, input.view);
+  if (!projected.ok) throw projected.error;
+  if (projected.value.kind !== "javascript")
+    throw new Error("expected JavaScript view");
+  const node = analysis.graph.nodes[0];
+  if (!node) throw new Error("missing module");
+  expect(projected.value.rows).toEqual([
+    {
+      node_id: node.node_id,
+      kind: node.kind,
+      path: "renderer.js",
+      identity: node.identity,
+      retained_source_range_count: 0,
+      basis: [
+        { authority: "artifact-bytes", state: "observed", confidence: "exact" },
+      ],
+    },
+  ]);
+  expect(projected.value.coverage).toMatchObject({ total: 1, exhausted: true });
+  expect(projected.value.source_coverage).toMatchObject({
+    application: analysis.graph.coverage,
+    semantic: { status: analysis.semantic_graph.coverage.status },
+  });
+  expect(JSON.stringify(projected.value.rows)).not.toMatch(
+    /secret|should not leak|observations/,
+  );
+  const row = projected.value.rows[0];
+  if (!row) throw new Error("missing reference");
+  const retainedIdentity = structuredClone(node.identity);
+  if (row.identity.strategy !== "content-digest")
+    throw new Error("expected digest identity");
+  row.identity.sha256 = "e".repeat(64);
+  expect(node.identity).toEqual(retainedIdentity);
+  const empty = projectAnalysisView(parent, {
+    ...input.view,
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+    where: { kind: "javascript-module" },
+    offset: 0,
+    limit: 1,
+  });
+  if (!empty.ok) throw empty.error;
+  expect(empty.value).toMatchObject({
+    rows: [],
+    coverage: { total: 0, exhausted: true },
+  });
+});
+
+it("counts retained range observations including repeats and skips unavailable locations", () => {
+  const analysis = analysisViewJavaScriptAnalysis();
+  const original = analysis.graph.nodes[0];
+  const observed = original?.observations[0];
+  if (!original || !observed) throw new Error("missing module observation");
+  const range = {
+    kind: "source-range",
+    source: "renderer.js",
+    start: { line: 1, column: 0 },
+    end: { line: 1, column: 8 },
+  };
+  const node = createJavaScriptApplicationNode({
+    kind: original.kind,
+    identity: original.identity,
+    observations: [
+      ...["first retained observation", "second retained observation"].map(
+        (label) => ({
+          label,
+          properties: {},
+          evidence: {
+            ...observed.evidence,
+            location: { available: true, value: range },
+          },
+        }),
+      ),
+      {
+        label: "unavailable location",
+        properties: {},
+        evidence: {
+          ...observed.evidence,
+          authority: "unknown",
+          state: "unavailable",
+          confidence: "unknown",
+          location: {
+            available: false,
+            reason: "not-observed",
+            detail: "Location was not recorded.",
+          },
+          limitations: ["Location was not recorded."],
+        },
+      },
+    ],
+  });
+  const { graph_id: _graphId, ...application } = analysis.graph;
+  const graph = createJavaScriptApplicationGraph({
+    ...application,
+    nodes: [node],
+    root_node_ids: [node.node_id],
+  });
+  const parent = javascriptParent(
+    analysisViewBindJavaScriptGraphs(analysis, graph),
+  );
+  const references = projectAnalysisView(parent, {
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+    where: {},
+    offset: 0,
+    limit: 1,
+  });
+  const item = projectAnalysisView(parent, {
+    kind: "item",
+    collection: "modules",
+    selector: { node_id: node.node_id },
+  });
+  if (!references.ok) throw references.error;
+  if (!item.ok) throw item.error;
+  expect(references.value).toMatchObject({
+    rows: [{ node_id: node.node_id, retained_source_range_count: 2 }],
+  });
+  expect(item.value).toMatchObject({ item: { source_ranges: [range, range] } });
+});
+
+it("validates typed module selectors without coercing null or empty paths", () => {
+  const source = {
+    kind: "retained-evidence",
+    evidence_id: javascriptParent().evidenceId,
+  };
+  const view = {
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+  };
+  for (const path of [null, "", "renderer.js"])
+    expect(
+      inspectAnalysisViewInputSchema.safeParse({
+        source,
+        view: { ...view, where: { path } },
+      }).success,
+    ).toBe(true);
+  for (const where of [
+    { path: 1 },
+    { kind: "electron-main" },
+    { glob: "*.js" },
+  ])
+    expect(
+      inspectAnalysisViewInputSchema.safeParse({
+        source,
+        view: { ...view, where },
+      }).success,
+    ).toBe(false);
+  expect(
+    projectAnalysisView(layoutParent(), {
+      ...view,
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: {},
+      offset: 0,
+      limit: 1,
+    }).ok,
+  ).toBe(false);
+});
+
+it("keeps mixed observation support distinct instead of promoting a module to observed", () => {
+  const analysis = analysisViewJavaScriptAnalysis();
+  const original = analysis.graph.nodes[0];
+  const observed = original?.observations[0];
+  if (!original || !observed) throw new Error("missing module observation");
+  const inferred = {
+    ...observed.evidence,
+    authority: "static-relationship-inference" as const,
+    state: "inferred" as const,
+    confidence: "low" as const,
+    limitations: ["Static candidate; runtime loading is unknown."],
+  };
+  const node = createJavaScriptApplicationNode({
+    kind: original.kind,
+    identity: original.identity,
+    observations: [
+      {
+        label: observed.label,
+        properties: observed.properties,
+        evidence: observed.evidence,
+      },
+      { label: "candidate one", properties: {}, evidence: inferred },
+      { label: "candidate two", properties: {}, evidence: inferred },
+    ],
+  });
+  const { graph_id: _graphId, ...application } = analysis.graph;
+  const graph = createJavaScriptApplicationGraph({
+    ...application,
+    nodes: [node],
+    root_node_ids: [node.node_id],
+  });
+  const result = projectAnalysisView(
+    javascriptParent(analysisViewBindJavaScriptGraphs(analysis, graph)),
+    {
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: {},
+      offset: 0,
+      limit: 1,
+    },
+  );
+  if (!result.ok) throw result.error;
+  if (result.value.kind !== "javascript")
+    throw new Error("expected references");
+  expect(result.value.rows[0]?.basis).toHaveLength(2);
+  expect(result.value.rows[0]?.basis).toEqual(
+    expect.arrayContaining([
+      { authority: "artifact-bytes", state: "observed", confidence: "exact" },
+      {
+        authority: "static-relationship-inference",
+        state: "inferred",
+        confidence: "low",
+      },
+    ]),
+  );
+});
+
 it("rejects ambiguous JavaScript module paths with candidate node ids", () => {
   const analysis = analysisViewJavaScriptAnalysis();
   const first = analysis.graph.nodes[0];
@@ -492,6 +769,28 @@ it("rejects ambiguous JavaScript module paths with candidate node ids", () => {
       },
     ],
   });
+  const view = {
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+    where: { path: "renderer.js" },
+    offset: 0,
+    limit: 1,
+  } as const;
+  const ids: string[] = [];
+  for (const offset of [0, 1, 2, Number.MAX_SAFE_INTEGER]) {
+    const page = projectAnalysisView(parent, { ...view, offset });
+    if (!page.ok) throw page.error;
+    if (page.value.kind !== "javascript")
+      throw new Error("expected references");
+    ids.push(...page.value.rows.map(({ node_id }) => node_id));
+    expect(page.value.coverage).toMatchObject({
+      total: 2,
+      next_offset: offset === 0 ? 1 : null,
+      exhausted: offset !== 0,
+    });
+  }
+  expect(ids).toEqual(graph.nodes.map(({ node_id }) => node_id));
 });
 
 it("pages actual modules, including unknown and empty paths, without unrelated roles", () => {
@@ -532,7 +831,7 @@ it("pages actual modules, including unknown and empty paths, without unrelated r
         observations: original.observations.map((observation) => ({
           ...(kind === "source-module"
             ? {
-                source_map_reference: resolveJavaScriptSourceMapReference(
+                source_map_reference: sourceMapReference(
                   "",
                   null,
                   "renderer.js",
@@ -601,6 +900,24 @@ it("pages actual modules, including unknown and empty paths, without unrelated r
     collection: "modules",
     selector: { path: "" },
   });
+  for (const [path, kind] of [
+    [null, "javascript-module"],
+    ["", "source-module"],
+  ] as const) {
+    const references = projectAnalysisView(parent, {
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: { path },
+      offset: 0,
+      limit: 1,
+    });
+    if (!references.ok) throw references.error;
+    expect(references.value).toMatchObject({
+      rows: [{ path, kind }],
+      coverage: { total: 1, exhausted: true },
+    });
+  }
   expect(emptyPath.ok).toBe(true);
   const role = nodes.find((node) => node.kind === "electron-renderer");
   if (role === undefined) throw new Error("missing role");
@@ -699,6 +1016,181 @@ it("retains semantic coverage and limitations in a summary", () => {
   });
 });
 
+it.each([63, 64, 65, 10_000])(
+  "bounds and deduplicates %i messages in JavaScript and layout views",
+  (count) => {
+    const messages = Array.from(
+      { length: count },
+      (_, index) => `Module ${String(index).padStart(5, "0")} was not parsed.`,
+    );
+    const analysis = analysisViewJavaScriptAnalysis();
+    const { graph_id: _graphId, ...semantic } = analysis.semantic_graph;
+    const parent = javascriptParent({
+      ...analysis,
+      limitations: messages,
+      semantic_graph: createJavaScriptSemanticGraph({
+        ...semantic,
+        limitations: messages.slice(0, 1),
+      }),
+    });
+    const duplicatedParent = { ...parent, limitations: messages };
+    const notice = (
+      omitted: number,
+      field: "limitations" | "unknowns",
+      evidenceId: string,
+    ) =>
+      `${String(omitted)} additional ${field} omitted from this view; consult source parent Evidence ${evidenceId} for the complete list (the caller-supplied record, or its retaining session).`;
+    for (const view of [
+      { kind: "summary" },
+      { kind: "page", collection: "modules", offset: 0, limit: 1 },
+    ] as const) {
+      const result = projectAnalysisView(duplicatedParent, view);
+      if (!result.ok) throw result.error;
+      if (count <= 65) {
+        expect(result.value.limitations).toEqual(messages);
+        expect(result.value.unknowns).toEqual(
+          [...messages, "semantic_graph.coverage.status is unknown"].sort(),
+        );
+      } else {
+        const limitations = result.value.limitations;
+        const unknowns = result.value.unknowns;
+        expect(limitations.length).toBeGreaterThan(65);
+        expect(limitations.at(-1)).toBe(
+          notice(
+            count - limitations.length + 1,
+            "limitations",
+            parent.evidenceId,
+          ),
+        );
+        expect(unknowns.length).toBeGreaterThan(65);
+        expect(unknowns.at(-1)).toBe(
+          notice(
+            count + 1 - unknowns.length + 1,
+            "unknowns",
+            parent.evidenceId,
+          ),
+        );
+      }
+    }
+    const layout = layoutParent();
+    const layoutWithMessages = {
+      ...layout,
+      limitations: messages,
+      normalizedResult: {
+        ...analysisViewLayoutFixture(),
+        limitations: messages,
+      },
+    };
+    for (const view of [
+      { kind: "summary" },
+      { kind: "page", collection: "sections", offset: 0, limit: 1 },
+    ] as const) {
+      const result = projectAnalysisView(layoutWithMessages, view);
+      if (!result.ok) throw result.error;
+      if (count <= 65) expect(result.value.limitations).toEqual(messages);
+      else {
+        expect(result.value.limitations.length).toBeGreaterThan(65);
+        expect(result.value.limitations.at(-1)).toBe(
+          notice(
+            count - result.value.limitations.length + 1,
+            "limitations",
+            layout.evidenceId,
+          ),
+        );
+      }
+    }
+  },
+);
+
+it.each(["partial", "unknown"] as const)(
+  "preserves %s parent graph completeness when a module page is exhausted",
+  (status) => {
+    const analysis = analysisViewJavaScriptAnalysis();
+    const first = analysis.graph.nodes[0];
+    if (first === undefined) throw new Error("missing module");
+    const unknown = createJavaScriptApplicationNode({
+      kind: "unknown",
+      identity: {
+        strategy: "observation-fingerprint",
+        stability: "observation-only",
+        observation_sha256: "8".repeat(64),
+        scope: "unclassified module",
+      },
+      observations: first.observations.map((observation) => ({
+        label: "unclassified module",
+        properties: {},
+        evidence: observation.evidence,
+      })),
+    });
+    const messages = [
+      ...Array.from(
+        { length: 65 },
+        (_, index) =>
+          `Module ${String(index).padStart(5, "0")} was not parsed.`,
+      ),
+      "z".repeat(300_000),
+    ];
+    const { graph_id: _applicationId, ...application } = analysis.graph;
+    const graph = createJavaScriptApplicationGraph({
+      ...application,
+      nodes: [...application.nodes, unknown],
+      limitations: messages.slice(0, 1),
+      coverage: { ...application.coverage, status, omitted_count: null },
+    });
+    const bound = analysisViewBindJavaScriptGraphs(analysis, graph);
+    const { graph_id: _semanticId, ...semantic } = bound.semantic_graph;
+    const parent = javascriptParent({
+      ...bound,
+      limitations: messages,
+      semantic_graph: createJavaScriptSemanticGraph({
+        ...semantic,
+        limitations: messages.slice(0, 1),
+      }),
+    });
+    for (const view of [
+      { kind: "page", collection: "modules", offset: 0, limit: 10 },
+      {
+        kind: "javascript",
+        collection: "modules",
+        projection: "references",
+        where: {},
+        offset: 0,
+        limit: 10,
+      },
+      {
+        kind: "javascript",
+        collection: "modules",
+        projection: "references",
+        where: { path: "not-retained.js" },
+        offset: 0,
+        limit: 10,
+      },
+      {
+        kind: "item",
+        collection: "modules",
+        selector: { path: "renderer.js" },
+      },
+    ] as const) {
+      const result = projectAnalysisView(parent, view);
+      if (!result.ok) throw result.error;
+      expect(result.value.coverage.exhausted).toBe(true);
+      if (result.value.kind === "javascript")
+        expect(result.value.source_coverage).toMatchObject({
+          application: { status, omitted_count: null },
+          semantic: { status: "unknown" },
+          application_unknown_count: 1,
+        });
+      expect(result.value.unknowns).toEqual([
+        "1 application graph unknowns remain in the parent Evidence.",
+        ...messages.slice(0, 65),
+        `graph.coverage.status is ${status}`,
+        "semantic_graph.coverage.status is unknown",
+        `1 additional unknowns omitted from this view; consult source parent Evidence ${parent.evidenceId} for the complete list (the caller-supplied record, or its retaining session).`,
+      ]);
+    }
+  },
+);
+
 it("does not match unavailable layout names using a display placeholder", () => {
   const layout = analysisViewLayoutFixture();
   const section = layout.sections[2];
@@ -773,4 +1265,59 @@ it("rejects unsupported parent operations and incompatible collections", () => {
     ok: false,
     error: { _tag: "AnalysisInputError" },
   });
+});
+
+it("keeps the complete unique set when it fits the byte budget", () => {
+  const messages = ["a".repeat(2_400), "b".repeat(2_400)];
+  expect(
+    boundedViewMessages(messages, `ev_${"a".repeat(64)}`, "limitations"),
+  ).toEqual(messages);
+});
+
+it("does not impose a message-count cutoff below the byte budget", () => {
+  const messages = Array.from(
+    { length: 100 },
+    (_, index) => `message ${String(index).padStart(2, "0")}`,
+  );
+  expect(
+    boundedViewMessages(messages, `ev_${"a".repeat(64)}`, "limitations"),
+  ).toEqual(messages.toSorted());
+});
+
+it("bounds repeated view messages even when fewer than 64 source strings are huge", () => {
+  const oversized = ["\u0000".repeat(300_000), "\\".repeat(300_000)];
+  const projected = boundedViewMessages(
+    oversized,
+    `ev_${"a".repeat(64)}`,
+    "limitations",
+  );
+  expect(projected).toHaveLength(1);
+  expect(projected[0]).toContain("2 additional limitations omitted");
+  expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThan(256 * 1024);
+});
+
+it("preserves selected native facet unavailability instead of an exhausted empty page", () => {
+  const parent = nativeParent({
+    ...functionDossierSchema.parse(ghidraFunctionDossier()),
+    facet_availability: {
+      comments: { available: false, reason: "Typed comments unavailable" },
+      references: { available: false, reason: "Typed references unavailable" },
+    },
+  });
+  for (const [facet, reason] of [
+    ["comments", "Typed comments unavailable"],
+    ["incoming_references", "Typed references unavailable"],
+  ] as const) {
+    const result = projectAnalysisView(parent, {
+      kind: "native",
+      facet,
+      offset: 0,
+      limit: 8,
+    });
+    if (!result.ok) throw result.error;
+    expect(result.value).toMatchObject({
+      item: { available: false, reason },
+      unknowns: expect.arrayContaining([reason]),
+    });
+  }
 });

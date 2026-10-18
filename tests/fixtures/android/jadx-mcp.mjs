@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
+import { JADX_BRIDGE_IDENTITY } from "../../../src/android/JadxRelease.ts";
 
 // An actual child MCP server exercising the production stdio/process seam.
 // It is a protocol fixture, not evidence of JADX decompiler support.
@@ -8,7 +9,11 @@ const mode = process.env.REA_FAKE_JADX_MODE ?? "normal";
 const server = new McpServer({
   name: mode === "empty-server-identity" ? "" : "rea-jadx-bridge",
   version:
-    mode === "empty-server-identity" ? "" : mode === "version" ? "99.0.0" : "1",
+    mode === "empty-server-identity"
+      ? ""
+      : mode === "version"
+        ? "99.0.0"
+        : JADX_BRIDGE_IDENTITY.version,
 });
 const requestedCount = Number.parseInt(
   process.env.REA_FAKE_JADX_CLASS_COUNT ?? "",
@@ -32,18 +37,21 @@ const methods = [
   {
     name: "onCreate",
     signature: "onCreate(Bundle): void",
+    dex_descriptor: "(Landroid/os/Bundle;)V",
     is_constructor: false,
     def_pos: 0,
   },
   {
     name: "choose",
     signature: "choose(String): void",
+    dex_descriptor: "(Ljava/lang/String;)V",
     is_constructor: false,
     def_pos: 0,
   },
   {
     name: "choose",
     signature: "choose(int): void",
+    dex_descriptor: "(I)V",
     is_constructor: false,
     def_pos: 0,
   },
@@ -55,7 +63,10 @@ const register = (name, handler) =>
 register("rea_jvm_status", () =>
   json({
     engine_reported_version: mode === "engine-version" ? "0.7.0" : "0.7.1",
-    max_heap_bytes: 8 * 1024 * 1024 * 1024,
+    max_heap_bytes:
+      mode === "heap-failure" || mode === "other-memory-failure"
+        ? 67108864
+        : 8 * 1024 * 1024 * 1024,
     available_processors: 4,
     java_version: "21-fixture",
     metadata_scope: "parsed_members",
@@ -63,6 +74,22 @@ register("rea_jvm_status", () =>
 );
 register("load_apk", async ({ path }) => {
   if (mode === "stall") await new Promise(() => {});
+  if (mode === "heap-failure" || mode === "other-memory-failure")
+    return {
+      ...json({
+        kind: "jvm-memory-failure",
+        memory_area: mode === "heap-failure" ? "heap" : "unknown",
+        exception_type: "java.lang.OutOfMemoryError",
+        message: mode === "heap-failure" ? "Java heap space" : "Metaspace",
+        max_heap_bytes: 67108864,
+      }),
+      isError: true,
+    };
+  if (mode === "heap-decoy")
+    return {
+      ...text("load failed: cannot read /inputs/Java heap space.apk"),
+      isError: true,
+    };
   return json({
     state: "LOADED",
     apk_path: mode === "wrong-apk" ? "/different.apk" : path,
@@ -93,14 +120,22 @@ register("get_android_manifest", () => {
   if (mode === "large-manifest") return text("x".repeat(1024 * 1024));
   return text('<manifest package="fixture"/>');
 });
-register("list_classes", ({ offset, limit }) =>
-  json({
-    total: classes.length,
+register("list_classes", ({ offset, limit, query = "" }) => {
+  const matching = [];
+  let nextOffset = offset;
+  while (nextOffset < classes.length && matching.length < limit) {
+    const name = classes[nextOffset++];
+    if (name.includes(query)) matching.push(name);
+  }
+  return json({
+    scope: "top_level",
+    total_classes: classes.length,
+    next_offset: nextOffset,
     offset,
     limit,
-    items: mode === "empty-page" ? [] : classes.slice(offset, offset + limit),
-  }),
-);
+    items: mode === "empty-page" ? [] : matching,
+  });
+});
 register("get_class_summary", () =>
   json({
     full_name: mode === "wrong-class" ? "fixture.Other" : "fixture.Target",
@@ -114,35 +149,56 @@ register("get_class_summary", () =>
     ...(mode === "summary-error" ? { error: "summary timed out" } : {}),
   }),
 );
-register("get_method_body", ({ method_name, overload_index }) =>
-  json({
+register("get_method_body", ({ method_name, overload_index }) => {
+  if (mode === "body-error")
+    return {
+      ...text("// ERROR: decompile timed out or failed"),
+      isError: true,
+    };
+  const selected = methods.filter((method) => method.name === method_name)[
+    overload_index
+  ];
+  return json({
     class_name: "fixture.Target",
     method_name,
     full_name: `fixture.Target.${method_name}`,
     overload_index:
       mode === "wrong-method" ? overload_index + 1 : overload_index,
     overload_count: method_name === "choose" ? 2 : 1,
-    mode: mode === "smali" || mode === "overloaded-smali" ? "smali" : "java",
-    fell_back: mode === "smali" || mode === "overloaded-smali",
+    dex_descriptor:
+      mode === "wrong-descriptor" ? "()V" : selected.dex_descriptor,
+    mode:
+      mode === "smali" || mode === "selected-overload-smali" ? "smali" : "java",
+    fell_back: mode === "smali" || mode === "selected-overload-smali",
     markers:
-      mode === "smali" || mode === "overloaded-smali"
+      mode === "smali" || mode === "selected-overload-smali"
         ? ["Method not decompiled"]
-        : [],
+        : mode === "native-method"
+          ? ["native_method"]
+          : [],
     body:
-      mode === "no-body"
-        ? "// method exists but has no decompiled body (native/abstract)"
-        : mode === "body-error"
-          ? "// ERROR: decompile timed out or failed"
+      mode === "smali" || mode === "selected-overload-smali"
+        ? `.method public ${method_name}${selected.dex_descriptor}\n    .registers 2\n    return-void\n.end method`
+        : mode === "native-method"
+          ? ""
           : mode === "truncated"
             ? "void onCreate(){}\n\n... [truncated: exceeds 18 bytes, total 100 bytes]"
             : `void ${method_name}() { /* overload ${overload_index} */ }`,
-  }),
-);
+  });
+});
 for (const name of ["get_xrefs_to_class", "get_xrefs_to_method"])
-  register(name, ({ class_name, method_name }) =>
+  register(name, ({ class_name, method_name, overload_index }) =>
     json({
       target:
         method_name === undefined ? class_name : `${class_name}.${method_name}`,
+      ...(method_name === undefined
+        ? {}
+        : {
+            overload_index,
+            reported_signature: methods.filter(
+              (method) => method.name === method_name,
+            )[overload_index]?.signature,
+          }),
       total: mode === "partial-xrefs" ? 2 : 1,
       count: 1,
       resolve_line: false,

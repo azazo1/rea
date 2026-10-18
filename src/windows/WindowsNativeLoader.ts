@@ -41,6 +41,7 @@ const inspectionSchema = z.strictObject({
   architecture: z.literal("x64"),
   filesystem: windowsFileIdentitySchema,
   privateDacl: z.literal(true),
+  privateBridgeDescriptorAccess: z.literal(true),
   atomicJobAssignment: z.literal(true),
   killOnOwnerClose: z.literal(true),
   protocolStdin: z.boolean().optional(),
@@ -70,6 +71,7 @@ export type WindowsNativeLoadResult =
   | {
       readonly available: false;
       readonly reason: string;
+      readonly failureStage: "host" | "artifact" | "self-test" | "inspection";
       /** Only a failed native invocation can recover on a later query. */
       readonly retryable?: true;
     };
@@ -85,6 +87,24 @@ export interface WindowsNativeLoadHost {
   loadArtifact(): unknown;
 }
 
+const missingWindowsNativeFileReason = (file: string): string =>
+  `Missing packaged Windows native file native/windows/build/${file} (ENOENT). Restore both native/windows/build/manifest.json and native/windows/build/rea-windows-x64.node from the rea-agents@${PACKAGE_METADATA.version} tarball or build them with native/windows/README.md; no native artifact was loaded.`;
+
+const readPackagedWindowsNativeFile = <T>(file: string, read: () => T): T => {
+  try {
+    return read();
+  } catch (cause: unknown) {
+    if (
+      typeof cause === "object" &&
+      cause !== null &&
+      "code" in cause &&
+      cause.code === "ENOENT"
+    )
+      throw new Error(missingWindowsNativeFileReason(file), { cause });
+    throw cause;
+  }
+};
+
 /** Validate compatibility and artifact identity before invoking the native addon. */
 export const loadWindowsNativeAuthority = (
   host: WindowsNativeLoadHost,
@@ -92,16 +112,25 @@ export const loadWindowsNativeAuthority = (
   if (host.platform !== "win32" || host.architecture !== "x64")
     return {
       available: false,
+      failureStage: "host",
       reason: "REA Windows native controls require a Windows x64 host.",
     };
+  const nodeApiVersion = Number(host.nodeApiVersion);
+  if (!Number.isSafeInteger(nodeApiVersion) || nodeApiVersion < 8)
+    return {
+      available: false,
+      failureStage: "host",
+      reason: "REA Windows native controls require Node-API 8 or newer.",
+    };
   try {
-    const manifest = windowsNativeManifestSchema.parse(host.readManifest());
+    const manifest = windowsNativeManifestSchema.parse(
+      readPackagedWindowsNativeFile("manifest.json", () => host.readManifest()),
+    );
     if (manifest.packageVersion !== host.packageVersion)
       throw new Error("Windows native artifact belongs to another REA version");
-    const nodeApiVersion = Number(host.nodeApiVersion);
-    if (!Number.isSafeInteger(nodeApiVersion) || nodeApiVersion < 8)
-      throw new Error("Windows native artifact requires Node-API 8 or newer");
-    const artifact = host.readArtifact();
+    const artifact = readPackagedWindowsNativeFile("rea-windows-x64.node", () =>
+      host.readArtifact(),
+    );
     if (
       createHash("sha256").update(artifact).digest("hex") !==
       manifest.artifactSha256
@@ -117,27 +146,36 @@ export const loadWindowsNativeAuthority = (
     } catch (cause: unknown) {
       return {
         available: false,
+        failureStage: "self-test",
         retryable: true,
         reason: `REA Windows native self-test failed: ${cause instanceof Error ? cause.message : String(cause)}`,
       };
     }
-    const inspection = inspectionSchema.parse(observed);
+    const parsed = inspectionSchema.safeParse(observed);
+    if (!parsed.success)
+      return {
+        available: false,
+        failureStage: "inspection",
+        reason: `REA Windows native inspection is invalid: ${parsed.error.message}`,
+      };
+    const inspection = parsed.data;
     return { available: true, authority: { call: binding.call, inspection } };
   } catch (cause: unknown) {
     return {
       available: false,
+      failureStage: "artifact",
       reason: `REA Windows native controls are unavailable: ${cause instanceof Error ? cause.message : String(cause)}`,
     };
   }
 };
 
 const assertWindowsX64Artifact = (bytes: Buffer): void => {
-  if (bytes.length < 64 || bytes.toString("ascii", 0, 2) !== "MZ")
+  if (bytes.length < 64 || bytes.toString("latin1", 0, 2) !== "MZ")
     throw new Error("Windows native artifact is not a PE image");
   const offset = bytes.readUInt32LE(0x3c);
   if (
     offset > bytes.length - 26 ||
-    bytes.toString("ascii", offset, offset + 4) !== "PE\0\0" ||
+    bytes.toString("latin1", offset, offset + 4) !== "PE\0\0" ||
     bytes.readUInt16LE(offset + 4) !== 0x8664 ||
     bytes.readUInt16LE(offset + 24) !== 0x20b
   )

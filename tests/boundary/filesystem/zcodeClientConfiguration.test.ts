@@ -13,7 +13,10 @@ import {
 } from "../../../src/application/SetupClientConfiguration.js";
 import { skillDestinations } from "../../../src/application/SetupSkill.js";
 import { supportedClients } from "../../../src/application/SupportedClients.js";
-import { systemUninstallHost } from "../../../src/application/Uninstall.js";
+import {
+  runUninstall,
+  systemUninstallHost,
+} from "../../../src/application/Uninstall.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { clearClientLocationEnvironment } from "../../fixtures/clientEnvironment.js";
 
@@ -257,6 +260,91 @@ describe("ZCode .agents fallback preservation", () => {
   });
 });
 
+describe("ZCode fallback uninstall", () => {
+  const owned = { command: command[0], args: command.slice(1) };
+  const writeFallback = async (home: string, servers: object) => {
+    await mkdir(join(home, ".agents"), { recursive: true });
+    const text = `${JSON.stringify({ ui: { keep: true }, mcpServers: servers }, null, 2)}\n`;
+    await writeFile(fallbackPath(home), text);
+    return text;
+  };
+
+  it.each(["comment", "trailing-comma", "bom"])(
+    "fails closed on strict fallback syntax: %s",
+    async (mode) => {
+      const { home } = await zcodeClient();
+      const valid = await writeFallback(home, {
+        rea: owned,
+        other: { command: "other-server" },
+      });
+      const original =
+        mode === "comment"
+          ? `// unsupported comment\n${valid}`
+          : mode === "bom"
+            ? `\uFEFF${valid}`
+            : valid.replace(/\}\s*$/u, ",}");
+      await writeFile(fallbackPath(home), original);
+      const result = await runUninstall(false, systemUninstallHost(home));
+      expect(result.items).toContainEqual(
+        expect.objectContaining({ name: "zcode", status: "failed" }),
+      );
+      expect(await readFile(fallbackPath(home), "utf8")).toBe(original);
+      await expect(
+        readFile(`${fallbackPath(home)}.rea.backup`),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it("removes the REA-owned fallback entry with the native registration", async () => {
+    const { home, client } = await zcodeClient();
+    await writeFile(
+      client.configPath,
+      JSON.stringify({ mcp: { servers: { rea: owned } } }),
+    );
+    const original = await writeFallback(home, {
+      rea: owned,
+      other: { command: "other-server" },
+    });
+
+    const result = await runUninstall(false, systemUninstallHost(home));
+
+    expect(result.status).toBe("complete");
+    expect(result.items.find(({ name }) => name === "zcode")?.status).toBe(
+      "removed",
+    );
+    const native = JSON.parse(await readFile(client.configPath, "utf8"));
+    expect(native.mcp.servers).toEqual({});
+    const fallback = JSON.parse(await readFile(fallbackPath(home), "utf8"));
+    expect(fallback).toEqual({
+      ui: { keep: true },
+      mcpServers: { other: { command: "other-server" } },
+    });
+    expect(await readFile(`${fallbackPath(home)}.rea.backup`, "utf8")).toBe(
+      original,
+    );
+  });
+
+  it("removes a fallback-only REA entry and keeps a foreign rea entry", async () => {
+    for (const [servers, expected] of [
+      [{ rea: owned }, {}],
+      [
+        { rea: { command: "someone-else" } },
+        { rea: { command: "someone-else" } },
+      ],
+    ] as const) {
+      const { home } = await zcodeClient();
+      await writeFallback(home, servers);
+
+      expect(
+        (await runUninstall(false, systemUninstallHost(home))).status,
+      ).toBe("complete");
+      expect(
+        JSON.parse(await readFile(fallbackPath(home), "utf8")).mcpServers,
+      ).toEqual(expected);
+    }
+  });
+});
+
 describe("ZCode fallback admission", () => {
   it.each([{ PORT: 123 }, { REA_MCP_INPUT_SCHEMA_PROFILE: "unknown" }])(
     "refuses malformed fallback REA environment %j before native writes",
@@ -368,6 +456,115 @@ describe("ZCode disabled registrations", () => {
       (await configureClientConfiguration(client, {}, command)).status,
     ).toBe("configured");
     expect(await statusFor()).toMatchObject({ state: "aligned", command });
+  });
+
+  it("reports the effective same-scope fallback registration and source path", async () => {
+    const { home, client } = await zcodeClient();
+    const fallback = client.zcodeFallbackPath;
+    if (fallback === undefined) throw new Error("missing ZCode fallback path");
+    await mkdir(join(home, ".agents"), { recursive: true });
+    await writeFile(
+      fallback,
+      JSON.stringify({
+        mcpServers: {
+          rea: { command: command[0], args: command.slice(1) },
+        },
+      }),
+    );
+
+    expect(
+      (
+        await readClientRegistrationStatuses(home, undefined, {
+          platform: process.platform,
+          environment: {},
+        })
+      ).find(({ client }) => client === "zcode"),
+    ).toMatchObject({
+      config_path: fallback,
+      command,
+      state: "aligned",
+    });
+  });
+
+  it("reports a selected fallback parse failure as invalid at its source path", async () => {
+    const { home, client } = await zcodeClient();
+    const fallback = client.zcodeFallbackPath;
+    if (fallback === undefined) throw new Error("missing ZCode fallback path");
+    await mkdir(join(home, ".agents"), { recursive: true });
+    await writeFile(fallback, "{ malformed");
+
+    expect(
+      (
+        await readClientRegistrationStatuses(home, undefined, {
+          platform: process.platform,
+          environment: {},
+        })
+      ).find(({ client }) => client === "zcode"),
+    ).toMatchObject({ config_path: fallback, state: "invalid" });
+  });
+
+  it("reports disabled fallback registrations as stale at the fallback path", async () => {
+    const { home, client } = await zcodeClient();
+    const fallback = client.zcodeFallbackPath;
+    if (fallback === undefined) throw new Error("missing ZCode fallback path");
+    await mkdir(join(home, ".agents"), { recursive: true });
+    await writeFile(
+      fallback,
+      JSON.stringify({
+        mcpServers: {
+          rea: { command: command[0], args: command.slice(1), enable: false },
+        },
+      }),
+    );
+
+    expect(
+      (
+        await readClientRegistrationStatuses(home, undefined, {
+          platform: process.platform,
+          environment: {},
+        })
+      ).find(({ client }) => client === "zcode"),
+    ).toMatchObject({
+      config_path: fallback,
+      command,
+      state: "stale",
+    });
+  });
+
+  it("prefers a nonempty native server table over the fallback", async () => {
+    const { home, client } = await zcodeClient();
+    const fallback = client.zcodeFallbackPath;
+    if (fallback === undefined) throw new Error("missing ZCode fallback path");
+    await mkdir(join(home, ".agents"), { recursive: true });
+    await writeFile(
+      fallback,
+      JSON.stringify({
+        mcpServers: {
+          rea: { command: "fallback-command", args: ["mcp"] },
+        },
+      }),
+    );
+    await writeFile(
+      client.configPath,
+      JSON.stringify({
+        mcp: {
+          servers: { rea: { command: command[0], args: command.slice(1) } },
+        },
+      }),
+    );
+
+    expect(
+      (
+        await readClientRegistrationStatuses(home, undefined, {
+          platform: process.platform,
+          environment: {},
+        })
+      ).find(({ client }) => client === "zcode"),
+    ).toMatchObject({
+      config_path: client.configPath,
+      command,
+      state: "aligned",
+    });
   });
 });
 

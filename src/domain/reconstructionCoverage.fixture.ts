@@ -16,6 +16,11 @@ const EVIDENCE_RECORDS = ["1", "2", "3", "4", "5"].map((character) =>
       operation: `fixture-${character}`,
       parameters: {},
       result: { character },
+      confidence: "observed",
+      authority:
+        character === "3" || character === "4"
+          ? "controlled-replay"
+          : "shipped-artifact",
     },
   ),
 );
@@ -142,4 +147,14 @@ export const completeReconstructionCoverageData = () => {
       },
     ],
   });
+};
+
+/** Complete workspace with its first verifier result and boundary narrowed once. */
+export const completeReconstructionCoverageFixture = () => {
+  const workspace = completeReconstructionCoverageData();
+  const result = workspace.verifier_results[0];
+  const boundary = workspace.boundaries[0];
+  if (result === undefined || boundary === undefined)
+    throw new Error("Expected complete reconstruction coverage fixture");
+  return { workspace, result, boundary };
 };

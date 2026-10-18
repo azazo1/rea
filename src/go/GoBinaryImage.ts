@@ -8,6 +8,10 @@ import {
   type GoBinaryContainer,
   type GoFileMapping,
 } from "./GoBinaryContainer.js";
+import {
+  classifyFatContainerIdentity,
+  readFatContainerHeader,
+} from "../domain/apple/machoContainer.js";
 import { readGoElfImage } from "./GoElfImage.js";
 import { readGoMachoImage } from "./GoMachoImage.js";
 import { readGoPeImage } from "./GoPeImage.js";
@@ -21,6 +25,7 @@ const MAGIC = Buffer.from("ff20476f206275696c64696e663a", "hex");
 const MODULE_START = Buffer.from("3077af0c9274080241e1c107e6d618e6", "hex");
 const MODULE_END = Buffer.from("f932433186182072008242104116d8f2", "hex");
 const MAX_BUILD_INFO_BYTES = 1024 * 1024;
+const MAX_HEADER_SEARCH_BYTES = 256 * 1024 * 1024;
 
 /** Exact file span of one embedded string's contents, excluding its length/header. */
 export interface GoStringLocation {
@@ -51,12 +56,33 @@ export interface GoBinaryImage {
 
 /** Inspect bounded executable bytes using native mappings, without loading or executing code. */
 export const readGoBinaryImage = (bytes: Buffer): GoBinaryImage => {
-  const container = readContainer(bytes);
+  const container = readGoBinaryContainer(bytes);
   const { format, architecture, bits, byte_order } = container;
-  const search = container.search;
-  const header = findHeader(bytes, search);
-  if (header === null || search === null)
+  let selected: { search: GoFileMapping; header: number } | null = null;
+  const searched = new Set<string>();
+  let remainingSearchBytes = MAX_HEADER_SEARCH_BYTES;
+  for (const search of container.search) {
+    // Identical file spans and alignment inspect the same candidate bytes.
+    // Partially overlapping spans still consume a cumulative work budget.
+    const identity = `${search.offset}:${search.size}:${search.address % 16n}`;
+    if (searched.has(identity)) continue;
+    searched.add(identity);
+    if (search.size > remainingSearchBytes)
+      throw new GoBinaryResourceFailure(
+        "search",
+        MAX_HEADER_SEARCH_BYTES,
+        "Go build-info discovery exceeds the cumulative 256 MiB header-search budget",
+      );
+    remainingSearchBytes -= search.size;
+    const header = findHeader(bytes, search);
+    if (header !== null) {
+      selected = { search, header };
+      break;
+    }
+  }
+  if (selected === null)
     return { format, architecture, bits, byte_order, build_info: null };
+  const { search, header } = selected;
   const verifyMapping = (size: number): void => {
     const address = search.address + BigInt(header - search.offset);
     if (
@@ -180,18 +206,35 @@ interface LocatedString {
   readonly location: GoStringLocation;
 }
 
-const readContainer = (bytes: Buffer): GoBinaryContainer => {
+/** Identify an ELF, PE, or thin Mach-O image and its named file sections. */
+export const readGoBinaryContainer = (bytes: Buffer): GoBinaryContainer => {
   if (bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])))
     return readGoElfImage(bytes);
   if (bytes.subarray(0, 2).equals(Buffer.from("MZ")))
     return readGoPeImage(bytes);
   if (bytes.length >= 4) {
     const magic = bytes.readUInt32BE();
-    if ([0xcafebabe, 0xcafebabf, 0xbebafeca, 0xbfbafeca].includes(magic))
-      throw new GoBinaryFormatFailure(
-        "unsupported",
-        "Universal/fat Mach-O containers require selecting a thin slice",
-      );
+    if ([0xcafebabe, 0xcafebabf, 0xbebafeca, 0xbfbafeca].includes(magic)) {
+      const fatHeader = readFatContainerHeader(bytes, bytes.length);
+      if (fatHeader.state === "malformed")
+        throw new GoBinaryFormatFailure("malformed", fatHeader.reason);
+      const identity =
+        fatHeader.state === "parsed"
+          ? classifyFatContainerIdentity(fatHeader, (offset) => {
+              if (offset >= bytes.length) return undefined;
+              if (offset + 4 > bytes.length) return null;
+              return bytes.readUInt32BE(offset);
+            })
+          : undefined;
+      // An invalid FAT-shaped table is not proof of a Mach-O container: JVM
+      // constant-pool bytes can share both the magic and a known CPU value.
+      const confirmedFatMachO = identity?.state === "mach-o";
+      if (confirmedFatMachO)
+        throw new GoBinaryFormatFailure(
+          "unsupported",
+          "Universal/fat Mach-O containers require selecting a thin slice",
+        );
+    }
     if ([0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe].includes(magic))
       return readGoMachoImage(bytes);
   }
@@ -201,11 +244,8 @@ const readContainer = (bytes: Buffer): GoBinaryContainer => {
   );
 };
 
-const findHeader = (
-  bytes: Buffer,
-  search: GoFileMapping | null,
-): number | null => {
-  if (search === null || search.size === 0) return null;
+const findHeader = (bytes: Buffer, search: GoFileMapping): number | null => {
+  if (search.size === 0) return null;
   const end = search.offset + search.size;
   const selected = bytes.subarray(search.offset, end);
   let offset = Number((16n - (search.address % 16n)) % 16n);

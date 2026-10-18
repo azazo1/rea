@@ -14,7 +14,6 @@ const boundedRelativePathSchema = z
   .refine(
     (path) =>
       !path.startsWith("/") &&
-      !path.includes("\\") &&
       path.split("/").every((part) => part !== "" && part !== ".."),
     "Expected a normalized relative POSIX path without traversal",
   );
@@ -188,33 +187,26 @@ export const artifactGraphManifestSchema = z.object({
   edge_count: z.number().int().min(0),
 });
 
-/** Whether the inventory producer covered its modeled child-entry scope. */
-export const artifactInventoryCoverageSchema = z.enum(["complete", "partial"]);
+/** Producer-owned traversal coverage; content certainty remains on each occurrence. */
+export const artifactInventoryCoverageSchema = z.strictObject({
+  scope: z.enum(["root", "container-entries"]),
+  status: z.enum(["complete", "unknown"]),
+});
 export type ArtifactInventoryCoverage = z.infer<
   typeof artifactInventoryCoverageSchema
 >;
 
-/** Complete inventory observation containing the stable artifact graph. */
-export const artifactInventoryResultSchema = z.object({
+/** Current inventory observation containing the stable artifact graph. */
+export const artifactInventoryResultSchema = z.strictObject({
   manifest: artifactGraphManifestSchema,
   nodes: z.array(artifactNodeSchema),
   occurrences: z.array(artifactOccurrenceSchema),
   edges: z.array(artifactEdgeSchema),
   provenance: z.array(artifactCommandSchema),
-  integrity_contradictions: z.array(integrityContradictionSchema).default([]),
+  integrity_contradictions: z.array(integrityContradictionSchema),
+  coverage: artifactInventoryCoverageSchema,
   limitations: z.array(z.string()),
-  /** Optional only for persisted inventory Evidence written before this field. */
-  coverage_status: artifactInventoryCoverageSchema.optional(),
 });
-
-/** Current inventory producers always classify the coverage they examined. */
-export const artifactInventoryOutputSchema =
-  artifactInventoryResultSchema.extend({
-    coverage_status: artifactInventoryCoverageSchema,
-  });
-export type ArtifactInventoryOutput = z.infer<
-  typeof artifactInventoryOutputSchema
->;
 
 /** One safely materialized artifact beneath caller-approved output root. */
 const extractedArtifactSchema = z.object({

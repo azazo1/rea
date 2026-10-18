@@ -7,11 +7,74 @@ import {
   createGoBinaryByteStringFixture,
   createGoBinaryDiagnosticFixtures,
   createGoBinaryFixture,
+  createGoSplitElfFixture,
+  createGoOverlappingElfFixture,
   createGoBinaryPathFailureFixture,
   GO_MODULE_TEXT,
 } from "../fixtures/go/image.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 import { cliTest } from "../support/cli/cliFixture.js";
+import { connectLocalToolsMcp } from "../fixtures/localToolsMcp.js";
+import { parseMcpToolError } from "../fixtures/mcpToolError.js";
+
+cliTest(
+  "bounds overlapping ELF scans through CLI and keeps MCP responsive",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-go-overlap-");
+    const path = join(root, "overlapping.elf");
+    await writeFile(path, createGoOverlappingElfFixture());
+    const result = await cli.run({
+      arguments: ["inspect-go-binary", path, "--json"],
+    });
+    expect(result.exitCode).toBe(1);
+    const expected = {
+      code: "resource_constraint",
+      details: {
+        operation: "inspect_go_binary",
+        resource: "cpu",
+        reported_limits: {
+          boundary: "search",
+          maximum_bytes: 256 * 1024 * 1024,
+        },
+      },
+    };
+    expect(result.json).toMatchObject(expected);
+    const { client, call } = await connectLocalToolsMcp();
+    const response = await call("inspect_go_binary", { path });
+    expect(parseMcpToolError(response).error).toMatchObject(expected);
+    await client.ping();
+  },
+  30000,
+);
+
+cliTest(
+  "retains later-load sectionless ELF evidence through public CLI and stdio MCP",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-go-split-elf-");
+    const { client, call } = await connectLocalToolsMcp();
+    const infos = [];
+    for (const sectionless of [false, true]) {
+      const fixture = createGoSplitElfFixture({ sectionless });
+      const path = join(root, sectionless ? "sectionless.elf" : "original.elf");
+      await writeFile(path, fixture.bytes);
+      const result = await cli.run({
+        arguments: ["inspect-go-binary", path, "--json"],
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      const evidence = toolContract("inspect_go_binary").outputSchema.parse(
+        result.json,
+      );
+      expect(evidence.normalized_result.build_info).not.toBeNull();
+      infos.push(evidence.normalized_result.build_info);
+      const response = await call("inspect_go_binary", { path });
+      expect(response.isError, JSON.stringify(response)).not.toBe(true);
+      expect(response.structuredContent).toEqual(evidence);
+    }
+    expect(infos[1]).toEqual(infos[0]);
+    await client.ping();
+  },
+  30000,
+);
 
 for (const expectedErrno of ["ELOOP", "ENAMETOOLONG"] as const) {
   cliTest.skipIf(expectedErrno === "ELOOP" && process.platform === "win32")(
@@ -218,6 +281,36 @@ cliTest(
     expect(report.build_info).toBeNull();
     expect(report.limitations.join(" ")).toContain(
       "does not establish that the binary is not Go",
+    );
+  },
+);
+
+cliTest(
+  "returns unknown dependency coverage for parse-complete GOPATH metadata in CLI Evidence",
+  async ({ cli }) => {
+    const moduleText =
+      "path\texample.com/tool/cmd/tool\n" +
+      "build\t-compiler=gc\n" +
+      "build\tGOOS=linux\n";
+    const root = await createTestTempDirectory("rea-go-gopath-cli-");
+    const path = join(root, "application.elf");
+    await writeFile(path, createGoBinaryFixture({ moduleText }).bytes);
+    const result = await cli.run({
+      arguments: ["inspect-go-binary", path, "--json"],
+    });
+    expect(result.exitCode, result.stderr).toBe(0);
+    const evidence = toolContract("inspect_go_binary").outputSchema.parse(
+      result.json,
+    );
+    expect(evidence.normalized_result.build_info?.module).toMatchObject({
+      path: "example.com/tool/cmd/tool",
+      main: null,
+      dependencies: [],
+      complete: true,
+      unparsed_lines: [],
+    });
+    expect(evidence.limitations.join(" ")).toContain(
+      "Dependency coverage is unknown",
     );
   },
 );

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
@@ -133,7 +134,7 @@ describe("Hopper API facade", () => {
   it("imports without Hopper globals and gates exhaustive work during analysis", async () => {
     const { stdout } = await execute(
       "python3",
-      [probePath.pathname, bridgePath.pathname],
+      [fileURLToPath(probePath), fileURLToPath(bridgePath)],
       {
         encoding: "utf8",
         timeout: 3_000,
@@ -167,6 +168,19 @@ describe("Hopper API facade", () => {
       },
       native_api: null,
       native_value_flow: null,
+      facet_availability: {
+        pseudocode: {
+          available: false,
+          reason: "Hopper did not supply pseudocode.",
+        },
+        assembly: { available: true },
+        comments: { available: true },
+        callers: { available: true },
+        callees: { available: true },
+        references: { available: true },
+        strings_names: { available: true },
+        cfg: { available: true },
+      },
     });
     expect(result.provider_faults.map((reply) => reply.error.message)).toEqual([
       "TypeError: Hopper bridge operation failed",

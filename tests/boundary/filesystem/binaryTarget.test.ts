@@ -26,8 +26,30 @@ import {
   thinMach,
 } from "../../../src/domain/binaryTarget.fixture.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import { hasXmlPlistSignature } from "../../../src/domain/apple/appleArchiveFormat.js";
+import { parseExecutableHeader } from "../../../src/domain/binaryTarget.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+
+it.each([0x01c0, 0x01c2, 0x01c4, 0xaa64])(
+  "retains original PE COFF machine %i through file-backed target resolution",
+  async (peMachine) => {
+    const directory = await createTestTempDirectory("rea-pe-machine-");
+    const path = join(directory, "image.exe");
+    const bytes = pe(peMachine === 0xaa64 ? 0xaa64 : 0x01c0);
+    bytes.writeUInt16LE(peMachine, bytes.readUInt32LE(0x3c) + 4);
+    await writeFile(path, bytes);
+    const target = await parseBinaryTarget(path);
+    expect(target).toMatchObject({
+      ok: true,
+      value: {
+        format: "pe",
+        architecture: peMachine === 0xaa64 ? "arm64" : "arm",
+        peMachine,
+      },
+    });
+  },
+);
 
 it.each([{ cpus: [0x0100000c] }, { cpus: [0x01000007, 0x0100000c] }])(
   "preserves a FAT container's format in the resolved target and Evidence ($cpus)",
@@ -257,6 +279,46 @@ describe("binary target I/O: package classification", () => {
     });
   });
 
+  it("classifies XML plists by content while preserving named formats", async () => {
+    const directory = await createTestTempDirectory("rea-xml-plist-target-");
+    const xml = Buffer.from(
+      '<?xml version="1.0"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>$archiver</key><string>NSKeyedArchiver</string></dict></plist>',
+    );
+    const archivePath = join(directory, "Model.archive");
+    const javascriptPath = join(directory, "Model.js");
+    await writeFile(archivePath, xml);
+    await writeFile(javascriptPath, xml);
+
+    const archive = await parseBinaryTarget(archivePath);
+    const javascript = await parseBinaryTarget(javascriptPath);
+    expect(archive.ok && archive.value).toMatchObject({
+      kind: "artifact",
+      format: "plist",
+    });
+    expect(javascript.ok && javascript.value).toMatchObject({
+      kind: "artifact",
+      format: "javascript",
+    });
+  });
+
+  it("continues a bounded XML plist probe beyond the initial file window", async () => {
+    const directory = await createTestTempDirectory("rea-xml-long-prolog-");
+    const path = join(directory, "Model.archive");
+    await writeFile(
+      path,
+      `<?xml version="1.0"?>${" ".repeat(8192)}<plist><dict/></plist>`,
+    );
+
+    const result = await parseBinaryTarget(path);
+    expect(result.ok && result.value).toMatchObject({
+      kind: "artifact",
+      format: "plist",
+    });
+    expect(hasXmlPlistSignature(Buffer.from(`<root><plist/></root>`))).toBe(
+      false,
+    );
+  });
+
   it("does not trust a ZIP-family extension without ZIP magic", async () => {
     const directory = await createTestTempDirectory("rea-fake-archive-");
     const path = join(directory, "fake.zip");
@@ -367,7 +429,9 @@ describe("binary target I/O: filesystem and app bundle target resolution", () =>
       ).ok,
     ).toBe(false);
   });
+});
 
+describe("app bundle canonical containment", () => {
   it.skipIf(process.platform === "win32")(
     "rejects an app program symlink that leaves the bundle",
     async () => {
@@ -391,6 +455,68 @@ describe("binary target I/O: filesystem and app bundle target resolution", () =>
           })
         ).ok,
       ).toBe(false);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a Contents/MacOS directory symlink that leaves the bundle",
+    async () => {
+      const directory = await createTestTempDirectory("rea-target-");
+      const app = join(directory, "Escaping.app");
+      const contents = join(app, "Contents");
+      const programs = join(contents, "MacOS");
+      const outside = join(directory, "outside");
+      await mkdir(contents, { recursive: true });
+      await mkdir(outside);
+      await writeFile(
+        join(contents, "Info.plist"),
+        "<plist><dict><key>CFBundleExecutable</key><string>Escaping</string></dict></plist>",
+      );
+      await writeFile(
+        join(outside, "Escaping"),
+        thinMach(0xfeedfacf, 0x0100000c),
+      );
+      await symlink(outside, programs, "dir");
+
+      const result = await parseBinaryTarget(app, {
+        cwd: directory,
+        hostArchitecture: "arm64",
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          path: app,
+          reason: "app program directory leaves Contents/MacOS",
+        },
+      });
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "allows bundle and program directory aliases within the canonical bundle",
+    async () => {
+      const directory = await createTestTempDirectory("rea-target-");
+      const app = join(directory, "Canonical.app");
+      const alias = join(directory, "Alias.app");
+      const contents = join(app, "Contents");
+      const programs = join(contents, "Programs");
+      const executable = join(programs, "Example");
+      await mkdir(programs, { recursive: true });
+      await writeFile(executable, thinMach(0xfeedfacf, 0x0100000c));
+      await writeFile(
+        join(contents, "Info.plist"),
+        "<plist><dict><key>CFBundleExecutable</key><string>Example</string></dict></plist>",
+      );
+      await symlink(programs, join(contents, "MacOS"), "dir");
+      await symlink(app, alias, "dir");
+      const result = await parseBinaryTarget(alias, {
+        cwd: directory,
+        hostArchitecture: "arm64",
+      });
+      expect(result).toMatchObject({
+        ok: true,
+        value: { path: await realpath(executable), format: "mach-o" },
+      });
     },
   );
 });
@@ -421,6 +547,65 @@ describe("binary target I/O: explicit kinds and executable headers", () => {
     expect(result.ok && result.value).toMatchObject({
       format: "pe",
       architecture: "x86_64",
+    });
+  });
+
+  it("extracts CodeView RSDS debug metadata from a PE target", async () => {
+    const directory = await createTestTempDirectory("rea-target-");
+    const path = join(directory, "symbols.exe");
+    await writeFile(
+      path,
+      pe(0x8664, 64, 0x0002, false, {
+        type: "RSDS",
+        pdbPath: "C:\\build\\test.pdb",
+        guid: "12345678-abcd-ef01-2345-6789abcdef01",
+        age: 3,
+      }),
+    );
+    const result = await parseBinaryTarget(path, {
+      cwd: directory,
+      hostArchitecture: "x64",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw result.error;
+    expect(result.value).toMatchObject({
+      format: "pe",
+      architecture: "x86_64",
+      codeView: {
+        pdbPath: "C:\\build\\test.pdb",
+        pdbFileName: "test.pdb",
+        guid: "12345678-abcd-ef01-2345-6789abcdef01",
+        age: 3,
+      },
+    });
+  });
+
+  it("extracts CodeView NB10 debug metadata from a PE target", async () => {
+    const directory = await createTestTempDirectory("rea-target-");
+    const path = join(directory, "legacy.exe");
+    await writeFile(
+      path,
+      pe(0x014c, 64, 0x0002, false, {
+        type: "NB10",
+        pdbPath: "D:\\old\\legacy.pdb",
+        age: 1,
+      }),
+    );
+    const result = await parseBinaryTarget(path, {
+      cwd: directory,
+      hostArchitecture: "ia32",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw result.error;
+    expect(result.value).toMatchObject({
+      format: "pe",
+      architecture: "x86",
+      codeView: {
+        pdbPath: "D:\\old\\legacy.pdb",
+        pdbFileName: "legacy.pdb",
+        guid: null,
+        age: 1,
+      },
     });
   });
 
@@ -884,3 +1069,43 @@ it.each([
     });
   },
 );
+
+describe("binary target I/O: PE CodeView header ranges", () => {
+  it.each(["RSDS", "NB10"] as const)(
+    "reads bounded %s header debug records and rejects unfinished names",
+    async (type) => {
+      const directory = await createTestTempDirectory("rea-target-");
+      const path = join(directory, "header-symbols.exe");
+      const bytes = pe(0x8664, 64, 0x0002, false, {
+        type,
+        pdbPath: "header.pdb",
+      });
+      const optionalHeader = 64 + 24;
+      bytes.writeUInt32LE(512, optionalHeader + 60);
+      bytes.copy(bytes, 384, 512);
+      bytes.writeUInt32LE(384, optionalHeader + 112 + 6 * 8);
+      bytes.writeUInt32LE(412, 384 + 20);
+      bytes.writeUInt32LE(0, 384 + 24);
+      for (const complete of [true, false]) {
+        if (!complete) {
+          const dataSize = bytes.readUInt32LE(384 + 16);
+          bytes[412 + dataSize - 1] = 0x61;
+        }
+        await writeFile(path, bytes);
+        const resolved = await parseBinaryTarget(path, {
+          hostArchitecture: "x64",
+        });
+        const buffered = parseExecutableHeader(bytes, "x64");
+        if (!resolved.ok) throw resolved.error;
+        if (!buffered.ok) throw new Error(buffered.error);
+        for (const value of [resolved.value, buffered.value]) {
+          if (complete)
+            expect(value).toMatchObject({
+              codeView: { pdbPath: "header.pdb" },
+            });
+          else expect(value).not.toHaveProperty("codeView");
+        }
+      }
+    },
+  );
+});

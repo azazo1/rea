@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { machoCpuSubtypeBase } from "../../domain/apple/machoCpuIdentity.js";
 
 const architectureSchema = z.object({
   name: z.string().min(1),
@@ -6,6 +7,7 @@ const architectureSchema = z.object({
   cpu_subtype: z.string().nullable(),
   cpu_type_code: z.number().int().nonnegative().nullable(),
   cpu_subtype_code: z.number().int().nonnegative().nullable(),
+  cpu_subtype_base: z.number().int().nonnegative().nullable(),
   capabilities: z.string().nullable(),
   file_offset: z.number().int().min(0).nullable(),
   size: z.number().int().min(0).nullable(),
@@ -14,8 +16,26 @@ const architectureSchema = z.object({
 
 export type LipoArchitecture = z.infer<typeof architectureSchema>;
 
-/** Parse `lipo -detailed_info` into deterministic slice metadata. */
-export const parseLipoArchitectures = (output: string): LipoArchitecture[] => {
+interface LipoOutput {
+  readonly format: "thin" | "fat";
+  readonly architectures: LipoArchitecture[];
+}
+
+/** Parse `lipo -detailed_info` framing and deterministic slice metadata. */
+export const parseLipoOutput = (
+  output: string,
+  operandPath?: string,
+): LipoOutput => {
+  // The echoed FAT operand is one value, even when its pathname contains lines.
+  if (operandPath !== undefined) {
+    const header = `Fat header in: ${operandPath}`;
+    if (output.startsWith(header)) {
+      if (output.startsWith("\r\n", header.length))
+        output = output.slice(header.length + 2);
+      else if (output.startsWith("\n", header.length))
+        output = output.slice(header.length + 1);
+    }
+  }
   // lipo echoes a thin file's pathname verbatim, including embedded newlines.
   // Match its final architecture field before splitting records into lines.
   const thinArchitecture =
@@ -23,19 +43,23 @@ export const parseLipoArchitectures = (output: string): LipoArchitecture[] => {
       output,
     )?.[1];
   if (thinArchitecture !== undefined)
-    return [
-      architectureSchema.parse({
-        name: thinArchitecture,
-        cpu_type: null,
-        cpu_subtype: null,
-        cpu_type_code: null,
-        cpu_subtype_code: null,
-        capabilities: null,
-        file_offset: null,
-        size: null,
-        alignment: null,
-      }),
-    ];
+    return {
+      format: "thin",
+      architectures: [
+        architectureSchema.parse({
+          name: thinArchitecture,
+          cpu_type: null,
+          cpu_subtype: null,
+          cpu_type_code: null,
+          cpu_subtype_code: null,
+          cpu_subtype_base: null,
+          capabilities: null,
+          file_offset: null,
+          size: null,
+          alignment: null,
+        }),
+      ],
+    };
   const architectures: LipoArchitecture[] = [];
   let current: Record<string, string> | undefined;
   const flush = (): void => {
@@ -54,6 +78,7 @@ export const parseLipoArchitectures = (output: string): LipoArchitecture[] => {
             current.cpusubtype,
             current.capabilities,
           ),
+          cpu_subtype_base: cpuSubtypeBase(current.cpusubtype),
           capabilities: current.capabilities ?? null,
           file_offset: integer(current.offset),
           size: integer(current.size),
@@ -86,7 +111,7 @@ export const parseLipoArchitectures = (output: string): LipoArchitecture[] => {
   flush();
   if (architectures.length === 0)
     throw new TypeError("lipo output contained no architectures");
-  return architectures;
+  return { format: "fat", architectures };
 };
 
 const integer = (value: string | undefined): number | null => {
@@ -158,10 +183,10 @@ const cpuSubtypeCode = (
 };
 
 /** The subtype bits a lipo record names, without its capability byte. */
-export const lipoSubtypeBits = (value: string | null): number | null => {
-  if (value === null) return null;
+const cpuSubtypeBase = (value: string | undefined): number | null => {
+  if (value === undefined) return null;
   const subtype = unsigned32(value) ?? CPU_SUBTYPES[value];
-  return subtype === undefined ? null : subtype & 0x00ffffff;
+  return subtype === undefined ? null : machoCpuSubtypeBase(subtype);
 };
 
 /** lipo names the LIB64 capability and prints other capability bits in hex. */

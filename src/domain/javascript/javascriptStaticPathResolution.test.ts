@@ -1,9 +1,11 @@
 import { posix } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { parseExpression } from "@babel/parser";
 import { describe, expect, it } from "vitest";
 
 import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import { parserPluginsForPath } from "./javascriptSourceParser.js";
 import {
   staticPath,
   staticPathResolutionContext,
@@ -22,6 +24,7 @@ const absoluteParts = [
 
 const anchoredExpressions = [
   ['path.resolve(__dirname, "preload.cjs")', "preload.cjs"],
+  ['path[`resolve`](__dirname, "preload.js")', "preload.js"],
   ['path.posix.resolve("ignored", __dirname, "preload.js")', "preload.js"],
   ['path.resolve("/ignored", __dirname, "preload.js")', "preload.js"],
   [
@@ -38,9 +41,19 @@ const anchoredExpressions = [
   ["path.resolve(__dirname)", "."],
   ['path.posix.resolve(`/app`, `/shared`, "preload.js")', "/shared/preload.js"],
   ['path.posix.resolve("" + "/app", "preload.js")', "/app/preload.js"],
+  ['__dirname + "/preload.js"', "preload.js"],
+  ['__dirname + "/" + "preload.js"', "preload.js"],
+  ['path.dirname(__filename) + "/lib" + "/preload.js"', "lib/preload.js"],
 ] as const;
 
 const unknownExpressions = [
+  "runtimePath as string",
+  "path.join(__dirname as string, runtimeFile as string) as string",
+  'path[method](__dirname, "preload.js")',
+  'path[`join${suffix}`](__dirname, "preload.js")',
+  '(path[method] as typeof path.join)(__dirname, "preload.js")',
+  '((useJoin ? path.join : path.resolve) as typeof path.join)(__dirname, "preload.js")',
+  'fileURLToPath(new (runtimeURL as typeof URL)("./preload.js", import.meta.url))',
   "path.resolve()",
   "path.posix.resolve()",
   'path.resolve("sub", "../preload.js")',
@@ -58,9 +71,105 @@ const unknownExpressions = [
   'path.win32.resolve(__dirname, "preload.js")',
   'win32.resolve("/app", "preload.js")',
   'resolve("/app", "preload.js")',
+  '__dirname + "preload.js"',
+  'path.dirname(__filename) + "preload.js"',
 ];
 
+const pathValueExpressions = [
+  ['"./preload.js" as const', "./preload.js", "module-specifier"],
+  [
+    'path.join(__dirname, "preload.js") as string',
+    "preload.js",
+    "filesystem-expression",
+  ],
+  [
+    'path.join(__dirname as string, "preload.js" as const)',
+    "preload.js",
+    "filesystem-expression",
+  ],
+  [
+    'path.resolve(__dirname as string, "preload.js" as const)',
+    "preload.js",
+    "filesystem-expression",
+  ],
+  [
+    'fileURLToPath(new URL("./preload.js", import.meta.url as string) as URL) as string',
+    "./preload.js",
+    "filesystem-expression",
+  ],
+  [
+    'path.join(path.dirname(__filename as string), "preload.js")',
+    "preload.js",
+    "filesystem-expression",
+  ],
+  [
+    'path.join(path.dirname(__filename) as string, "preload.js")',
+    "preload.js",
+    "filesystem-expression",
+  ],
+  [
+    '((__dirname + "/lib") as string) + "/preload.js"',
+    "lib/preload.js",
+    "filesystem-expression",
+  ],
+  ['"/app/preload.js"', "/app/preload.js", "filesystem-expression"],
+  ["`/app/preload.js`", "/app/preload.js", "filesystem-expression"],
+  [
+    'path.join(`/app`, "preload.js")',
+    "/app/preload.js",
+    "filesystem-expression",
+  ],
+  ["`./preload.js`", "./preload.js", "module-specifier"],
+] as const;
+
+const pathCallTargetExpressions = [
+  ['(path.join as typeof path.join)(__dirname, "preload.js")', "preload.js"],
+  ['path.join!(__dirname, "preload.js")', "preload.js"],
+  [
+    '(path.resolve satisfies typeof path.resolve)(__dirname, "preload.js")',
+    "preload.js",
+  ],
+  [
+    '((path as typeof path).posix as typeof path.posix).resolve("/app", "preload.js")',
+    "/app/preload.js",
+  ],
+  [
+    '(fileURLToPath as typeof fileURLToPath)(new URL("./preload.js", import.meta.url))',
+    "./preload.js",
+  ],
+  [
+    'fileURLToPath(new (URL as typeof URL)("./preload.js", import.meta.url))',
+    "./preload.js",
+  ],
+  [
+    'fileURLToPath(new (url.URL as typeof URL)("./preload.js", import.meta.url))',
+    "./preload.js",
+  ],
+  [
+    'path.join((path.dirname as typeof path.dirname)(__filename), "preload.js")',
+    "preload.js",
+  ],
+  [
+    'path.join(dirname((fileURLToPath as typeof fileURLToPath)(import.meta.url)), "preload.js")',
+    "preload.js",
+  ],
+] as const;
+
 describe("inert JavaScript path resolution", () => {
+  it.each(pathCallTargetExpressions)(
+    "preserves exact path values and context through call target %s",
+    (expression, path) => {
+      assertPathProjection(expression, path, "filesystem-expression");
+    },
+  );
+
+  it.each(pathValueExpressions)(
+    "preserves exact path values and context through %s",
+    (expression, path, context) => {
+      assertPathProjection(expression, path, context);
+    },
+  );
+
   it.each(absoluteParts)(
     "matches the POSIX resolve oracle for %j",
     (...parts) => {
@@ -101,6 +210,21 @@ describe("inert JavaScript path resolution", () => {
       "filesystem-expression",
     ],
     [
+      'path[`join`](__dirname, "preload.js")',
+      "preload.js",
+      "filesystem-expression",
+    ],
+    [
+      'path.join(__dirname, "/preload.js")',
+      "preload.js",
+      "filesystem-expression",
+    ],
+    [
+      'path.join(dirname(fileURLToPath(import.meta.url)), "/lib", "/preload.js")',
+      "lib/preload.js",
+      "filesystem-expression",
+    ],
+    [
       'path.join("ignored", __dirname, "preload.js")',
       "ignored/preload.js",
       "filesystem-expression",
@@ -111,14 +235,13 @@ describe("inert JavaScript path resolution", () => {
       "filesystem-expression",
     ],
     ['join("sub", "preload.js")', "sub/preload.js", "module-specifier"],
+    ["path.join(__dirname)", ".", "filesystem-expression"],
   ] as const)("preserves join behavior in %s", (expression, path, context) => {
     assertPathProjection(expression, path, context);
   });
 
   it.each(unknownExpressions)("keeps unsupported %s unknown", (expression) => {
-    expect(
-      staticPath(parseExpression(expression, { sourceType: "module" })),
-    ).toBeUndefined();
+    expect(staticPath(parsePathExpression(expression))).toBeUndefined();
     const { analysis, windowExpression, utilityExpression } =
       analyzePathConsumers(expression);
     expect(analysis.parse_status).toBe("partial");
@@ -182,15 +305,42 @@ describe("inert JavaScript path resolution", () => {
 
   it.each([
     "path.join()",
-    "path.join(__dirname)",
     'path.join("/app", runtimeFile)',
     "path.join(...parts)",
   ])("preserves unresolved join syntax in %s", (expression) =>
-    expect(
-      staticPath(parseExpression(expression, { sourceType: "module" })),
-    ).toBeUndefined(),
+    expect(staticPath(parsePathExpression(expression))).toBeUndefined(),
   );
 });
+
+it.each([
+  "file:///app/preload%20file.js",
+  "file:///app/%E2%9C%93.js",
+  "file:///app/preload.js?query=1#fragment",
+])("decodes literal file URL %s as a filesystem expression", (url) => {
+  assertPathProjection(
+    `fileURLToPath(${JSON.stringify(url)})`,
+    fileURLToPath(url, { windows: false }),
+    "filesystem-expression",
+  );
+});
+
+it.each([
+  'fileURLToPath("file:///app/%2Fpreload.js")',
+  'fileURLToPath("file:///app/%5Cpreload.js")',
+  'fileURLToPath("file:///app/%")',
+  'fileURLToPath("file:///C:/app/preload.js")',
+  'fileURLToPath("file://remote/share/preload.js")',
+  'fileURLToPath("file:///app/preload.js", options)',
+  "fileURLToPath(selectedUrl)",
+])("leaves platform-dependent or invalid %s unknown", (expression) =>
+  expect(staticPath(parsePathExpression(expression))).toBeUndefined(),
+);
+
+const parsePathExpression = (expression: string) =>
+  parseExpression(expression, {
+    sourceType: "module",
+    plugins: parserPluginsForPath("preload.ts"),
+  });
 
 const analyzePathConsumers = (expression: string) => {
   const property = `preload: ${expression}`;
@@ -215,7 +365,7 @@ const assertPathProjection = (
   path: string,
   context: JavaScriptStaticPathContext,
 ) => {
-  const node = parseExpression(expression, { sourceType: "module" });
+  const node = parsePathExpression(expression);
   expect(staticPath(node)).toBe(path);
   expect(staticPathResolutionContext(node)).toBe(context);
   const {

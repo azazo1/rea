@@ -62,6 +62,37 @@ it("requires producer coverage accounting in every parsed capture", () => {
   );
 });
 
+it("does not infer normalized retention budget from missing scenario defaults", () => {
+  const capture = emptyCapture();
+  const scenario = {
+    ...capture.manifest.scenario,
+    limits: {
+      files: 10_000,
+      file_bytes: 10_000_000,
+      processes: 1_000,
+      filesystem_depth: 16,
+    },
+  };
+  expect(() =>
+    parseProcessCapture({
+      ...capture,
+      manifest: {
+        ...capture.manifest,
+        scenario,
+        full_scenario_sha256: digestProcessCommitment(scenario),
+      },
+      truncation_details: {
+        ...capture.truncation_details,
+        normalized_terminal: {
+          budget_bytes: 1_000_000,
+          retained_bytes: 0,
+          omitted_frames: 0,
+        },
+      },
+    }),
+  ).toThrow("manifest.scenario.limits.output_bytes");
+});
+
 it("rejects settlement and cleanup combinations that cannot occur", () => {
   const capture = emptyCapture();
   expect(() =>
@@ -838,4 +869,28 @@ it("requires compatible contracts and enforces capture age through a clock seam"
       ],
     }),
   );
+});
+
+it("requires interaction dispatch times to follow their sequence", () => {
+  const capture = emptyCapture();
+  const interaction = (sequence: number, dispatched: number) => ({
+    sequence,
+    scheduled_at_ms: 0,
+    dispatched_at_ms: dispatched,
+    type: "input" as const,
+    data: "x",
+    outcome: "dispatched" as const,
+  });
+  const issues = (dispatched: readonly number[]) =>
+    processCaptureIssues({
+      ...capture,
+      interaction_events: dispatched.map((at, index) => interaction(index, at)),
+    }).filter(({ message }) => message.includes("dispatch timestamps"));
+  expect(issues([5, 5, 10])).toEqual([]);
+  expect(issues([10, 5])).toEqual([
+    {
+      path: "interaction_events",
+      message: expect.stringContaining("dispatch timestamps must be ordered"),
+    },
+  ]);
 });

@@ -94,7 +94,7 @@ const results: Readonly<Record<string, unknown>> = {
     serial: "emulator-5554",
     package_name: "com.example",
     version_name: "1.2.3",
-    version_code: 45,
+    version_code: "45",
     first_install_time: "2026-01-02 03:04:05",
     last_update_time: "2026-02-03 04:05:06",
     installer_package_name: null,
@@ -194,9 +194,25 @@ const results: Readonly<Record<string, unknown>> = {
   inspect_adb_window: {
     client: clientIdentity,
     serial: "emulator-5554",
+    source_section: "windows",
+    focus_summary: "single_context",
+    focus_contexts: [
+      {
+        scope: "unscoped",
+        display_id: null,
+        header_line: null,
+        declarations: [
+          {
+            field: "mCurrentFocus",
+            value: "Window{abcdef u0 com.example.app/Main}",
+            raw_line: "mCurrentFocus=Window{abcdef u0 com.example.app/Main}",
+          },
+        ],
+      },
+    ],
     focused_window: "Window{abcdef u0 com.example.app/Main}",
     focused_app: null,
-    observed_lines: ["Window{abcdef u0 com.example.app/Main}"],
+    observed_lines: ["mCurrentFocus=Window{abcdef u0 com.example.app/Main}"],
   },
   read_adb_setting: {
     client: clientIdentity,
@@ -233,7 +249,8 @@ const results: Readonly<Record<string, unknown>> = {
     apk_path: "/tmp/app.apk",
     bytes: 2048,
     sha256: "a".repeat(64),
-    replaced: false,
+    replace_requested: false,
+    replaced: null,
   },
   uninstall_adb_package: {
     client: clientIdentity,

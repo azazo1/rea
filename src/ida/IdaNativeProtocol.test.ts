@@ -90,6 +90,7 @@ const fixture = async () => {
     },
     serverInfo: () => producer.serverInfo(),
     close: () => producer.close(),
+    detach: () => producer.detach(),
   };
   const client = new IdaSessionClient(
     {
@@ -242,6 +243,10 @@ describe("native IDA provider observations", () => {
         expect(dossier.value.result).toMatchObject({
           callers: [],
           callees: [{ address: "0x2000", name: "puts" }],
+          facet_availability: {
+            callers: { available: false },
+            callees: { available: true },
+          },
         });
         if (more)
           expect(dossier.value.limitations).toContain(
@@ -274,6 +279,11 @@ describe("native IDA provider observations", () => {
       );
       if (!result.ok) throw result.error;
       expect(result.value.provider.name).toBe("IDA MCP adapter");
+      if (operation === "xrefs")
+        expect(
+          result.value.referencesTruncated,
+          "the native producer's explicit cap flag is forwarded",
+        ).toBe(false);
       if (operation === "procedure_assembly")
         expect(result.value.result).toBe("0x1000: ret");
       if (operation === "procedure_pseudo_code") {
@@ -755,6 +765,36 @@ describe("native IDA malformed observations", () => {
     producer.overrideCall = (name) =>
       name === "find_regex" ? { matches: [], cursor: { next: 0 } } : undefined;
     expect((await client.execute("list_strings", {})).ok).toBe(false);
+    await client.close();
+  });
+});
+
+describe("native IDA attached operation admission", () => {
+  it("forwards the native producer's explicit reference cap flag", async () => {
+    const { client } = await fixture();
+    const result = await client.execute("xrefs", { address: "0x1000" });
+
+    if (!result.ok) throw result.error;
+    expect(result.value.referencesTruncated).toBe(false);
+    await client.close();
+  });
+
+  it("reports the bound document but not headless-only address resolution", async () => {
+    const { client, producer, target } = await fixture();
+    const containing = await client.execute("resolve_containing_procedure", {
+      address: "0x1000",
+    });
+    expect(containing.ok).toBe(false);
+    if (!containing.ok)
+      expect(containing.error._tag).toBe("AnalysisCapabilityUnavailableError");
+
+    const documents = await client.execute("list_documents", {});
+    if (!documents.ok) throw documents.error;
+    expect(documents.value.result).toEqual([target.path]);
+    expect(
+      producer.calls.some(({ name }) => name === "lookup_funcs"),
+      "nothing is dispatched upstream",
+    ).toBe(false);
     await client.close();
   });
 });

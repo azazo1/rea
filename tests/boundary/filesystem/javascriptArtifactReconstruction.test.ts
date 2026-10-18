@@ -68,6 +68,7 @@ it("keeps malformed JavaScript, package metadata, and source maps as explicit un
   await Promise.all([
     writeFile(join(root, "package.json"), "{"),
     writeFile(join(root, "broken.js"), "function broken( {"),
+    writeFile(join(root, "data.json"), "{"),
     writeFile(join(root, "renderer", "renderer.js.map"), "{"),
   ]);
 
@@ -90,9 +91,33 @@ it("keeps malformed JavaScript, package metadata, and source maps as explicit un
     expect.arrayContaining([
       "parse-javascript",
       "parse-package-json",
+      "parse-json-module",
       "parse-local-source-map",
     ]),
   );
+  const gaps = result.graph.nodes
+    .filter(({ kind }) => kind === "unknown")
+    .flatMap(({ observations }) => observations);
+  for (const operation of [
+    "parse-javascript",
+    "parse-package-json",
+    "parse-json-module",
+    "parse-local-source-map",
+  ]) {
+    const applicable = gaps.filter(
+      ({ properties }) => properties.operation === operation,
+    );
+    expect(applicable.length).toBeGreaterThan(0);
+    for (const gap of applicable)
+      expect(gap.evidence).toMatchObject({
+        authority:
+          operation === "parse-javascript"
+            ? "ast-static-analysis"
+            : "artifact-bytes",
+        state: "unavailable",
+        confidence: "unknown",
+      });
+  }
 });
 
 it("retains every source declared by every included local source map", async () => {
@@ -135,7 +160,6 @@ it("retains every source declared by every included local source map", async () 
 it.each([
   ["a non-array sourcesContent value", { sourcesContent: "source" }],
   ["a non-string, non-null source entry", { sourcesContent: [42] }],
-  ["a source-content array with the wrong length", { sourcesContent: [] }],
 ])(
   "reports %s as an invalid local source map",
   async (_description, content) => {
@@ -209,6 +233,51 @@ it("accepts omitted and explicitly null source-map source contents", async () =>
   ).toBe(true);
   expect(result.graph.coverage.status).toBe("complete");
 });
+
+it.each([
+  ["shorter", ["export const answer = 42;"]],
+  ["longer", ["export const answer = 42;", null, "unused trailing content"]],
+])(
+  "keeps every source declaration when sourcesContent is %s than sources",
+  async (length, sourcesContent) => {
+    const root = await createTestTempDirectory(
+      `rea-javascript-${length}-source-content-`,
+    );
+    await writeFile(
+      join(root, "bundle.js.map"),
+      JSON.stringify({
+        version: 3,
+        sources: ["a.ts", "b.ts"],
+        sourcesContent,
+        names: [],
+        mappings: "AAAA;ACAA",
+      }),
+    );
+
+    const result = await reconstructJavaScriptArtifact({ input_path: root });
+    const originals = result.graph.nodes.filter(
+      ({ identity }) => identity.strategy === "source-map-original",
+    );
+
+    expect(
+      originals
+        .map(({ identity, observations }) => ({
+          original_source:
+            "original_source" in identity ? identity.original_source : null,
+          source_index: observations[0]?.properties.source_index,
+          content_available: observations[0]?.properties.content_available,
+        }))
+        .sort(
+          (left, right) =>
+            Number(left.source_index) - Number(right.source_index),
+        ),
+    ).toEqual([
+      { original_source: "a.ts", source_index: 0, content_available: true },
+      { original_source: "b.ts", source_index: 1, content_available: false },
+    ]);
+    expect(result.graph.coverage.status).toBe("complete");
+  },
+);
 
 it("retains unnamed source declarations without shifting later source evidence", async () => {
   const root = await createTestTempDirectory("rea-javascript-unnamed-source-");

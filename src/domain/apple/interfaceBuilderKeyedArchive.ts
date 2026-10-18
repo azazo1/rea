@@ -55,6 +55,7 @@ export const parseInterfaceBuilderRecords = (
   readonly objectCount: number;
   readonly omittedObjects: number;
   readonly omittedConnections: number;
+  readonly unresolvedConnections: number;
   readonly omittedHierarchyReferences: number;
 } => {
   const root = record(value);
@@ -130,11 +131,12 @@ export const parseInterfaceBuilderRecords = (
   return {
     objects,
     connections,
-    hierarchy: Array.isArray(hierarchyRaw) ? hierarchyRaw.slice(0, 20_000) : [],
+    hierarchy: Array.isArray(hierarchyRaw) ? hierarchyRaw : [],
     classes: classesRaw,
     objectCount: objectEntries.length,
     omittedObjects: Math.max(0, objectEntries.length - 20_000),
     omittedConnections,
+    unresolvedConnections: 0,
     omittedHierarchyReferences: 0,
   };
 };
@@ -320,15 +322,21 @@ const parseKeyedArchive = (
   const connections: InterfaceBuilderConnection[] = [];
   let objectCount = 0;
   let omittedConnections = 0;
+  let unresolvedConnections = 0;
   for (const [index, raw] of objectTable.entries()) {
     if (index === 0) continue;
     const resolved = record(resolve(raw));
     const className = firstString(resolved.className);
-    if (className === null) continue;
+    // An archived object names its class with its own `$class` reference;
+    // when that reference cannot be resolved the object is still observed,
+    // with an unknown class. Scalars and class descriptors are not objects.
+    if (className === null && !Object.hasOwn(record(raw), "$class")) continue;
     objectCount += 1;
     const fields = Object.fromEntries(
       Object.entries(resolved).filter(([key]) => key !== "className"),
     );
+    // Keep the unresolvable class reference itself, e.g. a dangling UID.
+    if (className === null) fields.$class = record(raw).$class;
     const authoredId = firstString(fields.objectID, fields["object-id"]);
     const objectId =
       authoredId ??
@@ -354,6 +362,7 @@ const parseKeyedArchive = (
         }),
       );
     if (
+      className !== null &&
       /(?:Outlet|Connection|Segue|ActionConnection|ControlConnector)/iu.test(
         className,
       )
@@ -371,7 +380,13 @@ const parseKeyedArchive = (
             controlAction ? fields.to : fields.from,
             controlAction ? fields.target : fields.owner,
           );
-      if (source === null) continue;
+      if (source === null) {
+        // A recognized connector that cannot name its owner is an unresolved
+        // connection, not an absent one, and cannot be represented as a
+        // connection because connection identity requires a source.
+        unresolvedConnections += 1;
+        continue;
+      }
       const kind = controlAction ? "action" : classifyConnection(className);
       const parsedConnection = connection.parse({
         id: `archive:${objectId}`,
@@ -426,6 +441,7 @@ const parseKeyedArchive = (
     objectCount,
     omittedObjects: Math.max(0, objectCount - 20_000),
     omittedConnections,
+    unresolvedConnections,
     omittedHierarchyReferences: hierarchy.omittedReferences,
   };
 };
@@ -513,7 +529,8 @@ const classifyConnection = (
 ): InterfaceBuilderConnection["kind"] => {
   const value = type.toLowerCase();
   if (value.includes("outlet")) return "outlet";
-  if (value.includes("action")) return "action";
+  if (value.includes("action") || value.includes("eventconnection"))
+    return "action";
   if (value.includes("segue")) return "segue";
   return "other";
 };

@@ -1,13 +1,13 @@
 import { z } from "zod";
-import {
-  AnalysisInputError,
-  AnalysisResourceConstraintError,
-} from "../analysisErrorCore.js";
+import { AnalysisResourceConstraintError } from "../analysisErrorCore.js";
 import type { AnalysisError } from "../analysisErrorBase.js";
 import { compareUnicodeCodePoints as compare } from "../unicodeCodePointOrder.js";
-import { parseRecordedTransportUrl } from "../recordedTransportUrl.js";
+import {
+  parseRecordedTransportUrl,
+  parseUrlQueryParameterNames,
+} from "../recordedTransportUrl.js";
 import { err, ok, type Result } from "../result.js";
-import { MAX_JSON_DEPTH } from "../jsonValue.js";
+import { admitAnalysisViewData } from "./analysisViewDataAdmission.js";
 import {
   WEB_NETWORK_CAPTURE_LIMITS,
   type WebNetworkCaptureRecord,
@@ -41,6 +41,7 @@ interface GroupState {
   readonly ordinals: number[];
   readonly statuses: Set<number>;
   readonly contentTypes: Set<string>;
+  readonly queryNames?: Map<string, number[]>;
 }
 type Buckets = Map<string, Map<string, Map<string, Map<string, GroupState>>>>;
 
@@ -85,9 +86,6 @@ const ENTRY_BYTES = 128;
 const RECORD_SCRATCH_BYTES = 512;
 const SEGMENT_SCRATCH_BYTES = 512;
 const CAPTURE_CONTAINER_BYTES = 512;
-// Covers cloned member slots and per-member validation/entries/map scratch.
-// Scalar strings remain shared references, so their text is not copied here.
-const CAPTURE_MEMBER_BYTES = 256;
 const textBytes = (length: number): number => 32 + length * 14;
 
 const segmentRule = (value: string): Rule | null => {
@@ -120,7 +118,10 @@ export class WebNetworkApiSurfaceAccumulator {
   #retainedBytes = 0;
   #temporaryBytes = 0;
 
-  constructor(readonly maximumBytes = WEB_NETWORK_CAPTURE_LIMITS.outputBytes) {}
+  constructor(
+    readonly maximumBytes = WEB_NETWORK_CAPTURE_LIMITS.outputBytes,
+    readonly includeQueryParameterNames = false,
+  ) {}
 
   #retain(bytes: number): boolean {
     if (this.#retainedBytes + this.#temporaryBytes + bytes > this.maximumBytes)
@@ -149,87 +150,15 @@ export class WebNetworkApiSurfaceAccumulator {
 
   /** Reserve schema output and validation scratch while the borrowed parent stays live. */
   admitCaptureClone(value: unknown): Result<void, AnalysisError> {
-    return this.#admitCaptureValue(value, new Set(), 0, false);
+    return admitAnalysisViewData(value, false, (bytes) =>
+      this.#retain(bytes) ? ok(undefined) : this.#overBudget(),
+    );
   }
 
   /** Admit the complete portable envelope before cloning or authenticating it. */
   admitInlineEvidence(value: unknown): Result<void, AnalysisError> {
-    return this.#admitCaptureValue(value, new Set(), 0, true);
-  }
-
-  #admitCaptureValue(
-    value: unknown,
-    ancestors: Set<object>,
-    depth: number,
-    inline: boolean,
-  ): Result<void, AnalysisError> {
-    // Capture records add three levels before reported; inline Evidence adds one.
-    if (
-      depth > MAX_JSON_DEPTH + (inline ? 4 : 3) ||
-      (typeof value === "object" && value !== null && ancestors.has(value))
-    )
-      return this.#invalidCapture();
-    if (!this.#retain(CAPTURE_MEMBER_BYTES)) return this.#overBudget();
-    // Evidence authentication encodes strings and object keys for hashing.
-    // Keep that allowance live alongside the envelope clone and projection.
-    if (
-      inline &&
-      typeof value === "string" &&
-      !this.#retain(textBytes(value.length))
-    )
-      return this.#overBudget();
-    if (typeof value !== "object" || value === null) return ok(undefined);
-    if (!this.#retain(CAPTURE_CONTAINER_BYTES)) return this.#overBudget();
-    ancestors.add(value);
-    // Walk depth-first without building a second capture graph. Member charges
-    // include key enumeration; aliases count each time the schema copies them.
-    if (Array.isArray(value)) {
-      for (let index = 0; index < value.length; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(value, index);
-        if (descriptor === undefined || !Object.hasOwn(descriptor, "value"))
-          return this.#invalidCapture();
-        const admitted = this.#admitCaptureValue(
-          descriptor.value,
-          ancestors,
-          depth + 1,
-          inline,
-        );
-        if (!admitted.ok) return admitted;
-      }
-    } else {
-      const prototype: unknown = Object.getPrototypeOf(value);
-      if (prototype !== Object.prototype && prototype !== null)
-        return this.#invalidCapture();
-      // Zod reads named fields even when they are non-enumerable.
-      for (const key of Object.getOwnPropertyNames(value)) {
-        if (inline && !this.#retain(textBytes(key.length)))
-          return this.#overBudget();
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (descriptor === undefined || !Object.hasOwn(descriptor, "value"))
-          return this.#invalidCapture();
-        const admitted = this.#admitCaptureValue(
-          descriptor.value,
-          ancestors,
-          depth + 1,
-          inline,
-        );
-        if (!admitted.ok) return admitted;
-      }
-    }
-    ancestors.delete(value);
-    return ok(undefined);
-  }
-
-  #invalidCapture(): Result<never, AnalysisError> {
-    return err(
-      new AnalysisInputError("inspect_analysis_view", undefined, [
-        {
-          path: ["source"],
-          reason: "invalid_value",
-          message:
-            "Parent capture must contain bounded ordinary JSON data without cycles or accessors.",
-        },
-      ]),
+    return admitAnalysisViewData(value, true, (bytes) =>
+      this.#retain(bytes) ? ok(undefined) : this.#overBudget(),
     );
   }
 
@@ -305,7 +234,9 @@ export class WebNetworkApiSurfaceAccumulator {
     if (!this.#temporary(RECORD_SCRATCH_BYTES + textBytes(url.length)))
       return this.#overBudget();
     try {
-      const parsed = parseRecordedTransportUrl(url);
+      const parsed = parseRecordedTransportUrl(url, {
+        includeQuery: this.includeQueryParameterNames,
+      });
       if (parsed.origin === null)
         return this.#exclude(record.ordinal, "url-unparseable");
       if (typeof method !== "string" || method.length === 0)
@@ -325,6 +256,8 @@ export class WebNetworkApiSurfaceAccumulator {
         return this.#overBudget();
       const route = this.#route(parsed.path);
       if (!route.ok) return route;
+      const queryNames = this.#queryNames(parsed.query);
+      if (!queryNames.ok) return queryNames;
       return this.#append(
         record.ordinal,
         method,
@@ -332,11 +265,32 @@ export class WebNetworkApiSurfaceAccumulator {
         route.value,
         typeof status === "number" && status !== 0 ? status : null,
         mediaTypeEssence(rawMime),
+        queryNames.value,
       );
     } finally {
       // Per-record strings and descriptors never become cumulative scratch.
       this.#temporaryBytes = 0;
     }
+  }
+
+  #queryNames(
+    query: string | undefined,
+  ): Result<ReadonlySet<string> | undefined, AnalysisError> {
+    if (query === undefined) return ok(undefined);
+    // Reserve form-parser tuples, decoded strings, the iterator and the name
+    // set before URLSearchParams materializes them. Delimiter count is an upper
+    // bound: empty query pairs are ignored by the WHATWG parser.
+    let pairs = query.length > 1 ? 1 : 0;
+    for (const character of query) if (character === "&") pairs += 1;
+    if (
+      !this.#temporary(
+        RECORD_SCRATCH_BYTES +
+          textBytes(query.length) +
+          pairs * ENTRY_BYTES * 4,
+      )
+    )
+      return this.#overBudget();
+    return ok(new Set(parseUrlQueryParameterNames(query)));
   }
 
   #append(
@@ -346,6 +300,7 @@ export class WebNetworkApiSurfaceAccumulator {
     route: Route,
     status: number | null,
     mime: string | null,
+    queryNames: ReadonlySet<string> | undefined,
   ): Result<void, AnalysisError> {
     let group = this.#buckets
       .get(method)
@@ -371,6 +326,14 @@ export class WebNetworkApiSurfaceAccumulator {
     if (status !== null && !group?.statuses.has(status)) bytes += ENTRY_BYTES;
     if (mime !== null && !group?.contentTypes.has(mime))
       bytes += ENTRY_BYTES + textBytes(mime.length);
+    if (queryNames !== undefined) {
+      if (group === undefined) bytes += CAPTURE_CONTAINER_BYTES;
+      for (const name of queryNames) {
+        bytes += ENTRY_BYTES; // This name's source ordinal, once per record.
+        if (!group?.queryNames?.has(name))
+          bytes += ENTRY_BYTES + textBytes(name.length);
+      }
+    }
     // Reserve the whole mutation while route scratch is still live. No sets,
     // map entries, arrays or new observed values are retained before admission.
     if (!this.#retain(bytes)) return this.#overBudget();
@@ -387,6 +350,7 @@ export class WebNetworkApiSurfaceAccumulator {
         ordinals: [],
         statuses: new Set(),
         contentTypes: new Set(),
+        ...(queryNames === undefined ? {} : { queryNames: new Map() }),
       };
       const byOrigin = this.#buckets.get(method) ?? new Map();
       this.#buckets.set(method, byOrigin);
@@ -404,6 +368,13 @@ export class WebNetworkApiSurfaceAccumulator {
     if (status === null || mime === null) this.#unavailableResponse = true;
     if (status !== null) group.statuses.add(status);
     if (mime !== null) group.contentTypes.add(mime);
+    if (queryNames !== undefined && group.queryNames !== undefined) {
+      for (const name of queryNames) {
+        const ordinals = group.queryNames.get(name);
+        if (ordinals === undefined) group.queryNames.set(name, [ordinal]);
+        else ordinals.push(ordinal);
+      }
+    }
     return ok(undefined);
   }
 
@@ -440,6 +411,16 @@ export class WebNetworkApiSurfaceAccumulator {
         record_ordinals: [...group.ordinals],
         statuses: [...group.statuses].sort((a, b) => a - b),
         content_types: [...group.contentTypes].sort(compare),
+        ...(group.queryNames === undefined
+          ? {}
+          : {
+              query_parameter_names: [...group.queryNames]
+                .sort(([a], [b]) => compare(a, b))
+                .map(([name, record_ordinals]) => ({
+                  name,
+                  record_ordinals: [...record_ordinals],
+                })),
+            }),
         flags: [
           ...(group.ordinals.length === 1 ? ["single-sample" as const] : []),
           ...(group.statuses.size > 1 ? ["mixed-statuses" as const] : []),

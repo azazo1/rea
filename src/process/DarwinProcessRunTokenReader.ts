@@ -5,6 +5,17 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
+import {
+  DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS,
+  providerStartupTimeoutSchema,
+} from "../config/providerStartupTimeout.js";
+import { err, ok, type Result } from "../domain/result.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import type {
+  AnalysisCapturedOutput,
+  AnalysisError,
+} from "../domain/analysisErrorBase.js";
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { safeParseJson } from "../domain/safeJson.js";
 import { boundedUtf8Text } from "./boundedUtf8Text.js";
 import { execFileOutput, execFileOutputFailure } from "./ExecFileOutput.js";
@@ -73,27 +84,96 @@ const sourceFiles = [
  */
 export const SWIFTC_INTERRUPT = "SIGINT";
 
-/** Deadline for the one-shot helper compilation. */
-const COMPILER_TIMEOUT_MS = 60_000;
+/**
+ * Resolve the Darwin ownership-helper compile deadline from an explicit option
+ * or `REA_SWIFTC_COMPILE_TIMEOUT_MS`. The default matches the measured fresh
+ * Swift SDK cache on the supported Intel macOS VM (about 88s), so compilation
+ * stays bounded independently of short provider version probes. Invalid ambient
+ * values fall back to the default; `parseConfig` still rejects them at CLI/MCP
+ * admission.
+ */
+export const resolveSwiftcCompileTimeoutMs = (
+  options: {
+    readonly compileTimeoutMs?: number;
+    readonly environment?: Readonly<Record<string, string | undefined>>;
+  } = {},
+): number => {
+  if (options.compileTimeoutMs !== undefined) return options.compileTimeoutMs;
+  const raw = (options.environment ?? process.env)
+    .REA_SWIFTC_COMPILE_TIMEOUT_MS;
+  if (raw === undefined) return DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS;
+  const parsed = providerStartupTimeoutSchema.safeParse(raw);
+  return parsed.success ? parsed.data : DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS;
+};
 
 /** Bound on compiler diagnostics embedded in the inspection failure text. */
 const STDERR_EXCERPT_LIMIT = 512;
 
 /** The native Darwin process-ownership reader could not be prepared. */
 export class DarwinProcessOwnershipInspectionError extends Error {
+  readonly #cleanupOwner: { close(): Promise<void> } | undefined;
+  get cleanupOwner(): { close(): Promise<void> } | undefined {
+    return this.#cleanupOwner;
+  }
   constructor(
     message: string,
     options?: ErrorOptions & {
       readonly compilerOutcome?: DarwinCompilerOutcome;
+      readonly capturedOutput?: AnalysisCapturedOutput;
+      readonly cleanupOwner?: { close(): Promise<void> } | undefined;
+      readonly cleanupFailure?: AnalysisError;
+      readonly cancellation?: { readonly reason: unknown };
     },
   ) {
-    const { compilerOutcome, ...errorOptions } = options ?? {};
+    const {
+      compilerOutcome,
+      capturedOutput,
+      cleanupFailure,
+      cleanupOwner,
+      cancellation,
+      ...errorOptions
+    } = options ?? {};
     super(message, errorOptions);
     this.name = "DarwinProcessOwnershipInspectionError";
     this.compilerOutcome = compilerOutcome;
+    this.capturedOutput = capturedOutput;
+    this.#cleanupOwner = cleanupOwner;
+    this.cleanupFailure = cleanupFailure;
+    this.cancellation = cancellation;
   }
 
   readonly compilerOutcome: DarwinCompilerOutcome | undefined;
+  readonly capturedOutput: AnalysisCapturedOutput | undefined;
+  readonly cleanupFailure: AnalysisError | undefined;
+  readonly cancellation: { readonly reason: unknown } | undefined;
+
+  /** Preserve the physical preparation failure while following the exact cleanup owner. */
+  withCleanupFailure(
+    cleanup: AnalysisError,
+    owner?: { close(): Promise<void> },
+  ): DarwinProcessOwnershipInspectionError {
+    const combined =
+      this.cleanupFailure === undefined || this.cleanupFailure === cleanup
+        ? cleanup
+        : analysisErrorWithCleanupFailure(
+            this.cleanupFailure,
+            cleanup,
+          ).bindCleanupDependencies([this.cleanupFailure, cleanup]);
+    return new DarwinProcessOwnershipInspectionError(this.message, {
+      ...(Object.hasOwn(this, "cause") ? { cause: this.cause } : {}),
+      ...(this.compilerOutcome === undefined
+        ? {}
+        : { compilerOutcome: this.compilerOutcome }),
+      ...(this.capturedOutput === undefined
+        ? {}
+        : { capturedOutput: this.capturedOutput }),
+      cleanupFailure: combined,
+      cleanupOwner: owner ?? this.cleanupOwner,
+      ...(this.cancellation === undefined
+        ? {}
+        : { cancellation: this.cancellation }),
+    });
+  }
 }
 
 /** Explicit, bounded outcome from compiling REA's Darwin ownership helper. */
@@ -107,22 +187,28 @@ export interface DarwinCompilerOutcome {
   readonly code: string | number | null;
   readonly signal: string | null;
   readonly stderr: string;
-  readonly stderrBytes: number;
+  readonly stderrBytes?: number;
   readonly stderrTruncated: boolean;
   readonly outputTruncated: boolean;
   readonly killed: boolean;
   readonly timeoutMs?: number;
 }
 
-const MAX_COMPILER_STDERR_BYTES = 8 * 1024;
+const MAX_COMPILER_OUTPUT_BYTES = 8 * 1024;
 
-const compilerOutcome = (
+const compilerFailureFacts = (
   cause: unknown,
   timeoutMs: number,
-): DarwinCompilerOutcome | undefined => {
+):
+  | {
+      readonly outcome: DarwinCompilerOutcome;
+      readonly capturedOutput: AnalysisCapturedOutput;
+    }
+  | undefined => {
   const failure = execFileOutputFailure(cause);
   if (failure === undefined) return undefined;
-  const stderr = boundedUtf8Text(failure.stderr, MAX_COMPILER_STDERR_BYTES);
+  const stderr = boundedUtf8Text(failure.stderr, MAX_COMPILER_OUTPUT_BYTES);
+  const stdout = boundedUtf8Text(failure.stdout, MAX_COMPILER_OUTPUT_BYTES);
   const outcome =
     failure.code === "ETIMEDOUT"
       ? "timed_out"
@@ -134,15 +220,33 @@ const compilerOutcome = (
             ? "spawn_failed"
             : "failed";
   return {
-    outcome,
-    code: failure.code,
-    signal: failure.signal,
-    stderr: stderr.text,
-    stderrBytes: Buffer.byteLength(failure.stderr, "utf8"),
-    stderrTruncated: stderr.truncated,
-    outputTruncated: failure.outputTruncated,
-    killed: failure.killed,
-    ...(outcome === "timed_out" ? { timeoutMs } : {}),
+    outcome: {
+      outcome,
+      code: failure.code,
+      signal: failure.signal,
+      stderr: stderr.text,
+      ...(failure.stderrBytes === undefined
+        ? {}
+        : { stderrBytes: failure.stderrBytes }),
+      stderrTruncated: stderr.truncated,
+      outputTruncated: failure.outputTruncated,
+      killed: failure.killed,
+      ...(outcome === "timed_out" ? { timeoutMs } : {}),
+    },
+    capturedOutput: {
+      stdout: stdout.text,
+      stderr: stderr.text,
+      truncated:
+        stdout.truncated || stderr.truncated || failure.outputTruncated,
+      ...(failure.stdoutBytes === undefined
+        ? {}
+        : { stdout_bytes: failure.stdoutBytes }),
+      ...(failure.stderrBytes === undefined
+        ? {}
+        : { stderr_bytes: failure.stderrBytes }),
+      exit_code: typeof failure.code === "number" ? failure.code : null,
+      signal: failure.signal,
+    },
   };
 };
 
@@ -165,7 +269,8 @@ const compilerInspectionError = (
   timeoutMs: number,
   compiler: DarwinProcessReaderCompiler,
 ): DarwinProcessOwnershipInspectionError => {
-  const outcome = compilerOutcome(cause, timeoutMs);
+  const facts = compilerFailureFacts(cause, timeoutMs);
+  const outcome = facts?.outcome;
   const code = outcome?.code ?? "unknown";
   const description = compilerOutcomeDescription(outcome, code);
   const launcher =
@@ -191,14 +296,27 @@ const compilerInspectionError = (
     `${prefix} (${description})${suffix}`,
     {
       cause,
-      ...(outcome === undefined ? {} : { compilerOutcome: outcome }),
+      ...(facts === undefined
+        ? {}
+        : {
+            compilerOutcome: facts.outcome,
+            capturedOutput: facts.capturedOutput,
+          }),
     },
   );
 };
 
+/** One allocated helper root, including its shared finalization and live cleanup status. */
+interface ProcessReaderRoot {
+  readonly path: string;
+  cleanupPromise?: Promise<void> | undefined;
+  cleanupAnchor?: ProviderCleanupError | undefined;
+}
+
 interface ProcessReaderCompilation {
   readonly controller: AbortController;
-  promise: Promise<string>;
+  promise: Promise<Result<string, unknown>>;
+  primaryFailure?: { readonly cause: unknown };
   waiters: number;
   aborting: boolean;
   settled: boolean;
@@ -216,25 +334,32 @@ const isExpectedAbort = (cause: unknown, signal: AbortSignal): boolean =>
   (cause === signal.reason ||
     (cause instanceof Error && cause.name === "AbortError"));
 
+type CompilationWaitOutcome =
+  | { readonly kind: "completed"; readonly result: Result<string, unknown> }
+  | { readonly kind: "cancelled"; readonly reason: unknown };
+
 const waitForCompilation = async (
-  promise: Promise<string>,
+  operation: ProcessReaderCompilation,
   signal: AbortSignal | undefined,
-): Promise<string> => {
-  if (signal === undefined) return promise;
-  if (signal.aborted) throw abortReason(signal);
-  return new Promise((resolve, reject) => {
+): Promise<CompilationWaitOutcome> => {
+  if (signal === undefined)
+    return { kind: "completed", result: await operation.promise };
+  return new Promise((resolve) => {
     let completed = false;
-    const finish = (callback: () => void) => {
+    const finish = (outcome: CompilationWaitOutcome) => {
       if (completed) return;
       completed = true;
       signal.removeEventListener("abort", onAbort);
-      callback();
+      resolve(outcome);
     };
-    const onAbort = () => finish(() => reject(abortReason(signal)));
+    const onAbort = () => {
+      // Finalization belongs to an already observed physical failure.
+      if (operation.primaryFailure !== undefined) return;
+      finish({ kind: "cancelled", reason: signal.reason });
+    };
     signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (value) => finish(() => resolve(value)),
-      (cause: unknown) => finish(() => reject(cause)),
+    void operation.promise.then((result) =>
+      finish({ kind: "completed", result }),
     );
     if (signal.aborted) onAbort();
   });
@@ -253,8 +378,10 @@ export type DarwinProcessReaderCompiler =
 export const createDarwinProcessRunTokenReader = (
   options: {
     readonly compiler?: DarwinProcessReaderCompiler;
-    /** Deadline for the helper compilation; the default keeps verification fast. */
+    /** Deadline for helper compilation, independent of provider execution. */
     readonly compileTimeoutMs?: number;
+    /** Environment consulted when `compileTimeoutMs` is omitted. */
+    readonly environment?: Readonly<Record<string, string | undefined>>;
     /**
      * Caller-owned directory holding the compiler's module cache. Unset keeps
      * Swift's reusable default cache; a supplied directory outlives this
@@ -267,9 +394,9 @@ export const createDarwinProcessRunTokenReader = (
     kind: "xcrun",
     executable: "/usr/bin/xcrun",
   };
-  const compilerTimeoutMs = options.compileTimeoutMs ?? COMPILER_TIMEOUT_MS;
+  const compilerTimeoutMs = resolveSwiftcCompileTimeoutMs(options);
   const moduleCachePath = options.moduleCachePath ?? "";
-  let root: string | undefined;
+  let root: ProcessReaderRoot | undefined;
   let executable: string | undefined;
   let compilation: ProcessReaderCompilation | undefined;
   let closePromise: Promise<void> | undefined;
@@ -277,19 +404,48 @@ export const createDarwinProcessRunTokenReader = (
   let exitCleanupInstalled = false;
 
   const cleanupAtExit = () => {
-    if (root !== undefined) rmSync(root, { recursive: true, force: true });
+    if (root !== undefined) rmSync(root.path, { recursive: true, force: true });
   };
-  const cleanupRoot = async (target = root): Promise<void> => {
-    if (target === undefined) return;
-    await rm(target, { recursive: true, force: true });
-    if (root !== target) return;
-    root = undefined;
-    executable = undefined;
-    if (exitCleanupInstalled) process.removeListener("exit", cleanupAtExit);
-    exitCleanupInstalled = false;
+  const cleanupRoot = (target = root): Promise<void> => {
+    if (target === undefined) return Promise.resolve();
+    target.cleanupPromise ??= Promise.resolve()
+      .then(async () => {
+        try {
+          await rm(target.path, { recursive: true, force: true });
+        } catch (cause: unknown) {
+          const failure = new ProviderCleanupError(
+            "process-ownership",
+            [target.path],
+            {
+              reason:
+                "The Darwin ownership helper root remains owned until removal succeeds.",
+            },
+            { cause, operation: "prepare_owned_process" },
+          );
+          if (target.cleanupAnchor === undefined)
+            target.cleanupAnchor = failure;
+          else failure.bindCleanupDependencies([target.cleanupAnchor]);
+          throw failure;
+        }
+        target.cleanupAnchor?.resolveCleanup();
+        target.cleanupAnchor = undefined;
+        if (root !== target) return;
+        root = undefined;
+        executable = undefined;
+        if (exitCleanupInstalled) process.removeListener("exit", cleanupAtExit);
+        exitCleanupInstalled = false;
+      })
+      .catch((cause: unknown) => {
+        target.cleanupPromise = undefined;
+        throw cause;
+      });
+    return target.cleanupPromise;
   };
-  const runCompilation = async (signal: AbortSignal): Promise<string> => {
-    let operationRoot: string | undefined;
+  const runCompilation = async (
+    operation: ProcessReaderCompilation,
+  ): Promise<string> => {
+    const signal = operation.controller.signal;
+    let operationRoot: ProcessReaderRoot | undefined;
     try {
       if (
         compiler.kind === "swiftc" &&
@@ -299,15 +455,17 @@ export const createDarwinProcessRunTokenReader = (
           "Direct Darwin helper compilation requires absolute REA_DARWIN_SWIFTC_PATH and SDKROOT paths selecting a compatible installed Swift compiler and macOS SDK.",
         );
       }
-      operationRoot = await mkdtemp(join(tmpdir(), "rea-process-token-"));
+      operationRoot = {
+        path: await mkdtemp(join(tmpdir(), "rea-process-token-")),
+      };
       root = operationRoot;
       process.once("exit", cleanupAtExit);
       exitCleanupInstalled = true;
       if (signal.aborted || closed) throw abortReason(signal);
-      const output = join(operationRoot, "reader");
+      const output = join(operationRoot.path, "reader");
       // swiftc keeps intermediate objects under TMPDIR, so keep them inside
       // the root that cleanup removes.
-      const compilerTemporary = join(operationRoot, "tmp");
+      const compilerTemporary = join(operationRoot.path, "tmp");
       await mkdir(compilerTemporary);
       const compilerEnvironment: NodeJS.ProcessEnv = {
         ...process.env,
@@ -342,10 +500,23 @@ export const createDarwinProcessRunTokenReader = (
       executable = output;
       return output;
     } catch (cause: unknown) {
-      const ownsRoot = operationRoot !== undefined && root === operationRoot;
+      operation.primaryFailure = { cause };
       if (operationRoot !== undefined) {
-        if (ownsRoot) await cleanupRoot(operationRoot);
-        else await rm(operationRoot, { recursive: true, force: true });
+        try {
+          await cleanupRoot(operationRoot);
+        } catch (cleanup: unknown) {
+          if (!(cleanup instanceof ProviderCleanupError)) throw cleanup;
+          const primary =
+            cause instanceof DarwinProcessOwnershipInspectionError
+              ? cause
+              : new DarwinProcessOwnershipInspectionError(
+                  "Darwin process ownership helper preparation failed",
+                  { cause },
+                );
+          throw primary.withCleanupFailure(cleanup, {
+            close: () => cleanupRoot(operationRoot),
+          });
+        }
       }
       throw cause;
     }
@@ -355,10 +526,13 @@ export const createDarwinProcessRunTokenReader = (
     const controller = new AbortController();
     const operation: ProcessReaderCompilation = {
       controller,
-      promise: runCompilation(controller.signal).finally(() => {
-        operation.settled = true;
-        if (compilation === operation) compilation = undefined;
-      }),
+      promise: Promise.resolve()
+        .then(() => runCompilation(operation))
+        .then(ok, err)
+        .finally(() => {
+          operation.settled = true;
+          if (compilation === operation) compilation = undefined;
+        }),
       waiters: 0,
       aborting: false,
       settled: false,
@@ -380,30 +554,49 @@ export const createDarwinProcessRunTokenReader = (
       }
       let operation = compilation;
       if (operation?.aborting === true) {
-        try {
-          await waitForCompilation(operation.promise, signal);
-        } catch (cause: unknown) {
-          if (signal !== undefined && isExpectedAbort(cause, signal))
-            throw cause;
-        }
+        const waited = await waitForCompilation(operation, signal);
+        if (waited.kind === "cancelled") throw waited.reason;
+        if (
+          !waited.result.ok &&
+          waited.result.error instanceof
+            DarwinProcessOwnershipInspectionError &&
+          waited.result.error.cleanupFailure !== undefined
+        )
+          throw waited.result.error;
         continue;
       }
       operation ??= beginCompilation();
       operation.waiters += 1;
-      try {
-        return await waitForCompilation(operation.promise, signal);
-      } finally {
-        operation.waiters -= 1;
+      const waited = await waitForCompilation(operation, signal);
+      operation.waiters -= 1;
+      if (
+        operation.waiters === 0 &&
+        !operation.settled &&
+        !operation.aborting
+      ) {
+        operation.aborting = true;
+        operation.controller.abort();
+        const finalized = await operation.promise;
         if (
-          operation.waiters === 0 &&
-          !operation.settled &&
-          !operation.aborting
+          waited.kind === "cancelled" &&
+          !finalized.ok &&
+          finalized.error instanceof DarwinProcessOwnershipInspectionError &&
+          finalized.error.cleanupFailure !== undefined
         ) {
-          operation.aborting = true;
-          operation.controller.abort();
-          await operation.promise.catch(() => undefined);
+          throw new DarwinProcessOwnershipInspectionError(
+            "Darwin process ownership helper preparation was cancelled",
+            {
+              cause: waited.reason,
+              cancellation: { reason: waited.reason },
+              cleanupFailure: finalized.error.cleanupFailure,
+              cleanupOwner: finalized.error.cleanupOwner,
+            },
+          );
         }
       }
+      if (waited.kind === "cancelled") throw waited.reason;
+      if (!waited.result.ok) throw waited.result.error;
+      return waited.result.value;
     }
   };
 
@@ -513,7 +706,7 @@ export const createDarwinProcessRunTokenReader = (
       if (operation !== undefined && !operation.settled) {
         operation.aborting = true;
         operation.controller.abort();
-        await operation.promise.catch(() => undefined);
+        await operation.promise;
       }
       await cleanupRoot();
     })().catch((cause: unknown) => {

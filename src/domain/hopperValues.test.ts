@@ -2,17 +2,26 @@ import { describe, expect, it } from "vitest";
 
 import {
   functionBodySchema,
+  addressDistance,
   procedureIdentitySchema,
   parseDocuments,
   parseListCount,
   parseNames,
   parseProcedures,
   parseRelatedAddresses,
-  parseSegmentImageBase,
   parseSegments,
 } from "./hopperValues.js";
 
 describe("Hopper boundary values", () => {
+  it("distinguishes measured zero, malformed, incomparable, reversed, and oversized extents", () => {
+    expect(addressDistance("not-an-address", "0x2000")).toBeNull();
+    expect(addressDistance("ram:0x1000", "rom:0x2000")).toBeNull();
+    expect(addressDistance("0x2000", "0x1000")).toBeNull();
+    expect(addressDistance("0x1000", "0x1000")).toBe(0);
+    expect(addressDistance("0x1000", "0x2000")).toBe(4096);
+    expect(addressDistance("0x0", "0x20000000000000")).toBeNull();
+  });
+
   it("parses Hopper's address-keyed name and string maps", () => {
     expect(parseNames({ "0x1000": "_main" })).toEqual({
       ok: true,
@@ -66,19 +75,6 @@ describe("Hopper boundary values", () => {
       ok: true,
       value: ["fixture"],
     });
-    expect(
-      parseSegmentImageBase([
-        { image_base: "0x100000" },
-        { image_base: "0x100000" },
-      ]),
-    ).toBe("0x100000");
-    expect(
-      parseSegmentImageBase([
-        { image_base: "0x100000" },
-        { image_base: "0x200000" },
-      ]),
-    ).toBeUndefined();
-    expect(parseSegmentImageBase([{ name: "__TEXT" }])).toBeUndefined();
   });
 
   it.each([
@@ -92,9 +88,21 @@ describe("Hopper boundary values", () => {
     (_label, parse) => {
       const result = parse();
       expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.error._tag).toBe("HopperProtocolError");
+      if (!result.ok) expect(result.error._tag).toBe("AnalysisOutputError");
     },
   );
+
+  it("uses provider-neutral wording for malformed shared values", () => {
+    const result = parseSegments([{ name: 1 }]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error._tag).toBe("AnalysisOutputError");
+      expect(result.error.operation).toBe("list_segments");
+      expect(result.error.reason).toBe(
+        "Provider returned an invalid segment list",
+      );
+    }
+  });
 });
 
 describe("provider-neutral inclusive function body evidence", () => {

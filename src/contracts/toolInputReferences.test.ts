@@ -5,8 +5,40 @@ import { z } from "zod";
 
 import { presentInputJsonSchema } from "./inputSchemaPresentation.js";
 import { toolContract } from "./toolContracts.js";
-import { toolInputSchemaWithMetadata } from "./toolSchemaMetadata.js";
+import {
+  toolInputSchemaWithMetadata,
+  transformAdvertisedInputJsonSchema,
+} from "./toolSchemaMetadata.js";
 import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "./javascript/javascriptRuntimeReconciliationExample.js";
+
+it.each(["draft-2020-12", "draft-07"] as const)(
+  "honors projection options independently of cached wire transformations in %s",
+  (target) => {
+    const range = z.strictObject({ offset: z.number(), length: z.number() });
+    const canonical = z.strictObject({ before: range, after: range });
+    const transform = (schema: Record<string, unknown>) => ({
+      ...schema,
+      title: "Transformed range inputs",
+    });
+    const options = { target, libraryOptions: { reused: "ref" as const } };
+    for (const sharedFirst of [false, true]) {
+      const wrapped = transformAdvertisedInputJsonSchema(canonical, transform);
+      const project = wrapped["~standard"].jsonSchema.input;
+      if (sharedFirst) project(options);
+      const advertised = project({ target });
+      expect(JSON.stringify(advertised)).not.toContain('"$ref":');
+      expect(advertised).toEqual(
+        transform(canonical["~standard"].jsonSchema.input({ target })),
+      );
+      const shared = project(options);
+      expect(JSON.stringify(shared)).toContain('"$ref":');
+      expect(shared).toEqual(
+        transform(canonical["~standard"].jsonSchema.input(options)),
+      );
+      expect(project({ target })).toBe(advertised);
+    }
+  },
+);
 
 it.each(["draft-2020-12", "draft-07"] as const)(
   "preserves the complete inline Evidence contract before deferred authentication in %s",
@@ -35,7 +67,41 @@ it.each(["draft-2020-12", "draft-07"] as const)(
   },
 );
 
-describe("advertised input references", () => {
+describe("advertised object dependencies", () => {
+  it.each([
+    ["draft-07", "dependencies"],
+    ["draft-2020-12", "dependentRequired"],
+  ] as const)(
+    "presents object-group dependencies as guidance without unsupported dialect keywords (%s)",
+    (dialect, dependencyKeyword) => {
+      const advertised = presentInputJsonSchema(
+        {
+          $schema:
+            dialect === "draft-07"
+              ? "http://json-schema.org/draft-07/schema#"
+              : "https://json-schema.org/draft/2020-12/schema",
+          type: "object",
+          properties: { url: { type: "string" }, body: { type: "string" } },
+          required: ["body"],
+          [dependencyKeyword]: { body: ["url"] },
+        },
+        () => undefined,
+      );
+      expect(advertised.$schema).toBe(
+        dialect === "draft-07"
+          ? "http://json-schema.org/draft-07/schema#"
+          : "https://json-schema.org/draft/2020-12/schema",
+      );
+      expect(advertised).not.toHaveProperty("dependencies");
+      expect(advertised).not.toHaveProperty("dependentRequired");
+      expect(advertised.description).toContain(
+        "When body is provided, also provide url.",
+      );
+    },
+  );
+});
+
+describe("advertised production selector contracts", () => {
   it.each(["draft-2020-12", "draft-07"] as const)(
     "preserves production native-selector constraints in %s",
     (target) => {
@@ -84,7 +150,9 @@ describe("advertised input references", () => {
       expect(validate(unexpected)).toBe(false);
     },
   );
+});
 
+describe("advertised schema metadata and validation", () => {
   it.each(["draft-2020-12", "draft-07"] as const)(
     "retains specialized descriptions, literal metadata and strict validation in %s",
     (target) => {
@@ -235,12 +303,20 @@ describe("root input presentation", () => {
         { before: "first" },
         { unexpected: true },
         { before_scenario: 1, after_scenario: "wrong" },
-        { before_scenario: 1, normalization: true },
-        { after_scenario: 2, normalization: true },
       ]) {
         expect(schema.safeParse(input).success).toBe(false);
         expect(validate(input)).toBe(false);
       }
+      // The vendor-safe advertisement uses group guidance instead of
+      // dependentRequired; the canonical runtime parser keeps exact unions.
+      expect(
+        schema.safeParse({ before_scenario: 1, normalization: true }).success,
+      ).toBe(false);
+      expect(validate({ before_scenario: 1, normalization: true })).toBe(true);
+      expect(
+        schema.safeParse({ after_scenario: 2, normalization: true }).success,
+      ).toBe(false);
+      expect(validate({ after_scenario: 2, normalization: true })).toBe(true);
       // Cross-group exclusion is enforced only by the canonical runtime parser.
       const mixed = {
         before: "first",
@@ -301,5 +377,195 @@ describe("root input presentation", () => {
       examples: [literal],
       enum: [literal],
     });
+  });
+});
+
+describe("advertised Boolean literals", () => {
+  it("keeps canonical boolean-literal inputs accepted after advertisement", () => {
+    const canonical = {
+      type: "object",
+      properties: {
+        enabled: { type: "boolean", const: false },
+      },
+      required: ["enabled"],
+      additionalProperties: false,
+    };
+    const advertised = presentInputJsonSchema(canonical, () => undefined);
+    const canonicalValidate = new Ajv2020({ strict: false }).compile(canonical);
+    const advertisedValidate = new Ajv2020({ strict: false }).compile(
+      advertised,
+    );
+
+    expect(canonicalValidate({ enabled: false })).toBe(true);
+    expect(canonicalValidate({ enabled: true })).toBe(false);
+    expect(advertisedValidate({ enabled: false })).toBe(true);
+    expect(advertisedValidate({ enabled: true })).toBe(true);
+    expect(advertised.properties).toEqual({ enabled: { type: "boolean" } });
+  });
+
+  it("drops affected negation and conditional groups without rejecting canonical inputs", () => {
+    const negated = {
+      type: "object",
+      properties: {
+        flag: { type: "boolean", not: { const: false } },
+      },
+    };
+    const negatedAdvertisement = presentInputJsonSchema(
+      negated,
+      () => undefined,
+    );
+    const canonicalNegated = new Ajv2020({ strict: false }).compile(negated);
+    const advertisedNegated = new Ajv2020({ strict: false }).compile(
+      negatedAdvertisement,
+    );
+    expect(canonicalNegated({ flag: true })).toBe(true);
+    expect(canonicalNegated({ flag: false })).toBe(false);
+    expect(advertisedNegated({ flag: true })).toBe(true);
+
+    const conditional = {
+      type: "object",
+      properties: {
+        choice: {
+          if: { const: false },
+          then: { type: "string" },
+          else: { type: "boolean" },
+        },
+      },
+    };
+    const conditionalAdvertisement = presentInputJsonSchema(
+      conditional,
+      () => undefined,
+    );
+    const canonicalConditional = new Ajv2020({ strict: false }).compile(
+      conditional,
+    );
+    const advertisedConditional = new Ajv2020({ strict: false }).compile(
+      conditionalAdvertisement,
+    );
+    expect(canonicalConditional({ choice: true })).toBe(true);
+    expect(advertisedConditional({ choice: true })).toBe(true);
+    expect(conditionalAdvertisement.properties).toEqual({
+      choice: {},
+    });
+  });
+});
+
+describe("advertised Boolean schema composition", () => {
+  it("widens an affected oneOf to anyOf when branches could overlap", () => {
+    const canonical = {
+      type: "object",
+      properties: {
+        flag: {
+          oneOf: [{ type: "boolean", const: false }, {}],
+        },
+      },
+    };
+    const advertised = presentInputJsonSchema(canonical, () => undefined);
+    const canonicalValidate = new Ajv2020({ strict: false }).compile(canonical);
+    const advertisedValidate = new Ajv2020({ strict: false }).compile(
+      advertised,
+    );
+    expect(canonicalValidate({ flag: true })).toBe(true);
+    expect(canonicalValidate({ flag: false })).toBe(false);
+    expect(advertisedValidate({ flag: true })).toBe(true);
+    expect(advertised).toHaveProperty(["properties", "flag", "anyOf"]);
+  });
+
+  it("retains nested branch guidance when widening oneOf to anyOf", () => {
+    const canonical = {
+      type: "object",
+      properties: {
+        selection: {
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                source: { type: "string" },
+                mode: { type: "boolean", const: false },
+              },
+              required: ["source", "mode"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                target: { type: "string" },
+                mode: { type: "boolean", const: true },
+              },
+              required: ["target", "mode"],
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+    };
+    const advertised = presentInputJsonSchema(canonical, () => undefined);
+    const canonicalValidate = new Ajv2020({ strict: false }).compile(canonical);
+    const advertisedValidate = new Ajv2020({ strict: false }).compile(
+      advertised,
+    );
+    const example = { selection: { source: "capture.json", mode: false } };
+    expect(canonicalValidate(example)).toBe(true);
+    expect(advertisedValidate(example)).toBe(true);
+    expect(advertised).toMatchObject({
+      properties: {
+        selection: {
+          anyOf: [
+            { properties: { source: { type: "string" } } },
+            { properties: { target: { type: "string" } } },
+          ],
+        },
+      },
+    });
+  });
+
+  it("removes a nested not when widening a boolean item predicate", () => {
+    const canonical = {
+      type: "object",
+      properties: {
+        values: {
+          type: "array",
+          not: { items: { type: "boolean", const: false } },
+        },
+      },
+    };
+    const advertised = presentInputJsonSchema(canonical, () => undefined);
+    const canonicalValidate = new Ajv2020({ strict: false }).compile(canonical);
+    const advertisedValidate = new Ajv2020({ strict: false }).compile(
+      advertised,
+    );
+    expect(canonicalValidate({ values: [true] })).toBe(true);
+    expect(advertisedValidate({ values: [true] })).toBe(true);
+    expect(advertised).toHaveProperty(["properties", "values"], {
+      type: "array",
+    });
+  });
+
+  it("normalizes schema keywords only and preserves literal payloads", () => {
+    const literal = {
+      const: false,
+      enum: [false],
+      properties: { nested: { const: true } },
+    };
+    const presented = presentInputJsonSchema(
+      {
+        type: "object",
+        properties: {
+          default: { type: "boolean", const: false },
+          allowed: { enum: [false, true] },
+          kind: { type: "string", const: "exact" },
+        },
+        default: literal,
+        examples: [literal],
+      },
+      () => undefined,
+    );
+    expect(presented.properties).toEqual({
+      default: { type: "boolean" },
+      allowed: { type: "boolean" },
+      kind: { type: "string", const: "exact" },
+    });
+    expect(presented.default).toEqual(literal);
+    expect(presented.examples).toEqual([literal]);
   });
 });

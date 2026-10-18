@@ -1,7 +1,10 @@
 # Recorded crash evidence
 
 `inspect_recorded_crash` / `rea inspect-recorded-crash` inspect a caller-selected
-Linux ELF64 x86-64 little-endian core independently of an active binary target.
+Linux ELF64 little-endian core independently of an active binary target. Two
+architecture profiles are interpreted, x86-64 and AArch64; each binds registers
+to its own `NT_PRSTATUS` layout, and any other `e_machine` is refused as
+`unsupported_target` before note interpretation.
 
 ```sh
 export REA_PWNTOOLS_PYTHON=/absolute/existing/venv/bin/python
@@ -10,8 +13,8 @@ rea inspect-recorded-crash ./crash.core --json
 
 The selected Python needs unchanged pwntools 4.15.0, pyelftools 0.33 and Unicorn 2.1.2.
 REA does not install these dependencies. ELFFile/its original ELF structures and
-pwntools' original Linux amd64 ctypes provide parsing and ABI layout. The adapter
-adds bounds, representation preservation and lifecycle ownership.
+pwntools' original Linux amd64 and aarch64 ctypes provide parsing and ABI layout.
+The adapter adds bounds, representation preservation and lifecycle ownership.
 The initial Linux note profile accepts System V/unspecified and GNU/Linux OSABI
 with ABI version zero. Other declared ABIs return `unsupported_target` before
 note interpretation; an unspecified OSABI alone does not prove OS origin.
@@ -27,7 +30,8 @@ note interpretation; an unspecified OSABI alone does not prove OS origin.
 - Every exact Linux CORE PRSTATUS note as a separate recorded thread, with
   historical PID, signal and lossless uint64 registers bound to source bytes.
   Each supported note has exactly one interpretation; each thread contains the
-  complete 27-register ABI set, with names bound to their original ABI offsets.
+  complete ABI register set for its architecture (27 registers for amd64,
+  34 for AArch64), with names bound to their original ABI offsets.
   Physical note ranges cannot overlap or leave segment gaps. ELF and note headers
   are independently bound to the snapshot, including extended program counts.
 - Signed SIGINFO number/code/errno. Initially only SIGSEGV codes 1/2 establish the
@@ -57,9 +61,21 @@ The outer provider owns both processes and one stable core snapshot. An owned
 Python launcher lowers inherited soft limits before replacing itself with GDB.
 GDB starts without initfiles, auto-load, debuginfod or automatic shared-library
 loading. Owned empty library search paths and caches are used, with plugin
-updates disabled. Fixed package code verifies a core connection and no paired
-executable before querying mapping candidates. No caller GDB command language is
-exposed. The exact observed GDB/plugin version strings are retained.
+updates disabled. Debug-file lookup is also restricted to the owned empty
+search directory. GDB 16 can otherwise locate the recorded executable independently
+of these settings. While opening the core, fixed package code temporarily selects
+`/proc/self/exe` (the already running debugger) with `exec-file`, without loading
+symbols or running an inferior. This occupies GDB's executable slot and prevents
+its automatic executable discovery. The validated decoder profile selects the
+core architecture explicitly, so the placeholder cannot select it instead. The
+bridge discards that selection with `file` before querying mapping candidates,
+and verifies the core connection and absence of a main symbol file. Before launching GDB, the provider also checks
+source-bound `NT_FILE` descriptors: mapping names must be absolute Unix paths
+without dot segments. Relative names bypass GDB's sysroot, and traversal can
+escape it. Unresolved or unsafe mapping coverage refuses debugger enrichment
+while retaining the basic decoded observation and original bytes. No caller GDB
+command language is exposed. The exact observed GDB/plugin version strings are
+retained.
 
 Mapping names are producer display metadata, with unknown current file identity.
 Map permissions are derived from reported flags; zero/unfamiliar flags leave
@@ -72,9 +88,13 @@ debugger context is `observed`.
 
 Initial Linux x64 limits: 32 MiB input, 64 MiB decoder reply, 1 MiB diagnostics per
 stage, 30 seconds owned wall deadline per stage, 3 GiB address-space soft ceiling
-and 30 seconds CPU soft ceiling. Tighter inherited soft/hard limits are retained;
-hard limits are not raised. Complete oversized results fail explicitly. These
-process limits do not constitute a sandbox for caller-supplied engine code.
+and 30 seconds CPU soft ceiling. `REA_PWNTOOLS_MAX_INPUT_BYTES` raises the input
+bound alone, up to 1 GiB, and returns `provider_unavailable` when it is not a
+decimal integer in range; the reply, diagnostic and deadline bounds stay fixed, so a
+large core that outruns them still fails explicitly instead of partially. Tighter
+inherited soft/hard limits are retained; hard limits are not raised. Complete
+oversized results fail explicitly. These process limits do not constitute a sandbox
+for caller-supplied engine code.
 
 Resource exit statuses need matching private failure-branch markers. Unmarked
 launcher failures retain their actual status/output and unknown resource cause.
@@ -85,4 +105,6 @@ GDB/Python/pwndbg/strace. Fixture generation explicitly launches its owned test
 program; subsequent inspection only reads the resulting core. Real acceptance
 checks recorded threads, high registers, missing/malformed notes, opaque owners,
 CLI/MCP parity, optional debugger context and historical PID collision with an
-owned live sentinel. Original inputs and host configuration remain unchanged.
+owned live sentinel. The syscall trace also rejects access to the still-present
+source executable. The CI workflow defines Ubuntu 24.04 and Debian 13 (GDB 16)
+container lanes. Original inputs and host configuration remain unchanged.

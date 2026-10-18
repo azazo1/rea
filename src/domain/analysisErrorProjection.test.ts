@@ -25,6 +25,91 @@ import { ProviderSelectionError } from "./providerSelectionError.js";
 import { analysisErrorProjectionSchema } from "../contracts/errorSchemas.js";
 import { nativeCallPartialObservationSchema } from "./native/nativeCallPartialObservation.js";
 
+describe("capability failure retry disposition", () => {
+  it.each([
+    { options: {}, retryable: false, category: "unsupported_provider" },
+    {
+      options: { retryable: false },
+      retryable: false,
+      category: "unsupported_provider",
+    },
+    { options: { retryable: true }, retryable: true, category: "unavailable" },
+  ] as const)(
+    "preserves the producer's $retryable disposition",
+    ({ options, retryable, category }) => {
+      const reason = "Native self-test failed with a sharing violation";
+      const projected = projectAnalysisError(
+        new AnalysisCapabilityUnavailableError(
+          "fixture-provider",
+          "inspect",
+          reason,
+          options,
+        ),
+      );
+      expect(projected).toMatchObject({
+        code: "capability_unavailable",
+        category,
+        retryable,
+        details: { reason },
+      });
+      if (retryable) {
+        expect(projected.message).toBe(
+          "Required runtime controls are unavailable for this attempt.",
+        );
+        expect(projected.remediation.action).toContain(
+          "retry the same analysis",
+        );
+      }
+      expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(
+        true,
+      );
+    },
+  );
+
+  it("preserves a caller-selected message for a retryable failure", () => {
+    expect(
+      projectAnalysisError(
+        new AnalysisCapabilityUnavailableError(
+          "fixture-provider",
+          "inspect",
+          "temporary failure",
+          {
+            retryable: true,
+            userMessage: "Selected runtime diagnostic",
+          },
+        ),
+      ).message,
+    ).toBe("Selected runtime diagnostic");
+  });
+
+  it("retains cleanup ownership before allowing a transient operation to retry", () => {
+    expect(
+      projectAnalysisError(
+        new AnalysisCapabilityUnavailableError(
+          "fixture-provider",
+          "inspect",
+          "temporary failure",
+          {
+            retryable: true,
+            cleanup: {
+              reason: "owned handle is still live",
+              resources: ["native-owner"],
+            },
+          },
+        ),
+      ),
+    ).toMatchObject({
+      code: "cleanup_incomplete",
+      retryable: false,
+      details: {
+        cleanup: "incomplete",
+        resources: ["native-owner"],
+        execution_failure: "capability_unavailable",
+      },
+    });
+  });
+});
+
 it("projects a published file receipt alongside retained cleanup failure", () => {
   const projected = projectAnalysisError(
     new EvidenceFileError("write", "io", {
@@ -307,7 +392,30 @@ it("retains native partial observations and cleanup uncertainty on provider fail
   expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(true);
 });
 
-describe("analysis error projection: provider failures", () => {
+describe("analysis error projection: browser provider failures", () => {
+  it("explains the service-worker policy refusal and names its recovery", () => {
+    const projected = projectAnalysisError(
+      new BrowserObservationError(
+        "capture_browser_scenario",
+        "service_worker_blocked",
+      ),
+    );
+
+    expect(projected).toMatchObject({
+      code: "target_unavailable",
+      category: "unavailable",
+      retryable: false,
+      message: expect.stringContaining("service-worker policy is block"),
+      remediation: {
+        action: expect.stringContaining("environment.service_workers to allow"),
+      },
+      details: {
+        operation: "capture_browser_scenario",
+        reason: "service_worker_blocked",
+      },
+    });
+  });
+
   it("projects the primary browser failure alongside incomplete cleanup", () => {
     const projected = projectAnalysisError(
       new BrowserObservationError(
@@ -336,7 +444,9 @@ describe("analysis error projection: provider failures", () => {
       },
     });
   });
+});
 
+describe("analysis error projection: Hopper provider failures", () => {
   it("reports a timed-out active Hopper request and actionable retry guidance", () => {
     const projected = projectAnalysisError(
       new HopperTimeoutError(30_000, "trace_feature", 42, "busy"),
@@ -402,7 +512,9 @@ describe("analysis error projection: provider failures", () => {
       message: expect.stringContaining("Hopper analysis failed"),
     });
   });
+});
 
+describe("analysis error projection: detached provider diagnostics", () => {
   it.each(["adapter", "cancelled", "timeout"])(
     "preserves detached, actionable diagnostics for %s errors",
     (kind) => {
@@ -430,7 +542,9 @@ describe("analysis error projection: provider failures", () => {
       expect(error.diagnostics?.exit_code).toBe(1);
     },
   );
+});
 
+describe("analysis error projection: Hopper startup failures", () => {
   it("maps the Linux startup compatibility exit codes without host internals", () => {
     const expected = [
       [70, "private_display_unavailable"],
@@ -680,6 +794,18 @@ describe("analysis error projection: operational diagnostics", () => {
     expect(unknown.message).toContain("could not determine");
     expect(unknown.message).not.toContain("stopped");
     expect(unknown.remediation.action).toContain("provider_operation_health");
+
+    const unreachable = projectAnalysisError(
+      new HopperProcessError(null, {
+        operation: "search_strings",
+        providerState: "unreachable",
+      }),
+    );
+    expect(unreachable.message).toContain(
+      "If Hopper may have exited, call export_evidence_bundle before close_binary",
+    );
+    expect(unreachable.message).toContain("closing clears retained records");
+    expect(unreachable.remediation.action).toContain("export_evidence_bundle");
   });
 });
 
@@ -711,3 +837,59 @@ describe("analysis error projection: evidence files", () => {
     },
   );
 });
+
+it("retains the primary failure and both cleanup reports after a secondary failure", () => {
+  const primary = new AnalysisCancelledError("execute_rizin_command", {
+    capturedOutput: {
+      stdout: "partial",
+      stderr: "diagnostic",
+      truncated: false,
+    },
+    cleanup: { reason: "writer remains", resources: ["writer"] },
+  });
+  const secondary = new AnalysisOutputError("open_binary", "cannot rebind", {
+    cleanup: { reason: "provider remains", resources: ["provider", "writer"] },
+  });
+  const enriched = primary.retainSecondaryFailure(secondary, {
+    rebind_error: projectAnalysisError(secondary),
+  });
+  expect(enriched).toBe(primary);
+  expect(enriched._tag).toBe("AnalysisCancelledError");
+  expect(projectAnalysisError(enriched)).toMatchObject({
+    code: "cleanup_incomplete",
+    details: {
+      execution_failure: "cancelled",
+      resources: ["writer"],
+      cleanup_reason: "writer remains",
+      captured_output: { stdout: "partial", stderr: "diagnostic" },
+      diagnostics: { rebind_error: { code: "cleanup_incomplete" } },
+    },
+  });
+});
+
+it.each([false, true])(
+  "preserves producer capability recovery with retryable=%s",
+  (retryable) => {
+    const recovery =
+      "Choose an explicit disposition, then retry the same session.";
+    const projected = projectAnalysisError(
+      new AnalysisCapabilityUnavailableError("fixture", "close", "live state", {
+        retryable,
+        remediationAction: recovery,
+      }),
+    );
+    expect(projected).toMatchObject({
+      code: "capability_unavailable",
+      retryable,
+      remediation: { action: recovery },
+      details: {
+        provider_id: "fixture",
+        operation: "close",
+        reason: "live state",
+      },
+    });
+    expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(
+      true,
+    );
+  },
+);

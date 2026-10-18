@@ -1,29 +1,69 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
 
 import {
+  formatCommandForDisplay,
   installLinuxHopper,
-  linuxHopperLauncherDigestSupported,
   linuxPackageManagerCommands,
   linuxSharedLibrariesAvailable,
   parseLinuxDistribution,
+  supportsReaHost,
+  LinuxHopperTemporaryCleanupOwner,
+  systemLinuxHopperInstallHost,
   type LinuxDistribution,
   type LinuxHopperDownload,
   type LinuxHopperInstallHost,
   type LinuxHopperLauncherStatus,
   type LinuxPackageFamily,
+  type LinuxPackageInstallFailure,
+  type LinuxPackageInstallOutcome,
 } from "./LinuxHopper.js";
+import { err, ok } from "../domain/result.js";
+import {
+  HopperReleaseError,
+  type LinuxHopperRelease,
+} from "./HopperReleaseFeed.js";
+import type { VerifiedLinuxHopperPackage } from "./LinuxHopperPublisher.js";
+import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
+import * as nativeCommands from "../process/ExecFileOutput.js";
+import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
+
+describe("Linux package-manager command display", () => {
+  it("preserves argument boundaries for paths with spaces and quotes", () => {
+    expect(
+      formatCommandForDisplay("pkexec", [
+        "pacman",
+        "-U",
+        "/tmp/rea test/hopper.arch",
+        "apostrophe'path",
+      ]),
+    ).toBe('pkexec pacman -U "/tmp/rea test/hopper.arch" "apostrophe\'path"');
+  });
+});
 
 class RecordingLinuxHost implements LinuxHopperInstallHost {
   distributionValue: LinuxDistribution | undefined = {
     id: "ubuntu",
     versionId: "24.04",
     packageFamily: "deb",
-    supported: true,
+    hopperSetupSupported: true,
   };
   archive = new Uint8Array([1, 2, 3]);
   archiveOk = true;
   installSucceeds = true;
+  cleanupFails = false;
+  signatureValid = true;
+  cacheWritable = true;
+  verifiedBeforeInstall = false;
+  packageFailure: LinuxPackageInstallFailure = {
+    command: "pacman -U --noconfirm /tmp/rea test/hopper.arch",
+    exitCode: 1,
+    stdout: "",
+    stderr: "error: failed to prepare transaction",
+    outputTruncated: false,
+  };
   launcherStatusValue: LinuxHopperLauncherStatus = "ready";
   downloads: string[] = [];
   installed: Array<{ family: LinuxPackageFamily; archive: string }> = [];
@@ -31,6 +71,8 @@ class RecordingLinuxHost implements LinuxHopperInstallHost {
 
   distribution = (): Promise<LinuxDistribution | undefined> =>
     Promise.resolve(this.distributionValue);
+  release = (family: LinuxPackageFamily) =>
+    Promise.resolve(ok(releasesFor(new Uint8Array([1, 2, 3]))[family]));
   download = (url: string): Promise<LinuxHopperDownload> => {
     this.downloads.push(url);
     return Promise.resolve({ ok: this.archiveOk, bytes: this.archive });
@@ -38,18 +80,65 @@ class RecordingLinuxHost implements LinuxHopperInstallHost {
   createTemporaryDirectory = (): Promise<string> =>
     Promise.resolve("/tmp/rea test");
   writeArchive = (): Promise<void> => Promise.resolve();
+  verifyArchive = (family: LinuxPackageFamily, release: LinuxHopperRelease) => {
+    if (
+      createHash("sha1").update(this.archive).digest("hex") !==
+      release.file_hash
+    )
+      return Promise.resolve(
+        err(new HopperReleaseError("integrity", "Fixture byte mismatch")),
+      );
+    if (!this.signatureValid)
+      return Promise.resolve(
+        err(
+          new HopperReleaseError(
+            "publisher_verification_failed",
+            "Fixture signature rejection",
+          ),
+        ),
+      );
+    this.verifiedBeforeInstall = true;
+    return Promise.resolve(
+      ok({
+        family,
+        release,
+        packageSha256: createHash("sha256").update(this.archive).digest("hex"),
+        publicKey: "fixture",
+        primaryFingerprint: "0".repeat(40),
+        signingFingerprint: "1".repeat(40),
+      }),
+    );
+  };
+  retainVerifiedArchive = (_verified: VerifiedLinuxHopperPackage) =>
+    Promise.resolve(
+      this.cacheWritable
+        ? ok(undefined)
+        : err(
+            new HopperReleaseError(
+              "verification_unavailable",
+              "Fixture cache permission rejection",
+            ),
+          ),
+    );
   installPackage = (
     family: LinuxPackageFamily,
     archive: string,
-  ): Promise<boolean> => {
+  ): Promise<LinuxPackageInstallOutcome> => {
+    if (!this.verifiedBeforeInstall)
+      throw new Error("Package manager ran before publisher verification");
     this.installed.push({ family, archive });
-    return Promise.resolve(this.installSucceeds);
+    const outcome: LinuxPackageInstallOutcome = this.installSucceeds
+      ? { status: "installed" }
+      : { status: "failed", failure: this.packageFailure };
+    return Promise.resolve(outcome);
   };
   launcherStatus = (): Promise<LinuxHopperLauncherStatus> =>
     Promise.resolve(this.launcherStatusValue);
   cleanup = (path: string): Promise<void> => {
     this.cleaned.push(path);
-    return Promise.resolve();
+    return this.cleanupFails
+      ? Promise.reject(new Error("temporary path is busy"))
+      : Promise.resolve();
   };
 }
 
@@ -66,7 +155,7 @@ describe("Linux Hopper host classification", () => {
     (document, family) => {
       expect(parseLinuxDistribution(document)).toMatchObject({
         packageFamily: family,
-        supported: true,
+        hopperSetupSupported: true,
       });
     },
   );
@@ -99,26 +188,36 @@ describe("Linux Hopper host classification", () => {
     "ID=garuda\nID_LIKE=arch\n",
     "ID=omarchy\n",
     "ID=omarchy\nID_LIKE=debian\n",
-  ])("rejects unsupported vendor/version combinations", (document) => {
-    expect(parseLinuxDistribution(document).supported).toBe(false);
+  ])(
+    "rejects vendor/version combinations without a tested Hopper installer",
+    (document) => {
+      expect(parseLinuxDistribution(document).hopperSetupSupported).toBe(false);
+    },
+  );
+
+  it.each([
+    'ID=kali\nVERSION_ID="2026.3"\nID_LIKE=debian\n',
+    'ID=debian\nVERSION_ID="13"\nID_LIKE=debian\n',
+    'ID=linuxmint\nVERSION_ID="22.1"\nID_LIKE="ubuntu debian"\n',
+    "ID=manjaro\nID_LIKE=arch\n",
+    "ID=derivative\nID_LIKE='debian'\n",
+    "ID='debian'\nVERSION_ID='13'\n",
+  ])(
+    "hosts REA on a distribution Hopper has no tested package for: %s",
+    (document) => {
+      const distribution = parseLinuxDistribution(document);
+      expect(distribution.hopperSetupSupported).toBe(false);
+      expect(supportsReaHost(distribution)).toBe(true);
+    },
+  );
+
+  it("withholds host support from a distribution with no package family", () => {
+    expect(supportsReaHost(parseLinuxDistribution("ID=nixos\n"))).toBe(false);
+    expect(supportsReaHost(undefined)).toBe(false);
   });
 });
 
 describe("Linux Hopper installation", () => {
-  it.each([
-    [
-      "Debian and Arch",
-      "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded",
-    ],
-    ["RPM", "1339f9e58377442b0c6fcb0dfc3cec20d593cc557408521fad9a00dbc6b8da13"],
-  ])("accepts the pinned %s launcher build", (_, digest) => {
-    expect(linuxHopperLauncherDigestSupported(digest)).toBe(true);
-  });
-
-  it("rejects an unverified launcher build", () => {
-    expect(linuxHopperLauncherDigestSupported("0".repeat(64))).toBe(false);
-  });
-
   it.each([
     ["deb", "apt-get", ["xvfb", "xauth", "python3", "libx11-6", "libxtst6"]],
     [
@@ -158,7 +257,9 @@ describe("Linux Hopper installation", () => {
       );
     },
   );
+});
 
+describe("Linux Hopper package installation", () => {
   it.each(["deb", "rpm", "arch"] as const)(
     "downloads, verifies, installs, reads back, and cleans a %s package",
     async (family) => {
@@ -166,7 +267,7 @@ describe("Linux Hopper installation", () => {
       host.distributionValue = {
         id: family,
         packageFamily: family,
-        supported: true,
+        hopperSetupSupported: true,
       };
       const result = await installFixture(host);
       expect(result).toEqual({
@@ -179,7 +280,26 @@ describe("Linux Hopper installation", () => {
       expect(host.cleaned).toEqual(["/tmp/rea test"]);
     },
   );
+});
 
+describe("Linux Hopper installation failure classification", () => {
+  it.each([
+    ["signatureValid", "publisher_verification_failed"],
+    ["cacheWritable", "verification_unavailable"],
+  ] as const)(
+    "stops before privileged installation when %s fails",
+    async (field, reason) => {
+      const host = new RecordingLinuxHost();
+      host[field] = false;
+      expect(await installFixture(host)).toMatchObject({
+        status: "failed",
+        reason,
+        verificationFailure: { reason, message: expect.any(String) },
+      });
+      expect(host.installed).toEqual([]);
+      expect(host.cleaned).toEqual(["/tmp/rea test"]);
+    },
+  );
   it.each([
     ["unsupported host", "unsupported_host"],
     ["package request failure", "download"],
@@ -194,7 +314,7 @@ describe("Linux Hopper installation", () => {
       host.distributionValue = {
         id: "debian",
         packageFamily: "deb",
-        supported: false,
+        hopperSetupSupported: false,
       };
     if (scenario === "package request failure") host.archiveOk = false;
     if (scenario === "checksum mismatch") host.archive = new Uint8Array([9]);
@@ -204,14 +324,99 @@ describe("Linux Hopper installation", () => {
       host.launcherStatusValue = "runtime_dependencies";
     if (scenario === "unsupported build")
       host.launcherStatusValue = "unsupported_hopper_build";
-    expect(await installFixture(host)).toEqual({
+    expect(await installFixture(host)).toMatchObject({
       status: "failed",
       reason,
+      ...(scenario === "package manager failure"
+        ? { packageFailure: host.packageFailure }
+        : {}),
     });
     if (host.installed.length > 0)
       expect(host.cleaned).toEqual(["/tmp/rea test"]);
   });
+});
 
+describe("Linux Hopper cleanup and failure details", () => {
+  it("preserves a publisher descriptor cleanup failure during launcher status inspection", async () => {
+    const directory = await createTestTempDirectory("rea-hopper-status-");
+    const launcher = join(directory, "Hopper");
+    await writeFile(launcher, "fixture launcher");
+    const host = systemLinuxHopperInstallHost({
+      ...process.env,
+      HOME: directory,
+      XDG_CACHE_HOME: join(directory, "cache"),
+    });
+    const command = vi
+      .spyOn(nativeCommands, "execFileOutput")
+      .mockResolvedValue({
+        stdout: "libc.so.6 => /lib/libc.so.6",
+        stderr: "",
+        stdoutBytes: Buffer.byteLength("libc.so.6 => /lib/libc.so.6"),
+        stderrBytes: 0,
+      });
+    const close = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockRejectedValue(new Error("Fixture descriptor close unavailable"));
+    try {
+      await expect(host.launcherStatus(launcher, "0".repeat(64))).resolves.toBe(
+        "cleanup_failed",
+      );
+    } finally {
+      close.mockRestore();
+      command.mockRestore();
+      await host.close?.();
+    }
+  });
+
+  it("preserves the failing package-manager command and its output", async () => {
+    const host = new RecordingLinuxHost();
+    host.installSucceeds = false;
+    host.packageFailure = {
+      command: "pkexec pacman -U --noconfirm /tmp/rea test/hopper.arch",
+      exitCode: 1,
+      stdout: "loading packages...",
+      stderr:
+        "\u001b[31merror: unresolvable package conflicts detected\u001b[0m",
+      outputTruncated: false,
+    };
+    expect(await installFixture(host)).toEqual({
+      status: "failed",
+      reason: "authorization_or_package_manager",
+      packageFailure: host.packageFailure,
+    });
+    expect(host.cleaned).toEqual(["/tmp/rea test"]);
+  });
+
+  it("preserves a successful install result when temporary cleanup fails", async () => {
+    const host = new RecordingLinuxHost();
+    host.cleanupFails = true;
+    expect(await installFixture(host)).toEqual({
+      status: "installed",
+      launcherPath: "/opt/hopper/bin/Hopper",
+      cleanupFailure: {
+        path: "/tmp/rea test",
+        reason: "temporary path is busy",
+      },
+    });
+  });
+
+  it("preserves an install failure when temporary cleanup also fails", async () => {
+    const host = new RecordingLinuxHost();
+    host.installSucceeds = false;
+    host.cleanupFails = true;
+    expect(await installFixture(host)).toMatchObject({
+      status: "failed",
+      reason: "authorization_or_package_manager",
+      packageFailure: host.packageFailure,
+      cleanupFailure: {
+        path: "/tmp/rea test",
+        reason: "temporary path is busy",
+      },
+    });
+  });
+});
+
+describe("Linux Hopper cancellation", () => {
   it("cancels before network or mutation", async () => {
     const host = new RecordingLinuxHost();
     const controller = new AbortController();
@@ -227,16 +432,39 @@ describe("Linux Hopper installation", () => {
   });
 });
 
+describe("Linux Hopper temporary cleanup ownership", () => {
+  it("retains a failed cleanup for a later successful retry", async () => {
+    const owner = new LinuxHopperTemporaryCleanupOwner();
+    owner.retain({ path: "/tmp/rea-hopper", reason: "busy" });
+    let attempts = 0;
+
+    expect(
+      await owner.retry(async () => {
+        attempts += 1;
+        throw new Error("still busy");
+      }),
+    ).toContain("/tmp/rea-hopper");
+    expect(
+      await owner.retry(async () => {
+        attempts += 1;
+      }),
+    ).toBeUndefined();
+    expect(attempts).toBe(2);
+  });
+});
+
 function releasesFor(
   bytes: Uint8Array,
-): Record<
-  LinuxPackageFamily,
-  { filename: string; file_length: string; file_hash: string }
-> {
+): Record<LinuxPackageFamily, LinuxHopperRelease> {
   const release = (extension: string) => ({
-    filename: `https://www.hopperapp.com:443/downloader/public/Hopper.${extension}`,
+    version: "future-fixture",
+    filename: `https://www.hopperapp.com:443/downloader/public/Hopper-future-fixture-Linux-demo.${extension}`,
     file_length: String(bytes.byteLength),
     file_hash: createHash("sha1").update(bytes).digest("hex"),
+    main_exe_hash: "0".repeat(64),
+    signature: "AQ==",
+    public: "1" as const,
+    beta: "0" as const,
   });
   return {
     deb: release("deb"),
@@ -245,7 +473,4 @@ function releasesFor(
   };
 }
 
-const installFixture = (host: RecordingLinuxHost) =>
-  installLinuxHopper(host, {
-    releases: releasesFor(new Uint8Array([1, 2, 3])),
-  });
+const installFixture = (host: RecordingLinuxHost) => installLinuxHopper(host);

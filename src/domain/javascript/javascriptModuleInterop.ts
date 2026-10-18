@@ -26,6 +26,7 @@ import {
 import { SemanticPropertyPathCoverage } from "./javascriptSemanticPropertyPaths.js";
 import {
   readExactJavaScriptLiteral,
+  runtimeFunctionParameters,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 
@@ -553,7 +554,7 @@ export const createSemanticModuleInterop = (
       converted === undefined ||
       initial.projection.length !== 0 ||
       converted.projection.length !== 0 ||
-      state.conditionalInitializers.has(initial.node)
+      state.conditionallySkippedExpressions.has(initial.node)
     )
       return undefined;
     const call = converted.node;
@@ -662,10 +663,10 @@ const identityFunction = (
     !t.isFunction(node) ||
     node.async ||
     node.generator ||
-    node.params.length !== 1
+    runtimeFunctionParameters(node).length !== 1
   )
     return false;
-  const parameter = node.params[0];
+  const parameter = runtimeFunctionParameters(node)[0];
   const result = t.isBlockStatement(node.body)
     ? node.body.body.length === 1 && t.isReturnStatement(node.body.body[0])
       ? node.body.body[0].argument

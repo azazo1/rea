@@ -2,54 +2,93 @@ import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 
 import {
-  openRegularFile,
+  withOwnedRegularFile,
+  RegularFileCancelled,
+  RegularFileCleanupFailure,
+} from "./OwnedRegularFile.js";
+import {
   RegularFileChangedError,
+  RegularFileOperationCancelled,
+  assertRegularFileActive,
   sameRegularFileState,
 } from "./RegularFile.js";
+import type { OwnedFileHandle } from "./OwnedFileHandle.js";
+
+export interface StableFileHashOptions {
+  readonly signal?: AbortSignal;
+  readonly retainFailedClose: (owner: OwnedFileHandle) => void;
+}
+
+/** Physical hash admission/read failure with no outstanding descriptor cleanup. */
+export class StableFileHashFailure extends Error {
+  readonly _tag = "StableFileHashFailure";
+  constructor(
+    readonly path: string,
+    override readonly cause: unknown,
+  ) {
+    super(
+      `Could not hash ${path}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    );
+    this.name = this._tag;
+  }
+}
+
+/** Read the producing boundary's physical failure without guessing from signal state. */
+export const stableFileHashCause = (cause: unknown): unknown =>
+  cause instanceof StableFileHashFailure ? cause.cause : cause;
 
 /** Hash one regular file from its admitted descriptor and verify its path state. */
 export const hashStableFile = async (
   path: string,
-  signal?: AbortSignal,
+  options: StableFileHashOptions,
 ): Promise<{ readonly sha256: string; readonly bytes: number }> => {
-  const handle = await openRegularFile(path, {
-    symlinks: "follow",
-    signal,
-  });
   try {
-    const initial = await handle.stat();
-    if (!Number.isSafeInteger(initial.size) || initial.size < 0)
-      throw new RangeError(
-        `Regular file size cannot be represented safely: ${path}`,
-      );
-    const hash = createHash("sha256");
-    const chunk = Buffer.allocUnsafe(64 * 1024);
-    let position = 0;
-    while (position <= initial.size) {
-      signal?.throwIfAborted();
-      const length = Math.min(chunk.length, initial.size - position + 1);
-      if (length <= 0) break;
-      const read = await handle.read(chunk, 0, length, position);
-      signal?.throwIfAborted();
-      if (read.bytesRead === 0) break;
-      hash.update(chunk.subarray(0, read.bytesRead));
-      position += read.bytesRead;
-      if (position > initial.size) throw new RegularFileChangedError(path);
-    }
-    signal?.throwIfAborted();
-    const [opened, currentPath] = await Promise.all([
-      handle.stat(),
-      stat(path),
-    ]);
-    signal?.throwIfAborted();
+    return await withOwnedRegularFile(path, options, async (handle) => {
+      const initial = await handle.stat();
+      if (!Number.isSafeInteger(initial.size) || initial.size < 0)
+        throw new RangeError(
+          `Regular file size cannot be represented safely: ${path}`,
+        );
+      const hash = createHash("sha256");
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      while (position <= initial.size) {
+        assertRegularFileActive(options.signal);
+        const length = Math.min(chunk.length, initial.size - position + 1);
+        if (length <= 0) break;
+        const read = await handle.read(chunk, 0, length, position);
+        if (
+          position + read.bytesRead > initial.size ||
+          (read.bytesRead === 0 && position < initial.size)
+        )
+          throw new RegularFileChangedError(path);
+        assertRegularFileActive(options.signal);
+        if (read.bytesRead === 0) break;
+        hash.update(chunk.subarray(0, read.bytesRead));
+        position += read.bytesRead;
+      }
+      assertRegularFileActive(options.signal);
+      const [opened, currentPath] = await Promise.all([
+        handle.stat(),
+        stat(path),
+      ]);
+      if (
+        position !== initial.size ||
+        !sameRegularFileState(initial, opened) ||
+        !sameRegularFileState(initial, currentPath)
+      )
+        throw new RegularFileChangedError(path);
+      assertRegularFileActive(options.signal);
+      return { sha256: hash.digest("hex"), bytes: position };
+    });
+  } catch (cause: unknown) {
     if (
-      position !== initial.size ||
-      !sameRegularFileState(initial, opened) ||
-      !sameRegularFileState(initial, currentPath)
+      cause instanceof RegularFileCleanupFailure ||
+      cause instanceof RegularFileCancelled ||
+      cause instanceof RegularFileOperationCancelled
     )
-      throw new RegularFileChangedError(path);
-    return { sha256: hash.digest("hex"), bytes: position };
-  } finally {
-    await handle.close();
+      throw cause;
+    throw new StableFileHashFailure(path, cause);
   }
 };

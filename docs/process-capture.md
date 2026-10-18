@@ -159,14 +159,30 @@ line. Stdout stays the final Evidence document:
 `cleanup`. `completed` counts collected terminal frames, process samples, and
 interaction events. `total` stays null; REA does not invent a unit total or a
 percentage. `message` reports elapsed time and those counts. The final line uses
-`phase` `cleanup`, sets `terminal` to true, and adds `disposition` (`exited`,
-`timeout`, `idle_timeout`, `cancelled`, or `failed`) plus the owned-process,
-renderer, and temporary-root cleanup states. Updates use the shared progress
-boundary and are limited to one intermediate line per 100 ms; the terminal line
-is always emitted. If a receiver is slow, intermediate observations are merged
-into the latest status, and stale live observations are discarded before final
-cleanup status. Progress never copies child output. Child output remains in the
-capture Evidence on stdout.
+`phase` `cleanup` and sets `terminal` to true. Its `message` also contains
+`disposition=<value>` (`exited`, `timeout`, `idle_timeout`, `cancelled`, or `failed`)
+and the `owned_process_group`, `terminal_renderer`, and `temporary_root` cleanup
+states as `key=value` text. These values are not separate JSON fields. For
+example, a completed capture can end with:
+
+```json
+{
+  "rea_progress": {
+    "phase": "cleanup",
+    "completed": 0,
+    "total": null,
+    "message": "elapsed_ms=2180 frames=0 samples=0 interactions=0 disposition=exited owned_process_group=cleaned terminal_renderer=cleaned temporary_root=cleaned",
+    "terminal": true,
+    "sequence": 13
+  }
+}
+```
+
+Updates use the shared progress boundary and are limited to one intermediate line
+per 100 ms; the terminal line is always emitted. If a receiver is slow,
+intermediate observations are merged into the latest status, and stale live
+observations are discarded before final cleanup status. Progress never copies
+child output. Child output remains in the capture Evidence on stdout.
 
 ### Scenario with interactions
 
@@ -367,19 +383,33 @@ exit comparison like `settlement.elapsed_ms`.
 Every capture requires `truncation_details`, with separate accounting for:
 
 - `raw_terminal`: original UTF-8 PTY chunk bytes and observed/retained chunk
-  counts. A chunk that does not fit `limits.output_bytes` is omitted whole;
-  a later smaller chunk can still fit.
+  counts. A chunk that does not fit either its remaining original-text budget
+  or normalized-text budget is omitted whole; a later smaller chunk can still
+  fit. A normalized-text omission also omits its original chunk, so raw and
+  normalized coverage can both be incomplete for that event.
+- `normalized_terminal`: normalized comparison-text bytes retained from raw
+  chunks. This is optional when reading historical captures. A raw-fitting
+  chunk is omitted if an ordered normalization stage would exceed the remaining
+  `output_bytes` budget before the final normalized size is known. Its final
+  size is unknown, not assumed to equal the budget. The capture records the
+  omitted-frame count and a limitation; later smaller chunks remain eligible.
 - `rendered_terminal`: cumulative UTF-8 serialized-state and visible-line
   bytes, plus observed/retained frame counts. This is independent of the raw
   chunk budget and does not count JSON encoding. Repeated screen snapshots can
   exhaust it even when all raw output fits. Rendered states use retained PTY
-  input, so raw omissions also limit rendered coverage.
+  input, so raw omissions also limit rendered coverage. When bounded
+  normalization omits a rendered frame before its final size is known,
+  `unknown_size_frames` reports that count; `observed_bytes` includes only
+  rendered frame sizes that were determined exactly.
 - `filesystem_before` and `filesystem_after`: file-count/depth limits,
   enumeration failures, whole-file hash budget and bytes successfully hashed.
   Directory names are read incrementally within the remaining entry capacity.
   When a directory exceeds that capacity, the retained subset follows filesystem
   enumeration order and is then sorted; it is explicitly incomplete and cannot
   establish that an omitted path is absent.
+  An unreadable directory is recorded in `enumeration_omissions` with its
+  root-aliased path and operating-system error code. Entries observed before
+  that directory remain available, while descendants beneath it stay unknown.
   Each retained regular file without a digest has an aliased path, size,
   remaining budget and reason: `file_bytes_budget`,
   `file_changed_or_short_read`, or `file_unavailable`. Its `system_code` is
@@ -395,7 +425,9 @@ results for unaffected dimensions and mark affected dimensions unknown; an
 incomplete capture cannot locate the first divergence across all dimensions.
 Trace assertions use coverage for the sources they select, so an assertion
 about complete raw terminal output need not fail because rendered snapshots
-were omitted. Captures missing `truncation_details` are rejected on import;
+were omitted. A trace difference applies to the dimensions identified by its
+diagnostic; unrelated dimensions retain their own comparison, including unknown
+coverage. Captures missing `truncation_details` are rejected on import;
 preserve them as historical files and recapture for current comparisons.
 `limits.file_bytes` is already the cumulative whole-file hashing budget,
 independent of `limits.output_bytes`, which bounds retained terminal content.

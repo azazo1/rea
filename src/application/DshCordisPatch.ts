@@ -1,5 +1,8 @@
 import { isMap, isSeq, type Node, type YAMLMap } from "yaml";
-import { parseEnvironment } from "../config/environment.js";
+import {
+  parseEnvironment,
+  parseEnvironmentValues,
+} from "../config/environment.js";
 import { ConfigurationError } from "../domain/configurationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { ClientConfigurationDocument } from "./ClientConfigurationDocument.js";
@@ -8,6 +11,7 @@ import { CordisExpression, DshCordisYaml } from "./DshCordisYaml.js";
 export const DSH_ENTRY_ID = "rea-mcp";
 export const DSH_CLIENT_PACKAGE = "@deepseek-ai/dsh-mcp-client";
 const LAUNCHER_KEYS = new Set(["serverName", "transport", "command", "args"]);
+const SELECTOR_KEYS = new Set(["id", "name"]);
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" &&
   value !== null &&
@@ -180,6 +184,7 @@ export class DshCordisDocument {
   /** Validate literals without treating expression source as an environment value. */
   environment(
     overrides: Readonly<Record<string, string>> = {},
+    validation: "fragment" | "effective" = "effective",
   ): Result<Readonly<Record<string, string>>, ConfigurationError> {
     const config = this.#field("config");
     if (config instanceof CordisExpression)
@@ -214,8 +219,12 @@ export class DshCordisDocument {
         new ConfigurationError("Cordis server environment must be a mapping"),
       );
     const literals: Record<string, string> = {};
+    const unresolvedSettings = new Set<string>();
     for (const [key, value] of Object.entries(raw ?? {})) {
-      if (value instanceof CordisExpression) continue;
+      if (value instanceof CordisExpression) {
+        if (overrides[key] === undefined) unresolvedSettings.add(key);
+        continue;
+      }
       if (typeof value !== "string")
         return err(
           new ConfigurationError("Invalid Cordis server environment", {
@@ -231,7 +240,10 @@ export class DshCordisDocument {
       literals[key] = value;
     }
     const environment = { ...literals, ...overrides };
-    const validated = parseEnvironment(environment);
+    const validated =
+      validation === "fragment"
+        ? parseEnvironmentValues(environment, unresolvedSettings)
+        : parseEnvironment(environment, unresolvedSettings);
     return validated.ok ? ok(environment) : validated;
   }
 
@@ -295,10 +307,15 @@ export class DshCordisDocument {
         carried = true;
         return [this.#entry(desired, invalidated)] as typeof inserted.items;
       });
-      replacements.set(
-        op.source,
-        inserted.items.length === 0 ? undefined : copy,
-      );
+      if (inserted.items.length === 0) copy.delete("insert");
+      // An emptied operation keeps caller fields unless it would patch REA's row.
+      const kept =
+        inserted.items.length > 0 ||
+        (this.#id(op.map) !== DSH_ENTRY_ID &&
+          copy.items.some(
+            (pair) => !SELECTOR_KEYS.has(this.#yaml.value(pair.key) as string),
+          ));
+      replacements.set(op.source, kept ? copy : undefined);
     }
     const output = this.#yaml.document.clone();
     const outputRoot = output.contents;

@@ -19,6 +19,11 @@ import { err, type Result } from "../../domain/result.js";
 import type { SessionProviderRoute } from "./SessionProviderRouter.js";
 import { SessionProviderRouter } from "./SessionProviderRouter.js";
 
+/** Read a staged snapshot once the open holds its place in the session order. */
+export type AnalysisSnapshotLoader = () => Promise<
+  Result<AnalysisSnapshot, AnalysisError>
+>;
+
 export interface BinarySessionOpenOptions {
   readonly signal?: AbortSignal;
   readonly targetKind?: BinaryTarget["kind"];
@@ -26,6 +31,11 @@ export interface BinarySessionOpenOptions {
   readonly architecture?: BinaryArchitecture;
   readonly entryPoint?: string;
   readonly snapshot?: AnalysisSnapshot;
+  /**
+   * Load the snapshot inside the open's turn instead of before it, so calls
+   * dispatched after the open cannot overtake its file read.
+   */
+  readonly loadSnapshot?: AnalysisSnapshotLoader;
   readonly providerId?: AnalysisProviderSelector;
 }
 
@@ -92,9 +102,7 @@ export const resolveSessionTarget = async (
   input: ResolveSessionTargetInput,
 ): Promise<Result<ResolvedSessionOpen, AnalysisError>> => {
   const { router, current, target, options } = input;
-  const sameTarget =
-    current?.target.path === target.path &&
-    snapshotMatchesTarget(snapshotTarget(current.target), target);
+  const sameTarget = sameSessionTarget(current?.target, target);
   const resolvedRoute =
     sameTarget && options.providerId === undefined && current !== undefined
       ? ({ ok: true, value: current.route } as const)
@@ -113,9 +121,7 @@ export const validateResolvedSessionTarget = (
   },
 ): Result<ResolvedSessionOpen, AnalysisError> => {
   const { current, target, route, options, stagedSnapshotMatches } = input;
-  const sameTarget =
-    current?.target.path === target.path &&
-    snapshotMatchesTarget(snapshotTarget(current.target), target);
+  const sameTarget = sameSessionTarget(current?.target, target);
   const snapshotError = validateSnapshot({
     snapshot: options.snapshot,
     target,
@@ -126,6 +132,16 @@ export const validateResolvedSessionTarget = (
   if (snapshotError !== undefined) return err(snapshotError);
   return { ok: true, value: { target, route, sameTarget } };
 };
+
+const sameSessionTarget = (
+  current: BinaryTarget | undefined,
+  target: BinaryTarget,
+): boolean =>
+  current !== undefined &&
+  current.path === target.path &&
+  // Native admission is bound to the requested path, not just its realpath.
+  (current.sourcePath ?? current.path) === (target.sourcePath ?? target.path) &&
+  snapshotMatchesTarget(snapshotTarget(current), target);
 
 interface ValidateSnapshotInput {
   readonly snapshot: AnalysisSnapshot | undefined;

@@ -14,6 +14,10 @@ import { nativeDispatchMetadataResultSchema } from "../../domain/native/objcSwif
 import { inspectNativeDispatch } from "./NativeDispatchMetadataInspection.js";
 import { jsonValueSchema } from "../../domain/jsonValue.js";
 import { readNativeCallRoutes } from "./NativeCallRoutes.js";
+import {
+  renderSourceLimitations,
+  type SourceLimitation,
+} from "../SourceLimitations.js";
 import { err, ok } from "../../domain/result.js";
 import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
@@ -124,6 +128,11 @@ export const traceNativeUiAction = async (
       signal === undefined ? {} : { signal },
     );
     if (!native.ok && native.error._tag === "AnalysisCancelledError")
+      return err(native.error);
+    if (
+      !native.ok &&
+      native.error._tag !== "AnalysisCapabilityUnavailableError"
+    )
       return err(native.error);
     if (native.ok) {
       const address = z.string().safeParse(native.value.result);
@@ -239,6 +248,10 @@ export const traceNativeUiAction = async (
             : graph.truncated && trace.reason === null
               ? "native_trace_output_bound_reached"
               : trace.reason,
+        limitations: [
+          ...trace.limitations,
+          ...renderSourceLimitations(expanded.limitations),
+        ],
       }),
     ),
   );
@@ -393,6 +406,7 @@ const addDirectCallees = async (input: {
   let examined = 0;
   let omitted = 0;
   let truncated = false;
+  const sourceLimitations: SourceLimitation[] = [];
   while (queueIndex < queue.length) {
     const current = queue[queueIndex++];
     if (current === undefined || visited.has(current.address)) continue;
@@ -414,9 +428,47 @@ const addDirectCallees = async (input: {
       "provider",
     );
     examined += 1;
+    sourceLimitations.push(
+      ...(execution.ok ? execution.value.limitations : execution.limitations),
+    );
+    if (!execution.ok && execution.error._tag === "AnalysisCancelledError")
+      return { error: execution.error };
+    const unknowns = execution.ok
+      ? execution.value.unknowns
+      : execution.unknowns;
+    for (const [index, unknown] of unknowns.entries()) {
+      if (edges.size >= input.input.max_edges) {
+        truncated = true;
+        omitted += unknowns.length - index;
+        break;
+      }
+      const id = `unknown-dispatch:${current.address}:${unknown.address}`;
+      edges.set(id, {
+        id,
+        from: current.node.id,
+        to: null,
+        relation: "indirect_call",
+        resolution: "unresolved",
+        reason: unknown.reason,
+        evidence: [
+          {
+            kind: "reference",
+            provider: unknown.provider,
+            description: `${unknown.provider.name} reported an unresolved call: ${unknown.reason}`,
+            location: { address: unknown.address, file_offset: null },
+            artifact_path: null,
+            artifact_sha256: input.targetSha256,
+          },
+        ],
+        limitations: [],
+      });
+    }
     if (!execution.ok) {
-      if (execution.error._tag === "AnalysisCancelledError")
-        return { error: execution.error };
+      if (edges.size >= input.input.max_edges) {
+        truncated = true;
+        omitted += 1;
+        continue;
+      }
       const id = `unknown-callees:${current.address}`;
       edges.set(id, {
         id,
@@ -432,32 +484,6 @@ const addDirectCallees = async (input: {
       });
       continue;
     }
-    for (const unknown of execution.value.unknowns) {
-      if (edges.size >= input.input.max_edges) {
-        truncated = true;
-        omitted++;
-        break;
-      }
-      const id = `unknown-dispatch:${current.address}:${unknown.address}`;
-      edges.set(id, {
-        id,
-        from: current.node.id,
-        to: null,
-        relation: "indirect_call",
-        resolution: "unresolved",
-        reason: unknown.reason,
-        evidence: [
-          {
-            kind: "reference",
-            description: unknown.reason,
-            location: { address: unknown.address, file_offset: null },
-            artifact_path: null,
-            artifact_sha256: input.targetSha256,
-          },
-        ],
-        limitations: [],
-      });
-    }
     for (const [index, route] of execution.value.routes.entries()) {
       const address = route.address;
       if (edges.size >= input.input.max_edges) {
@@ -469,6 +495,7 @@ const addDirectCallees = async (input: {
       const evidence = [
         {
           kind: "reference" as const,
+          provider: execution.value.provider,
           description: `${execution.value.provider.name} reported ${route.relation} from ${current.address} to ${address}`,
           location: { address: route.site, file_offset: null },
           artifact_path: null,
@@ -524,6 +551,7 @@ const addDirectCallees = async (input: {
     examined,
     omitted,
     truncated,
+    limitations: sourceLimitations,
   };
 };
 

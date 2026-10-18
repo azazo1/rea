@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { buildBinary } from "plist";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { analyzeInterfaceBuilderBundle } from "../../../src/artifacts/apple/InterfaceBuilderAnalysis.js";
+import { InterfaceBuilderDecodeBudget } from "../../../src/artifacts/apple/InterfaceBuilderDecodeBudget.js";
 import { encodeNibArchiveFixture } from "../../../src/artifacts/apple/NibArchive.fixture.js";
 import { thinMach } from "../../../src/domain/binaryTarget.fixture.js";
 import { xcodeIbtoolAvailable } from "../../fixtures/ibtool.js";
@@ -405,12 +406,16 @@ describe("keyed archive hierarchy coverage", () => {
       const resources = join(bundle, "Contents", "Resources");
       await mkdir(resources, { recursive: true });
       const archive = join(resources, "Foundation.nib");
-      await compile("/usr/bin/xcrun", [
-        "swift",
-        "tests/conformance/native/keyed-archive-hierarchy.swift",
-        archive,
-        "40",
-      ]);
+      await compile(
+        "/usr/bin/xcrun",
+        [
+          "swift",
+          "tests/conformance/native/keyed-archive-hierarchy.swift",
+          archive,
+          "40",
+        ],
+        { timeout: 90_000 },
+      );
 
       const analysis = await analyzeInterfaceBuilderBundle({
         bundlePath: bundle,
@@ -431,6 +436,7 @@ describe("keyed archive hierarchy coverage", () => {
         ),
       ).toHaveLength(41);
     },
+    120_000,
   );
 });
 
@@ -697,6 +703,49 @@ describe("NIB projection byte amplification", () => {
 });
 
 cliTest(
+  "compiled CLI preserves distinct NIB keys and class identity",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-nib-name-identity-");
+    const bundle = join(root, "Example.app");
+    const resources = join(bundle, "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    await mkdir(join(bundle, "Contents", "MacOS"), { recursive: true });
+    await writeFile(
+      join(bundle, "Contents", "MacOS", "App"),
+      thinMach(0xfeedfacf, 0x0100000c),
+    );
+    await writeFile(
+      join(bundle, "Contents", "Info.plist"),
+      "<plist><dict><key>CFBundleExecutable</key><string>App</string></dict></plist>",
+    );
+    await writeFile(
+      join(resources, "Identity.nib"),
+      encodeNibArchiveFixture({
+        classes: ["\uFEFFWidget"],
+        objects: [{ classIndex: 0, values: { count: 1, "\uFEFFcount": 2 } }],
+      }),
+    );
+    const output = await cli.run({
+      arguments: ["decode-interface-builder", bundle, "--json"],
+      environment: { REA_LOG_LEVEL: "silent", REA_ANALYSIS_PROVIDER: "auto" },
+    });
+    expect(output.exitCode, output.stderr).toBe(0);
+    const result = interfaceBuilderAnalysisSchema.parse(
+      parseEvidence(output.json).normalized_result,
+    );
+    expect(result.graph.nodes).toContainEqual(
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          class_name: "\uFEFFWidget",
+          nibValues: { count: 1, "\uFEFFcount": 2 },
+        }),
+      }),
+    );
+    expect(JSON.stringify(result)).toContain("\uFEFFWidget");
+  },
+);
+
+cliTest(
   "compiled CLI preserves a good archive and reports repeated key and data omissions",
   async ({ cli }) => {
     const root = await createTestTempDirectory("rea-ib-cli-amplification-");
@@ -859,6 +908,57 @@ describe("aggregate Interface Builder archive retention budget", () => {
   });
 });
 
+describe("Interface Builder XML plist depth", () => {
+  it("bounds XML archives by plist value depth, not element depth", async () => {
+    const root = await createTestTempDirectory("rea-ib-depth-test-");
+    const bundle = join(root, "Example.app");
+    const resources = join(bundle, "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    // The root dict is value depth 0, so the leaf sits at `nested + 1`. The
+    // plist envelope and keys add XML elements but not value depth.
+    const document = (nested: number) =>
+      `<?xml version="1.0"?><plist version="1.0"><dict>${"<key>child</key><dict>".repeat(nested)}<key>leaf</key><integer>1</integer>${"</dict>".repeat(nested)}</dict></plist>`;
+    await writeFile(join(resources, "AtLimit.nib"), document(127));
+    await writeFile(join(resources, "BeyondLimit.nib"), document(128));
+
+    const release = vi.spyOn(InterfaceBuilderDecodeBudget.prototype, "release");
+    const result = await analyzeInterfaceBuilderBundle({
+      bundlePath: bundle,
+      targetSha256: "e".repeat(64),
+    });
+    const released = release.mock.calls.map(([bytes]) => bytes);
+    release.mockRestore();
+
+    // The rejected archive returns its reservation to later documents.
+    expect(released).toHaveLength(1);
+    expect(released[0]).toBeGreaterThan(0);
+    expect(result.documents.map(({ relative_path }) => relative_path)).toEqual([
+      "Contents/Resources/AtLimit.nib",
+    ]);
+    expect(result.graph.coverage).toContainEqual(
+      expect.objectContaining({
+        facet: "archive_decode",
+        status: "partial",
+        reason: "aggregate_decode_budget_exhausted",
+        examined: 2,
+        omitted: 1,
+      }),
+    );
+    expect(result.limitations).toContain(
+      "Contents/Resources/BeyondLimit.nib: omitted because aggregate decode budget exhausted.",
+    );
+  });
+
+  it("restores released representation bytes up to the initial budget", () => {
+    const budget = new InterfaceBuilderDecodeBudget(100);
+    budget.reserve(60, "reserve");
+    budget.release(60);
+    expect(budget.remainingBytes).toBe(100);
+    budget.release(10);
+    expect(budget.remainingBytes).toBe(100);
+  });
+});
+
 describe("bounded Interface Builder archive decoding", () => {
   it("counts malformed archives against the document limit", async () => {
     const root = await createTestTempDirectory("rea-ib-test-");
@@ -910,6 +1010,33 @@ describe("bounded Interface Builder archive decoding", () => {
     expect(result.graph.truncated).toBe(true);
     expect(result.limitations).toContain(
       "Contents/Resources/Prototype.nib: 1 dictionary entry keyed __proto__ was omitted because REA results cannot represent that key.",
+    );
+  });
+
+  it("decodes an archive whose date the decoder cannot represent", async () => {
+    const root = await createTestTempDirectory("rea-ib-test-");
+    const bundle = join(root, "Example.app");
+    const resources = join(bundle, "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    // plutil writes years past 9999 unsigned, which the decoder rejects.
+    await writeFile(
+      join(resources, "Far.nib"),
+      '<?xml version="1.0"?><plist version="1.0"><dict><key>$archiver</key><string>NSKeyedArchiver</string><key>$objects</key><array><string>$null</string><date>11507-08-17T05:20:00Z</date></array><key>$top</key><dict/></dict></plist>',
+    );
+
+    const result = await analyzeInterfaceBuilderBundle({
+      bundlePath: bundle,
+      targetSha256: "f".repeat(64),
+    });
+
+    expect(result.documents).toHaveLength(1);
+    expect(result.limitations).toContainEqual(
+      expect.stringMatching(
+        /^Contents\/Resources\/Far\.nib: 1 date value\(s\)/u,
+      ),
+    );
+    expect(result.limitations).not.toContainEqual(
+      expect.stringContaining("could not be decoded"),
     );
   });
 
@@ -1058,6 +1185,142 @@ describe("NIBArchive UIKit event connections", () => {
     ).toBe("placeholder");
     expect(analysis.graph.nodes.map(({ name }) => name)).not.toContain(
       "UIRuntimeEventConnection",
+    );
+  });
+
+  it("reports a runtime connection with no resolvable owner as an omission", async () => {
+    const root = await createTestTempDirectory("rea-ib-ownerless-");
+    const bundle = join(root, "Example.app");
+    await mkdir(bundle, { recursive: true });
+    // The connector is recognized by class, but carries no UISource reference,
+    // so no connection can be projected from it.
+    await writeFile(
+      join(bundle, "Cell.nib"),
+      encodeNibArchiveFixture({
+        classes: [
+          "UIProxyObject",
+          "UIClassSwapper",
+          "UIButton",
+          "UIRuntimeEventConnection",
+          "NSString",
+        ],
+        objects: [
+          { classIndex: 0, values: { UIProxiedObjectIdentifier: { ref: 5 } } },
+          { classIndex: 1, values: { UIClassName: { ref: 6 } } },
+          { classIndex: 2, values: {} },
+          {
+            classIndex: 3,
+            values: { UIDestination: { ref: 1 }, UIEventMask: 64 },
+          },
+          { classIndex: 2, values: {} },
+          { classIndex: 4, values: { "NS.bytes": "IBFilesOwner" } },
+          { classIndex: 4, values: { "NS.bytes": "BuildCell" } },
+        ],
+      }),
+    );
+
+    const analysis = await analyzeInterfaceBuilderBundle({
+      bundlePath: bundle,
+      targetSha256: "e".repeat(64),
+    });
+
+    expect(analysis.graph.coverage).toContainEqual(
+      expect.objectContaining({
+        facet: "connections:Cell.nib",
+        status: "partial",
+        reason: "connection_unresolved",
+        examined: 0,
+        omitted: 1,
+      }),
+    );
+    // The keyed-archive producer counts a recognized connector it cannot emit,
+    // so this producer has to report the same document total for the same
+    // connector rather than zero.
+    expect(analysis.documents).toContainEqual(
+      expect.objectContaining({
+        relative_path: "Cell.nib",
+        connection_count: 1,
+      }),
+    );
+    expect(analysis.graph.truncated).toBe(true);
+    expect(analysis.limitations).toContain(
+      "Some recognized NIBArchive connectors declare no resolvable owner; they carry no connection evidence and are reported as omissions.",
+    );
+  });
+});
+
+describe("NIBArchive ownerless connector accounting", () => {
+  it("keeps a connection dropped by the limit reported as a limit", async () => {
+    const root = await createTestTempDirectory("rea-ib-ownerless-limit-");
+    const bundle = join(root, "Example.app");
+    await mkdir(bundle, { recursive: true });
+    // Two resolvable connectors and one ownerless connector with the limit
+    // below the resolvable count, so this facet has both causes at once. Only a
+    // higher limit recovers the dropped connection, so that is the reason the
+    // caller needs, exactly as the keyed-archive producer reports it.
+    await writeFile(
+      join(bundle, "Cell.nib"),
+      encodeNibArchiveFixture({
+        classes: [
+          "UIProxyObject",
+          "UIClassSwapper",
+          "UIButton",
+          "UIRuntimeEventConnection",
+          "NSString",
+        ],
+        objects: [
+          { classIndex: 0, values: { UIProxiedObjectIdentifier: { ref: 5 } } },
+          { classIndex: 1, values: { UIClassName: { ref: 6 } } },
+          { classIndex: 2, values: {} },
+          {
+            classIndex: 3,
+            values: {
+              UISource: { ref: 2 },
+              UIDestination: { ref: 1 },
+              UILabel: { ref: 7 },
+              UIEventMask: 64,
+            },
+          },
+          { classIndex: 2, values: {} },
+          { classIndex: 4, values: { "NS.bytes": "IBFilesOwner" } },
+          { classIndex: 4, values: { "NS.bytes": "BuildCell" } },
+          { classIndex: 4, values: { "NS.bytes": "buildTapped:" } },
+          {
+            classIndex: 3,
+            values: {
+              UISource: { ref: 4 },
+              UIDestination: { ref: 1 },
+              UILabel: { ref: 7 },
+            },
+          },
+          {
+            classIndex: 3,
+            values: { UIDestination: { ref: 1 }, UIEventMask: 64 },
+          },
+        ],
+      }),
+    );
+
+    const analysis = await analyzeInterfaceBuilderBundle({
+      bundlePath: bundle,
+      targetSha256: "e".repeat(64),
+      limits: { max_connections: 1 },
+    });
+
+    expect(analysis.graph.coverage).toContainEqual(
+      expect.objectContaining({
+        facet: "connections:Cell.nib",
+        status: "partial",
+        reason: "connection_limit_reached",
+        examined: 1,
+        omitted: 2,
+      }),
+    );
+    expect(analysis.documents).toContainEqual(
+      expect.objectContaining({
+        relative_path: "Cell.nib",
+        connection_count: 3,
+      }),
     );
   });
 });

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { runCliJson as runCli } from "../../fixtures/cliJsonProcess.js";
+import { DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS } from "../../../src/domain/browserScenarioCaptureLimits.js";
 import {
   startFakeCdpBrowser,
   type FakeCdpBrowser,
@@ -183,6 +184,99 @@ it(
   INTEGRATION_TEST_TIMEOUT_MS,
 );
 
+it(
+  "compares redirect metadata uncertainty through the public CLI",
+  async () => {
+    const browser = await startFakeCdpBrowser();
+    browsers.push(browser);
+    const inspected = await runCli(
+      [
+        "inspect-web-page",
+        browser.endpoint,
+        "allowed-page",
+        "--observation-ms",
+        "0",
+        "--json",
+      ],
+      process.env,
+    );
+    const inspection = normalizedResult(inspected);
+    const missingVsKnown = await compareCapturesCli(
+      redirectCapture(inspection, browser.allowedOrigin, null),
+      redirectCapture(inspection, browser.allowedOrigin, 302),
+    );
+    expect(missingVsKnown).toMatchObject({
+      normalized_result: {
+        dimensions: {
+          network: {
+            status: "unknown",
+            total_changes: 0,
+            reason: expect.stringContaining("redirect"),
+          },
+        },
+      },
+    });
+    const knownDifference = await compareCapturesCli(
+      redirectCapture(inspection, browser.allowedOrigin, 302),
+      redirectCapture(inspection, browser.allowedOrigin, 307),
+    );
+    expect(knownDifference).toMatchObject({
+      normalized_result: {
+        dimensions: { network: { status: "changed", total_changes: 1 } },
+      },
+    });
+  },
+  INTEGRATION_TEST_TIMEOUT_MS,
+);
+
+it(
+  "browser CLI attaches through a browser socket and records it redacted",
+  async () => {
+    const browser = await startFakeCdpBrowser();
+    browsers.push(browser);
+    const inspected = await runCli(
+      [
+        "inspect-web-page",
+        browser.browserWebSocketUrl,
+        "allowed-page",
+        "--observation-ms",
+        "0",
+        "--json",
+      ],
+      process.env,
+    );
+    expect(inspected).toMatchObject({
+      operation: "inspect_web_page",
+      parameters: {
+        cdp_endpoint: browser.browserWebSocketUrl.replace(
+          /fake$/u,
+          "[REDACTED]",
+        ),
+      },
+      normalized_result: { target: { target_id: "allowed-page" } },
+    });
+    expect(JSON.stringify(inspected)).not.toContain("/devtools/browser/fake");
+
+    const refused = await runCli(
+      [
+        "list-browser-targets",
+        browser.browserWebSocketUrl.replace(/fake$/u, "not-this-browser"),
+        "--json",
+      ],
+      process.env,
+    );
+    expect(refused).toMatchObject({
+      code: "provider_unavailable",
+      details: {
+        operation: "list_browser_targets",
+        reason: "endpoint_unreachable",
+      },
+    });
+    expect(JSON.stringify(refused)).not.toContain("not-this-browser");
+  },
+  INTEGRATION_TEST_TIMEOUT_MS,
+);
+
 describe("scenario comparison CLI diagnostics", () => {
   const rule = {
     rule_id: "domain",
@@ -296,6 +390,68 @@ describe("scenario comparison CLI diagnostics", () => {
   );
 });
 
+describe("scenario comparison recovery guidance", () => {
+  it("reports independent network recovery alongside console differences", async () => {
+    const base = completeScenarioCapture();
+    const matchingSelection = scenarioCaptureWithConsole(
+      "before",
+      base.scenario.network_content,
+    );
+    const differentSelection = scenarioCaptureWithConsole("after", {
+      ...base.scenario.network_content,
+      response_body: true,
+    });
+    const changed = await compareCapturesCli(
+      matchingSelection,
+      differentSelection,
+    );
+    expect(changed).toMatchObject({
+      normalized_result: {
+        overall_status: "changed",
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            step_id: "open-settings",
+            artifact_diffs: expect.arrayContaining([
+              expect.objectContaining({
+                artifact: "events",
+                status: "changed",
+                reason: expect.stringContaining(
+                  "Network content selections differ",
+                ),
+              }),
+            ]),
+          }),
+        ]),
+      },
+    });
+    const quietMismatch = await compareCapturesCli(
+      matchingSelection,
+      scenarioCaptureWithConsole(
+        "before",
+        differentSelection.scenario.network_content,
+      ),
+    );
+    expect(quietMismatch).toMatchObject({
+      normalized_result: {
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            step_id: "open-settings",
+            artifact_diffs: expect.arrayContaining([
+              expect.objectContaining({
+                artifact: "events",
+                status: "unknown",
+                reason: expect.stringContaining(
+                  "Network content selections differ",
+                ),
+              }),
+            ]),
+          }),
+        ]),
+      },
+    });
+  });
+});
+
 describe("browser CLI capture parity", () => {
   it(
     "runs analysis, session, WebMCP, screenshot, and comparison from explicit request scope",
@@ -363,7 +519,14 @@ describe("browser CLI capture parity", () => {
         operation: "discover_webmcp_tools",
         normalized_result: {
           tools: {
-            items: [expect.objectContaining({ name: "search_orders" })],
+            items: [
+              expect.objectContaining({
+                name: "search_orders",
+                annotations: expect.objectContaining({
+                  consequential: true,
+                }),
+              }),
+            ],
           },
         },
       });
@@ -412,6 +575,43 @@ const normalizedResult = (value: unknown): Record<string, unknown> => {
     throw new TypeError("Missing CLI normalized result");
   return value.normalized_result;
 };
+
+const redirectCapture = (
+  inspection: Record<string, unknown>,
+  origin: string,
+  status: number | null,
+) => {
+  const copy = structuredClone(inspection);
+  if (!isRecord(copy.network) || !Array.isArray(copy.network.requests))
+    throw new Error("Missing network capture");
+  const request = copy.network.requests[0];
+  if (!isRecord(request)) throw new Error("Missing network request");
+  request.redirects = [
+    {
+      url: `${origin}/prior`,
+      response_url: `${origin}/prior`,
+      method: "GET",
+      resource_type: "Fetch",
+      status,
+      mime_type: "text/plain",
+      encoded_data_length: 12,
+      request_timestamp: 1,
+      redirect_event_timestamp: 2,
+    },
+  ];
+  return { inspection: copy };
+};
+
+const compareCapturesCli = (before: unknown, after: unknown) =>
+  runCli(
+    [
+      "compare-web-captures",
+      JSON.stringify(before),
+      JSON.stringify(after),
+      "--json",
+    ],
+    process.env,
+  );
 
 const completeScenarioCapture = () => {
   const url = {
@@ -466,15 +666,63 @@ const completeScenarioCapture = () => {
         header_values: false,
       },
       event_families: [],
+      limits: DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
     },
     duration_ms: 1,
     steps: [
       step(0, "scenario_start", "scenario_start"),
       step(1, "open-settings", "click"),
     ],
-    events: { retained: 0, dropped: 0, items: [] },
+    events: {
+      retained: 0,
+      dropped: 0,
+      items: [],
+      omissions: {
+        by_kind: [],
+        network_transactions: [],
+        network_transaction_range: null,
+      },
+    },
     completeness,
     limitations: [],
+  };
+};
+
+const scenarioCaptureWithConsole = (
+  text: string,
+  networkContent: {
+    readonly request_body: boolean;
+    readonly response_body: boolean;
+    readonly header_values: boolean;
+  },
+) => {
+  const capture = completeScenarioCapture();
+  return {
+    ...capture,
+    scenario: {
+      ...capture.scenario,
+      network_content: networkContent,
+      event_families: ["console"],
+    },
+    events: {
+      retained: 1,
+      dropped: 0,
+      items: [
+        {
+          sequence: 1,
+          step_index: 1,
+          kind: "console",
+          level: "info",
+          text,
+          url: null,
+        },
+      ],
+      omissions: {
+        by_kind: [],
+        network_transactions: [],
+        network_transaction_range: null,
+      },
+    },
   };
 };
 

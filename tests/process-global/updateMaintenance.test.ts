@@ -12,6 +12,7 @@ import {
 } from "../../src/application/UpdateMaintenance.js";
 import {
   runUpdateCommand,
+  UPDATE_COMMAND_OUTPUT_BYTES,
   systemUpdateHost,
 } from "../../src/application/UpdateRuntime.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
@@ -25,6 +26,7 @@ beforeEach(async () => {
     HOME: home,
     USERPROFILE: home,
     APPDATA: join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: join(home, "AppData", "Local"),
     CLAUDE_CONFIG_DIR: home,
     CODEX_HOME: join(home, ".codex"),
     COPILOT_HOME: join(home, ".copilot"),
@@ -123,6 +125,57 @@ describe("OMP integration maintenance", () => {
     await expect(
       existingMaintenanceScope(home, entryPoint, process.env),
     ).resolves.toMatchObject({ clients: ["grok_build"] });
+  });
+});
+
+describe("maintenance activation and layered configuration", () => {
+  it("leaves a natively disabled ZCode registration outside maintenance", async () => {
+    const configPath = await writeClient(
+      "zcode",
+      JSON.stringify({
+        mcp: {
+          servers: {
+            rea: { command: entryPoint, args: ["mcp"], enable: false },
+          },
+        },
+      }),
+    );
+    const original = await readFile(configPath, "utf8");
+    await expect(
+      existingMaintenanceScope(home, entryPoint, process.env),
+    ).resolves.toMatchObject({ clients: [] });
+    expect(await readFile(configPath, "utf8")).toBe(original);
+  });
+
+  it("selects a ZCode registration loaded from the same-scope fallback", async () => {
+    await writeClient("zcode", JSON.stringify({ mcp: { servers: {} } }));
+    const fallbackPath = join(home, ".agents", "mcp.json");
+    await mkdir(join(home, ".agents"), { recursive: true });
+    await writeFile(
+      fallbackPath,
+      JSON.stringify({
+        mcpServers: { rea: { command: entryPoint, args: ["mcp"] } },
+      }),
+    );
+
+    await expect(
+      existingMaintenanceScope(home, entryPoint, process.env),
+    ).resolves.toMatchObject({ clients: ["zcode"] });
+  });
+
+  it("selects an enabled registration inherited through layered OpenCode files", async () => {
+    const directory = join(home, ".config", "opencode");
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      join(directory, "opencode.json"),
+      JSON.stringify({
+        mcp: { rea: { type: "local", command: [entryPoint, "mcp"] } },
+      }),
+    );
+    await writeClient("opencode", JSON.stringify({ theme: "user-selected" }));
+    await expect(
+      existingMaintenanceScope(home, entryPoint, process.env),
+    ).resolves.toMatchObject({ clients: ["opencode"] });
   });
 });
 
@@ -283,6 +336,8 @@ describe("updated executable maintenance planning", () => {
   it("runs real setup as a noninteractive dry run and creates no new integrations or backups", async () => {
     const configPath = await writeClient("codex", staleCodex);
     const untouched = await writeClient("claude_code", '{"mcpServers":{}}');
+    const skillContent = `---\nname: ${PRODUCT_IDENTITY.skillName}\nmetadata:\n  version: "1"\n---\n# REA\n`;
+    const skillPath = await writeSkill(skillContent);
     vi.stubEnv("npm_command", "exec");
     const result = await planIntegrationMaintenance(
       home,
@@ -292,18 +347,35 @@ describe("updated executable maintenance planning", () => {
     );
     expect(result).toMatchObject({
       status: "planned",
-      scope: { clients: ["codex"], skill: false },
-      plannedActions: [
-        { id: "configure_client:codex", kind: "configure_client" },
-      ],
+      scope: {
+        clients: ["codex"],
+        skill: true,
+        skillDestinations: [{ client: "shared", path: dirname(skillPath) }],
+      },
     });
+    if (result.status !== "planned") throw new Error(JSON.stringify(result));
+    expect(result.plannedActions).toEqual([
+      expect.objectContaining({
+        id: "configure_client:codex",
+        kind: "configure_client",
+      }),
+      expect.objectContaining({
+        id: "install_skill",
+        kind: "install_skill",
+        target: dirname(skillPath),
+      }),
+    ]);
     expect(await readFile(configPath, "utf8")).toBe(staleCodex);
     expect(await readFile(untouched, "utf8")).toBe('{"mcpServers":{}}');
+    expect(await readFile(skillPath, "utf8")).toBe(skillContent);
     await expect(access(`${configPath}.rea.backup`)).rejects.toMatchObject({
       code: "ENOENT",
     });
+    await expect(access(`${skillPath}.rea.backup`)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
     await expect(
-      access(join(home, ".agents", "skills", PRODUCT_IDENTITY.skillName)),
+      access(join(home, ".claude", "skills", PRODUCT_IDENTITY.skillName)),
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
@@ -373,65 +445,93 @@ describe("update subprocess boundaries", () => {
   });
 });
 
+const createBunUpdateFixture = async (
+  root: string,
+  bunVersion: string,
+  installOutputBytes: number,
+  installExitCode: number,
+) => {
+  const globalDirectory = join(root, "bun", "install", "global");
+  const packageRoot = join(
+    globalDirectory,
+    "node_modules",
+    PRODUCT_IDENTITY.packageName,
+  );
+  const versionPath = join(root, "installed-version");
+  const logPath = join(root, "bun-invocations.jsonl");
+  await mkdir(join(packageRoot, "scripts"), { recursive: true });
+  await writeFile(
+    join(globalDirectory, "package.json"),
+    '{"dependencies":{"rea-agents":"3.2.1"}}\n',
+  );
+  await writeFile(versionPath, "3.2.1");
+  await writeFile(
+    join(packageRoot, "scripts", "rea.mjs"),
+    `import { readFileSync } from "node:fs";\nprocess.stdout.write(readFileSync(${JSON.stringify(versionPath)}, "utf8") + "\\n");\n`,
+  );
+  const binDirectory = join(root, "bin");
+  const recorder = join(binDirectory, "record-bun.mjs");
+  await mkdir(binDirectory);
+  await writeFile(
+    recorder,
+    [
+      'import { appendFileSync, writeFileSync } from "node:fs";',
+      "const args = process.argv.slice(2);",
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, cwd: process.cwd(), globalDirectory: process.env.BUN_INSTALL_GLOBAL_DIR }) + "\\n");`,
+      `if (JSON.stringify(args) === '["--version"]') console.log(${JSON.stringify(bunVersion)});`,
+      `else if (JSON.stringify(args) === ${JSON.stringify(JSON.stringify(["info", PRODUCT_IDENTITY.packageName, "dist-tags.latest", "--json"]))}) process.stdout.write('"3.3.0"\\n');`,
+      `else if (JSON.stringify(args) === ${JSON.stringify(JSON.stringify(["add", "--global", "--ignore-scripts", `${PRODUCT_IDENTITY.packageName}@3.3.0`]))}) process.stderr.write('x'.repeat(${installOutputBytes}), () => { ${installExitCode === 0 ? `writeFileSync(${JSON.stringify(versionPath)}, "3.3.0");` : "process.exitCode = 2;"} });`,
+      "else process.exitCode = 2;",
+      "",
+    ].join("\n"),
+  );
+  if (process.platform === "win32") {
+    await writeFile(
+      join(binDirectory, "bun.cmd"),
+      `@"${process.execPath}" "${recorder}" %*\r\n`,
+    );
+  } else {
+    await writeFile(
+      join(binDirectory, "bun"),
+      `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(recorder)} "$@"\n`,
+      { mode: 0o755 },
+    );
+  }
+  return { globalDirectory, packageRoot, versionPath, logPath, binDirectory };
+};
+
 describe("Bun global installation update", () => {
   it.each([
-    ["1.4.2", "updated", "absolute"],
-    ["1.2.17", "updated", "absolute"],
-    ["1.2.17", "updated", "relative"],
-    ["1.2.14", "failed", "absolute"],
-    ["1.2.17-canary.1", "failed", "absolute"],
-    ["unknown", "failed", "absolute"],
-  ])(
+    ["1.4.2", "updated", "absolute", UPDATE_COMMAND_OUTPUT_BYTES + 1, 0],
+    ["1.4.2", "install-failed", "absolute", UPDATE_COMMAND_OUTPUT_BYTES + 1, 2],
+    ["1.2.17", "updated", "absolute", 0, 0],
+    ["1.2.17", "updated", "relative", 0, 0],
+    ["1.2.14", "failed", "absolute", 0, 0],
+    ["1.2.17-canary.1", "failed", "absolute", 0, 0],
+    ["unknown", "failed", "absolute", 0, 0],
+  ] as const)(
     "handles Bun %s with outcome %s using %s global-directory configuration",
-    async (bunVersion, status, directoryMode) => {
+    async (
+      bunVersion,
+      status,
+      directoryMode,
+      installOutputBytes,
+      installExitCode,
+    ) => {
       // A recording `bun` on PATH crosses the real subprocess boundary without registry access.
       const root = await createTestTempDirectory("rea-update-bun-");
-      const globalDirectory = join(root, "bun", "install", "global");
-      const packageRoot = join(
+      const {
         globalDirectory,
-        "node_modules",
-        PRODUCT_IDENTITY.packageName,
+        packageRoot,
+        versionPath,
+        logPath,
+        binDirectory,
+      } = await createBunUpdateFixture(
+        root,
+        bunVersion,
+        installOutputBytes,
+        installExitCode,
       );
-      const versionPath = join(root, "installed-version");
-      const logPath = join(root, "bun-invocations.jsonl");
-      await mkdir(join(packageRoot, "scripts"), { recursive: true });
-      await writeFile(
-        join(globalDirectory, "package.json"),
-        '{"dependencies":{"rea-agents":"3.2.1"}}\n',
-      );
-      await writeFile(versionPath, "3.2.1");
-      await writeFile(
-        join(packageRoot, "scripts", "rea.mjs"),
-        `import { readFileSync } from "node:fs";\nprocess.stdout.write(readFileSync(${JSON.stringify(versionPath)}, "utf8") + "\\n");\n`,
-      );
-      const binDirectory = join(root, "bin");
-      const recorder = join(binDirectory, "record-bun.mjs");
-      await mkdir(binDirectory);
-      await writeFile(
-        recorder,
-        [
-          'import { appendFileSync, writeFileSync } from "node:fs";',
-          "const args = process.argv.slice(2);",
-          `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, cwd: process.cwd(), globalDirectory: process.env.BUN_INSTALL_GLOBAL_DIR }) + "\\n");`,
-          `if (JSON.stringify(args) === '["--version"]') console.log(${JSON.stringify(bunVersion)});`,
-          `else if (JSON.stringify(args) === ${JSON.stringify(JSON.stringify(["info", PRODUCT_IDENTITY.packageName, "dist-tags.latest", "--json"]))}) process.stdout.write('"3.3.0"\\n');`,
-          `else if (JSON.stringify(args) === ${JSON.stringify(JSON.stringify(["add", "--global", "--ignore-scripts", `${PRODUCT_IDENTITY.packageName}@3.3.0`]))}) writeFileSync(${JSON.stringify(versionPath)}, "3.3.0");`,
-          "else process.exitCode = 2;",
-          "",
-        ].join("\n"),
-      );
-      if (process.platform === "win32") {
-        await writeFile(
-          join(binDirectory, "bun.cmd"),
-          `@"${process.execPath}" "${recorder}" %*\r\n`,
-        );
-      } else {
-        await writeFile(
-          join(binDirectory, "bun"),
-          `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(recorder)} "$@"\n`,
-          { mode: 0o755 },
-        );
-      }
       const pathKey =
         Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ??
         "PATH";
@@ -479,18 +579,26 @@ describe("Bun global installation update", () => {
         return;
       }
 
-      expect(result).toMatchObject({
-        status: "updated",
-        installMethod: "bun",
-        installedVersion: "3.3.0",
-        command: [
-          "bun",
-          "add",
-          "--global",
-          "--ignore-scripts",
-          `${PRODUCT_IDENTITY.packageName}@3.3.0`,
-        ],
-      });
+      if (status === "install-failed") {
+        expect(result).toMatchObject({
+          status: "failed",
+          reason: "install",
+          remediation: expect.stringContaining("diagnostics truncated"),
+        });
+        expect(await readFile(versionPath, "utf8")).toBe("3.2.1");
+      } else
+        expect(result).toMatchObject({
+          status: "updated",
+          installMethod: "bun",
+          installedVersion: "3.3.0",
+          command: [
+            "bun",
+            "add",
+            "--global",
+            "--ignore-scripts",
+            `${PRODUCT_IDENTITY.packageName}@3.3.0`,
+          ],
+        });
       // `bun info` needs a project in its working directory, and the caller's
       // directory must never be selected, so all commands run in the owner.
       expect(invocations).toEqual([

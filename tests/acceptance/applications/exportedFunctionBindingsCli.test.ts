@@ -7,12 +7,19 @@ import { promisify } from "node:util";
 
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import { closeVerifierResources } from "../../../scripts/lib/verifier-cleanup.mjs";
 import { javascriptApplicationAnalysisResultSchema } from "../../../src/domain/javascript/javascriptApplicationAnalysis.js";
 import { javaScriptExportShapeComparisonResultSchema } from "../../../src/domain/javascript/javascriptExportShapeComparisonSchemas.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { cliCompileCacheEnvironment } from "../../support/cli/cliFixture.js";
+import {
+  createTestWorkspace,
+  removeTestWorkspace,
+  type TestWorkspace,
+} from "../../support/workspace/workspaceFixture.js";
 
 const execute = promisify(execFile);
 const requireFixture = createRequire(import.meta.url);
@@ -22,6 +29,12 @@ const comparisonEnvelope = z.object({
 const applicationEnvelope = z.object({
   normalized_result: javascriptApplicationAnalysisResultSchema,
 });
+let cliCacheWorkspace: TestWorkspace | undefined;
+
+beforeAll(async () => {
+  cliCacheWorkspace = await createTestWorkspace("rea-export-bindings-cache-");
+});
+
 // Source semantics use the real stdio workflow throughout the matrix. The
 // missing-export and count-change cases also check compiled CLI adapter parity.
 let mcpConnection:
@@ -33,17 +46,25 @@ let mcpConnection:
   | undefined;
 
 afterAll(async () => {
-  if (mcpConnection === undefined) return;
-  try {
-    await mcpConnection.ready;
-  } catch {
-    // Keep the failed connection owned until both resources are closed below.
+  if (mcpConnection !== undefined) {
+    try {
+      await mcpConnection.ready;
+    } catch {
+      // Keep the failed connection owned until both resources are closed below.
+    }
   }
-  try {
-    await mcpConnection.client.close();
-  } finally {
-    await mcpConnection.transport.close();
-  }
+  await closeVerifierResources([
+    async () => {
+      await mcpConnection?.client.close();
+    },
+    async () => {
+      await mcpConnection?.transport.close();
+    },
+    async () => {
+      if (cliCacheWorkspace !== undefined)
+        await removeTestWorkspace(cliCacheWorkspace.root);
+    },
+  ]);
 });
 
 describe("exported function binding resolution through stdio MCP and CLI", () => {
@@ -191,6 +212,121 @@ describe("exported function binding resolution through stdio MCP and CLI", () =>
         await expectCliAnalysisParity(fixture);
         expect(await compareThroughCli(fixture)).toEqual(comparison);
       }
+    },
+  );
+});
+
+describe("CommonJS receiver lifetimes through stdio MCP and CLI", () => {
+  it.each([
+    "module.exports = {}; exports.parse = VALUE;",
+    "exports = {}; exports.parse = VALUE;",
+    "exports.parse = VALUE; module.exports = {};",
+    "module.exports.parse = VALUE; module.exports = {};",
+    "module.exports = {}; exports = module.exports; module.exports = {}; exports.parse = VALUE;",
+    'module.exports = {}; exports.parse = "enabled";',
+    'module.exports = {}; Reflect.set(module, "other", exports); exports.parse = VALUE;',
+    "module.exports = {}; let wrapper = module; wrapper = {}; Object.assign(wrapper, { exports }); exports.parse = VALUE;",
+  ])("excludes detached public export receivers: %s", async (source) => {
+    const fixture = await analyzeVersions(
+      (count) =>
+        source.replace(
+          "VALUE",
+          `() => ({ kind: "result", count: ${String(count)} })`,
+        ),
+      "parse",
+      "app.cjs",
+    );
+    for (const path of [fixture.leftPath, fixture.rightPath]) {
+      const value = requireFixture(path);
+      expect(Object.hasOwn(value, "parse")).toBe(false);
+      expect(value.parse).toBeUndefined();
+    }
+    for (const evidence of [fixture.input.left, fixture.input.right]) {
+      const { graph } = applicationEnvelope.parse(evidence).normalized_result;
+      expect(
+        graph.nodes
+          .flatMap(({ observations }) => observations)
+          .filter(
+            ({ properties }) =>
+              properties.exported_name === "parse" &&
+              ["export-binding", "export-return-shapes"].includes(
+                String(properties.semantic_role),
+              ),
+          ),
+      ).toEqual([]);
+    }
+    await expectCliAnalysisParity(fixture);
+    const comparison = await compareThroughMcp(fixture.input);
+    expect(comparison).toMatchObject({
+      left: { status: "missing" },
+      right: { status: "missing" },
+      summary: { added: 0, removed: 0, changed: 0 },
+    });
+    expect(await compareThroughCli(fixture)).toEqual(comparison);
+  });
+
+  it.each([
+    "exports.parse = VALUE;",
+    "module.exports = {}; module.exports.parse = VALUE;",
+    "module.exports = {}; exports = module.exports; exports.parse = VALUE;",
+    "exports.parse = VALUE; Object.assign(module.exports, { other: exports });",
+  ])("retains connected public export receivers: %s", async (source) => {
+    const fixture = await analyzeVersions(
+      (count) =>
+        source.replace(
+          "VALUE",
+          `() => ({ kind: "result", count: ${String(count)} })`,
+        ),
+      "parse",
+      "app.cjs",
+    );
+    for (const [path, count] of [
+      [fixture.leftPath, 1],
+      [fixture.rightPath, 2],
+    ] as const)
+      expect(requireFixture(path).parse()).toEqual({ kind: "result", count });
+    await expectCliAnalysisParity(fixture);
+    const comparison = await compareThroughMcp(fixture.input);
+    expectCountChange(comparison);
+    expect(await compareThroughCli(fixture)).toEqual(comparison);
+  });
+
+  it.each([
+    "if (false) module.exports = {}; exports.parse = VALUE;",
+    "exports.parse = VALUE; if (false) module.exports = {};",
+    "function replace() { module.exports = {}; } exports.parse = VALUE;",
+    "function replace() { exports = {}; } exports.parse = VALUE;",
+    'const holder = {}; ({ [(module.exports = exports, "x")]: holder.x } = (module.exports = {})); exports.parse = VALUE;',
+    'const { [(module.exports = exports, "x")]: value } = (module.exports = {}); exports.parse = VALUE;',
+    "const [value = (module.exports = exports)] = (module.exports = []); exports.parse = VALUE;",
+    "module.exports = {}; Object.assign(module, { exports }); exports.parse = VALUE;",
+    'module.exports = {}; Object.defineProperty(module, "exports", { value: exports }); exports.parse = VALUE;',
+    'module.exports = {}; Reflect.set(module, "exports", exports); exports.parse = VALUE;',
+    "module.exports = {}; const assign = Object.assign; assign.call(null, module, { exports }); exports.parse = VALUE;",
+    "module.exports = {}; const wrapper = module; Object.assign(wrapper, { exports }); exports.parse = VALUE;",
+  ])(
+    "keeps execution-dependent receiver identity uncertain: %s",
+    async (source) => {
+      const fixture = await analyzeVersions(
+        (count) =>
+          source.replace(
+            "VALUE",
+            `() => ({ kind: "result", count: ${String(count)} })`,
+          ),
+        "parse",
+        "app.cjs",
+      );
+      for (const [path, count] of [
+        [fixture.leftPath, 1],
+        [fixture.rightPath, 2],
+      ] as const)
+        expect(requireFixture(path).parse()).toEqual({ kind: "result", count });
+      for (const evidence of [fixture.input.left, fixture.input.right])
+        expectUnresolvedExportBinding(evidence, "parse");
+      await expectCliAnalysisParity(fixture);
+      const comparison = await compareThroughMcp(fixture.input);
+      expectUncertainComparison(comparison);
+      expect(await compareThroughCli(fixture)).toEqual(comparison);
     },
   );
 });
@@ -462,6 +598,48 @@ describe("stable exported function bindings through stdio MCP", () => {
     const fixture = await analyzeVersions(source, "default");
     expectCountChange(await compareThroughMcp(fixture.input));
   });
+
+  it.each([
+    {
+      name: "a local callable captured by an identifier default export",
+      source: (count: number) =>
+        `const run = () => ({ kind: "result", count: ${String(count)} });\nexport default run;`,
+      runtimeValue: (count: number) => ({ kind: "result", count }),
+      expected: "known",
+    },
+    {
+      name: "the latest callable assigned before the default export",
+      source: (count: number) =>
+        `let run = () => ({ count: 0 });\nrun = () => ({ kind: "result", count: ${String(count)} });\nexport default run;`,
+      runtimeValue: (count: number) => ({ kind: "result", count }),
+      expected: "known",
+    },
+    {
+      name: "a callable assigned only after the default export capture",
+      source: (count: number) =>
+        `var run;\nexport default run;\nrun = () => ({ kind: "result", count: ${String(count)} });`,
+      runtimeValue: () => undefined,
+      expected: "unknown",
+    },
+    {
+      name: "a reassignment after the default export capture",
+      source: (count: number) =>
+        `let run = () => ({ kind: "result", count: ${String(count)} });\nexport default run;\nrun = () => ({ count: 99 });`,
+      runtimeValue: (count: number) => ({ kind: "result", count }),
+      expected: "known",
+    },
+  ] as const)(
+    "uses the value at $name",
+    async ({ source, runtimeValue, expected }) => {
+      const fixture = await analyzeVersions(source, "default");
+      await expectRuntimeExports(fixture, runtimeValue);
+      const mcp = await compareThroughMcp(fixture.input);
+      const cli = await compareThroughCli(fixture);
+      expect(cli).toEqual(mcp);
+      if (expected === "known") expectCountChange(mcp);
+      else expectUncertainComparison(mcp);
+    },
+  );
 });
 
 describe("export bindings with loop and assignment-only writes", () => {
@@ -1035,12 +1213,17 @@ const expectCountChange = (
 };
 
 const runCli = async (args: readonly string[]): Promise<unknown> => {
+  if (cliCacheWorkspace === undefined)
+    throw new Error("CLI compile-cache workspace was not initialized");
   const { stdout } = await execute(
     process.execPath,
     [resolve("scripts/rea.mjs"), ...args],
     {
       maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, REA_LOG_LEVEL: "silent" },
+      env: cliCompileCacheEnvironment(
+        { ...process.env, REA_LOG_LEVEL: "silent" },
+        cliCacheWorkspace.path("node-compile"),
+      ),
     },
   );
   return JSON.parse(stdout);

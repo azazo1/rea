@@ -3,6 +3,136 @@ import { describe, expect, it } from "vitest";
 import { runSetup } from "./Setup.js";
 import type { SetupProgressEvent } from "./SetupTypes.js";
 import { FakeSetupHost, options } from "./Setup.fixture.js";
+import { SetupSkillInstallError } from "./SetupSkill.js";
+import { err, ok } from "../domain/result.js";
+import { HopperReleaseError } from "./HopperReleaseFeed.js";
+
+const linkedSkillFailure = () =>
+  new SetupSkillInstallError({
+    path: "/fixture/home/.claude/skills/reverse-engineer-anything",
+    stage: "prepare",
+    reason: "Skill directory is a symbolic link",
+    rollbackFailures: [],
+    recoveryBackupPaths: [],
+    cause: undefined,
+  });
+
+describe("Linux publisher cache approval", () => {
+  it.each([true, false])(
+    "discloses the selected cache or blocks an unresolved path before approval: %s",
+    async (valid) => {
+      const host = Object.assign(new FakeSetupHost("linux"), {
+        linuxHopperReleaseCache: valid
+          ? ok("/caller/cache/rea/hopper-releases")
+          : err(
+              new HopperReleaseError(
+                "verification_unavailable",
+                "Invalid selected cache path",
+              ),
+            ),
+      });
+      host.distribution = {
+        id: "ubuntu",
+        versionId: "24.04",
+        packageFamily: "deb",
+        hopperSetupSupported: true,
+      };
+      const result = await runSetup(options(false, true), host);
+      if (valid)
+        expect(
+          result.plannedActions.find(({ kind }) => kind === "install_hopper")
+            ?.detail,
+        ).toContain("/caller/cache/rea/hopper-releases/<launcher-sha256>");
+      else
+        expect(result).toMatchObject({
+          status: "needs_human",
+          plannedActions: [],
+        });
+      expect(host.hopperInstalls).toBe(0);
+      expect(host.configurations).toBe(0);
+      expect(host.skillInstalls).toBe(0);
+    },
+  );
+});
+
+describe("selected skill admission", () => {
+  it.each(["codex", "shared"] as const)(
+    "keeps %s choices when an unselected client is linked",
+    async (choice) => {
+      const host = new FakeSetupHost();
+      host.hopper = "/Applications/Hopper";
+      host.clients = [
+        { name: "claude_code", configPath: "/claude.json" },
+        { name: "codex", configPath: "/codex.toml", format: "toml" },
+      ];
+      host.validateSkillDirectories = async (ids) => {
+        host.skillDirectoryValidations.push(ids);
+        return ids.includes("claude_code")
+          ? err(linkedSkillFailure())
+          : ok(undefined);
+      };
+      const result = await runSetup(
+        { ...options(false), structured: false },
+        host,
+        async (actions, context) => {
+          if (context?.stage === "select") {
+            expect(actions.some(({ kind }) => kind === "install_skill")).toBe(
+              true,
+            );
+            return {
+              approved: false,
+              selectedActionIds:
+                choice === "codex"
+                  ? ["configure_client:codex"]
+                  : ["install_skill"],
+            };
+          }
+          return true;
+        },
+      );
+      expect(result.status).toBe("ready");
+      expect(host.skillInstalls).toBe(1);
+      expect(host.configurations).toBe(choice === "codex" ? 1 : 0);
+      expect(host.skillDirectoryValidations).toEqual(
+        choice === "codex" ? [["codex"], ["codex"]] : [[], []],
+      );
+    },
+  );
+
+  it("rechecks directory admission after approval before changing clients or Hopper", async () => {
+    const host = new FakeSetupHost("linux");
+    host.distribution = {
+      id: "ubuntu",
+      versionId: "24.04",
+      packageFamily: "deb",
+      hopperSetupSupported: true,
+    };
+    host.clients = [{ name: "claude_code", configPath: "/claude.json" }];
+    let linked = false;
+    host.validateSkillDirectories = async () =>
+      linked ? err(linkedSkillFailure()) : ok(undefined);
+    const result = await runSetup(
+      {
+        ...options(false, true),
+        clientIds: ["claude_code"],
+        structured: false,
+      },
+      host,
+      async () => {
+        linked = true;
+        return true;
+      },
+    );
+    expect(result).toMatchObject({
+      status: "needs_human",
+      code: "skill_install_failed",
+      appliedActions: [],
+    });
+    expect(host.configurations).toBe(0);
+    expect(host.hopperInstalls).toBe(0);
+    expect(host.skillInstalls).toBe(0);
+  });
+});
 
 describe("skill plan destinations", () => {
   it("plans a Claude-only skill in its personal location", async () => {
@@ -45,6 +175,112 @@ describe("skill plan destinations", () => {
 });
 
 describe("setup workflow", () => {
+  it("blocks client registration when no executable entrypoint is available", async () => {
+    const host = new FakeSetupHost("win32");
+    host.registrationCommand = [];
+    host.registrationCommandBlocker =
+      "REA could not determine the current executable entrypoint.";
+    host.clients = [{ name: "codex", configPath: "C:\\config\\codex.toml" }];
+
+    const result = await runSetup(
+      { ...options(true), clientIds: ["codex"], installSkill: false },
+      host,
+    );
+
+    expect(result.status).toBe("needs_human");
+    expect(result.plannedActions).toEqual([]);
+    expect(result.remediation).toBe(host.registrationCommandBlocker);
+    expect(host.configurations).toBe(0);
+  });
+
+  it("keeps a relative Node registration out of setup defaults when cwd happens to match", async () => {
+    const host = new FakeSetupHost();
+    host.clients = [{ name: "cursor", configPath: "/cursor.json" }];
+    host.productRegistrations = [
+      {
+        client: "cursor",
+        config_path: "/cursor.json",
+        command: [process.execPath, "./rea.mjs", "mcp"],
+        state: "stale",
+        remediation: "Run rea setup to refresh this registration.",
+      },
+    ];
+
+    const result = await runSetup(
+      { ...options(false), clientIds: [], installSkill: false },
+      host,
+    );
+
+    expect(result.clientStates).toContainEqual(
+      expect.objectContaining({
+        client: expect.objectContaining({ name: "cursor" }),
+        status: "unknown",
+        configured: false,
+      }),
+    );
+    expect(result.plannedActions).toEqual([]);
+    expect(host.configurations).toBe(0);
+  });
+});
+
+describe("setup client selection", () => {
+  it.each([true, false])(
+    "handles repeated clients once in first-selected order (dry run: %s)",
+    async (dryRun) => {
+      const host = new FakeSetupHost();
+      host.hopper = "/Applications/Hopper";
+      host.skill = "unchanged";
+      host.clients = [
+        { name: "cursor", configPath: "/cursor.json" },
+        { name: "codex", configPath: "/codex.toml", format: "toml" },
+      ];
+      const inspected: string[] = [];
+      const configured: string[] = [];
+      const inspect = host.inspectClientConfiguration;
+      const configure = host.configureClient;
+      host.inspectClientConfiguration = (client) => {
+        inspected.push(client.name);
+        return inspect(client);
+      };
+      host.configureClient = (client, environment, command) => {
+        configured.push(client.name);
+        return configure(client, environment, command);
+      };
+
+      const result = await runSetup(
+        {
+          ...options(true),
+          clientIds: ["codex", "cursor", "codex", "cursor"],
+          installSkill: false,
+          dryRun,
+        },
+        host,
+      );
+
+      expect(result.status).toBe(dryRun ? "planned" : "ready");
+      expect(result.plannedActions.map(({ id }) => id)).toEqual([
+        "configure_client:codex",
+        "configure_client:cursor",
+      ]);
+      expect(inspected).toEqual(["codex", "cursor"]);
+      expect(configured).toEqual(dryRun ? [] : ["codex", "cursor"]);
+      expect(result.appliedActions).toEqual(
+        dryRun ? [] : ["configured_codex", "configured_cursor"],
+      );
+      if (!dryRun) {
+        expect(result.clients).toEqual({
+          codex: { status: "configured" },
+          cursor: { status: "configured" },
+        });
+        expect(host.doctorScopes.at(-1)?.clients).toEqual(["codex", "cursor"]);
+      }
+      expect(host.hopperInstalls).toBe(0);
+      expect(host.skillInstalls).toBe(0);
+    },
+  );
+});
+
+describe("setup plan application", () => {
   it("returns a complete plan without mutation", async () => {
     const host = new FakeSetupHost();
     host.clients = [{ name: "cursor", configPath: "/cursor.json" }];
@@ -70,7 +306,7 @@ describe("setup workflow", () => {
       id: "ubuntu",
       versionId: "24.04",
       packageFamily: "deb",
-      supported: true,
+      hopperSetupSupported: true,
     };
     const result = await runSetup(
       { ...options(false), structured: false },
@@ -162,13 +398,32 @@ describe("setup workflow", () => {
       id: "ubuntu",
       versionId: "24.04",
       packageFamily: "deb",
-      supported: true,
+      hopperSetupSupported: true,
     };
     const result = await runSetup(options(true, true), host);
     expect(result.appliedActions).toEqual(["installed_hopper"]);
     expect(host.hopperInstalls).toBe(1);
     expect(result.status).toBe("ready");
     expect(result.remediation).toBeUndefined();
+  });
+
+  it("records an installed Hopper when opening the app needs manual recovery", async () => {
+    const host = new FakeSetupHost("darwin");
+    host.installHopper = () =>
+      Promise.resolve({
+        status: "installed",
+        launcherPath: "/Applications/Hopper.app/Contents/MacOS/hopper",
+        warning:
+          "Hopper was installed, but macOS could not open it. Open it manually.",
+      });
+
+    const result = await runSetup(options(true, true), host);
+
+    expect(result).toMatchObject({
+      status: "needs_human",
+      appliedActions: ["installed_hopper"],
+      remediation: expect.stringContaining("Open it manually"),
+    });
   });
 
   it("reuses existing Hopper without selecting every detected client", async () => {
@@ -236,7 +491,7 @@ describe("setup workflow lifecycle and provider planning", () => {
       id: "ubuntu",
       versionId: "24.04",
       packageFamily: "deb",
-      supported: true,
+      hopperSetupSupported: true,
     };
     host.ghidra = "/opt/ghidra_12.1.4_PUBLIC";
     host.javaHome = "/usr/lib/jvm/jdk-21";

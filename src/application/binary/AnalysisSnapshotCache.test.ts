@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createAnalysisProfile } from "../../domain/analysisProfile.js";
+import type { RelationshipCoverage } from "../../domain/relationshipCoverage.js";
 import {
   ANALYSIS_SNAPSHOT_PROFILE,
   ANALYSIS_SNAPSHOT_PROVIDER,
@@ -502,57 +503,58 @@ describe("analysis snapshot cache partitioning", () => {
   });
 });
 
-describe("relationship coverage snapshot replay", () => {
-  it("authenticates relationship coverage and replays legacy reads as unknown", () => {
-    const cache = new AnalysisSnapshotCache();
-    const operation = "procedure_callees" as const;
-    const parameters = { procedure: "0x1000", document: "fixture" };
-    const coverage = {
-      status: "complete" as const,
-      diagnostics: ["The provider retained an unresolved call target."],
-    };
-    const execution = createAnalysisExecution(
-      ["0x2000"],
-      ANALYSIS_SNAPSHOT_PROVIDER,
-      {
-        analysisProfile: ANALYSIS_SNAPSHOT_PROFILE,
-        rawResult: ["0x2000"],
-        relationshipCoverage: coverage,
-        subject: {
-          path: ANALYSIS_SNAPSHOT_TARGET.path,
-          sha256: ANALYSIS_SNAPSHOT_TARGET.sha256,
-          format: ANALYSIS_SNAPSHOT_TARGET.format,
-          ...(ANALYSIS_SNAPSHOT_TARGET.architecture === undefined
-            ? {}
-            : { architecture: ANALYSIS_SNAPSHOT_TARGET.architecture }),
-        },
-      },
-    );
-    cache.record({
-      target: ANALYSIS_SNAPSHOT_TARGET,
-      profile: ANALYSIS_SNAPSHOT_PROFILE,
+const createRelationshipCoverageSnapshot = (
+  relationshipCoverage?: RelationshipCoverage,
+) => {
+  const operation = "procedure_callees" as const;
+  const parameters = { procedure: "0x1000", document: "fixture" };
+  const cache = new AnalysisSnapshotCache();
+  const execution = createAnalysisExecution(
+    ["0x2000"],
+    ANALYSIS_SNAPSHOT_PROVIDER,
+    {
+      analysisProfile: ANALYSIS_SNAPSHOT_PROFILE,
+      rawResult: ["0x2000"],
+      subject: ANALYSIS_SNAPSHOT_TARGET,
+      ...(relationshipCoverage === undefined ? {} : { relationshipCoverage }),
+    },
+  );
+  cache.record({
+    target: ANALYSIS_SNAPSHOT_TARGET,
+    profile: ANALYSIS_SNAPSHOT_PROFILE,
+    operation,
+    parameters,
+    execution,
+  });
+  const evidence = createEvidence(
+    ANALYSIS_SNAPSHOT_TARGET,
+    ANALYSIS_SNAPSHOT_PROVIDER,
+    {
       operation,
       parameters,
-      execution,
-    });
-    const evidence = createEvidence(
-      ANALYSIS_SNAPSHOT_TARGET,
-      ANALYSIS_SNAPSHOT_PROVIDER,
-      {
-        operation,
-        parameters,
-        result: ["0x2000"],
-        rawResult: ["0x2000"],
-        analysisProfile: ANALYSIS_SNAPSHOT_PROFILE,
-        relationshipCoverage: coverage,
-      },
-    );
-    const exported = cache.export(
-      ANALYSIS_SNAPSHOT_TARGET,
-      ANALYSIS_SNAPSHOT_PROFILE,
-      createEvidenceBundle([evidence]),
-    );
-    if (!exported.ok) throw exported.error;
+      result: ["0x2000"],
+      rawResult: ["0x2000"],
+      analysisProfile: ANALYSIS_SNAPSHOT_PROFILE,
+      ...(relationshipCoverage === undefined ? {} : { relationshipCoverage }),
+    },
+  );
+  const exported = cache.export(
+    ANALYSIS_SNAPSHOT_TARGET,
+    ANALYSIS_SNAPSHOT_PROFILE,
+    createEvidenceBundle([evidence]),
+  );
+  if (!exported.ok) throw exported.error;
+  return { cache, operation, parameters, snapshot: exported.value };
+};
+
+describe("relationship coverage snapshot replay", () => {
+  it("authenticates coverage and rejects missing serialized fields", () => {
+    const coverage: RelationshipCoverage = {
+      status: "complete",
+      diagnostics: ["The provider retained an unresolved call target."],
+    };
+    const { cache, operation, parameters, snapshot } =
+      createRelationshipCoverageSnapshot(coverage);
     expect(
       cache.lookup(
         ANALYSIS_SNAPSHOT_TARGET,
@@ -562,7 +564,7 @@ describe("relationship coverage snapshot replay", () => {
       )?.relationshipCoverage,
     ).toEqual(coverage);
 
-    const tampered = structuredClone(exported.value);
+    const tampered = structuredClone(snapshot);
     const tamperedEntry = tampered.entries[0];
     if (tamperedEntry === undefined) throw new Error("snapshot entry missing");
     tamperedEntry.execution.relationship_coverage = {
@@ -573,26 +575,36 @@ describe("relationship coverage snapshot replay", () => {
       new AnalysisSnapshotCache().import(tampered, undefined, () => ok(0)).ok,
     ).toBe(false);
 
-    const legacy = structuredClone(exported.value);
-    const legacyEntry = legacy.entries[0];
-    if (legacyEntry === undefined) throw new Error("snapshot entry missing");
-    Reflect.deleteProperty(legacyEntry.execution, "relationship_coverage");
-    const legacyEvidence = createEvidence(
-      ANALYSIS_SNAPSHOT_TARGET,
-      ANALYSIS_SNAPSHOT_PROVIDER,
-      {
-        operation,
-        parameters,
-        result: ["0x2000"],
-        rawResult: ["0x2000"],
-        analysisProfile: ANALYSIS_SNAPSHOT_PROFILE,
-      },
+    const missingCoverage = structuredClone(snapshot);
+    const missingCoverageEntry = missingCoverage.entries[0];
+    if (missingCoverageEntry === undefined)
+      throw new Error("snapshot entry missing");
+    Reflect.deleteProperty(
+      missingCoverageEntry.execution,
+      "relationship_coverage",
     );
-    Reflect.deleteProperty(legacyEvidence, "relationship_coverage");
-    legacy.evidence_bundle = createEvidenceBundle([legacyEvidence]);
-    parseAnalysisSnapshot(legacy);
+    const missingCoverageEvidence = missingCoverage.evidence_bundle.records[0];
+    if (missingCoverageEvidence === undefined)
+      throw new Error("snapshot Evidence missing");
+    Reflect.deleteProperty(missingCoverageEvidence, "relationship_coverage");
+    expect(() => parseAnalysisSnapshot(missingCoverage)).toThrow();
+    expect(
+      new AnalysisSnapshotCache().import(missingCoverage, undefined, () =>
+        ok(0),
+      ).ok,
+    ).toBe(false);
+  });
+
+  it("replays absent coverage as explicitly unknown", () => {
+    const { operation, parameters, snapshot } =
+      createRelationshipCoverageSnapshot();
+    expect(snapshot.entries[0]?.execution.relationship_coverage).toBeNull();
+    expect(
+      snapshot.evidence_bundle.records[0]?.relationship_coverage,
+    ).toBeNull();
+
     const replayCache = new AnalysisSnapshotCache();
-    expect(replayCache.import(legacy, undefined, () => ok(0)).ok).toBe(true);
+    expect(replayCache.import(snapshot, undefined, () => ok(0)).ok).toBe(true);
     expect(
       replayCache.lookup(
         ANALYSIS_SNAPSHOT_TARGET,
@@ -660,4 +672,53 @@ it("does not replay pre-envelope call graphs under the revised workflow profile"
       normalized_result: oldResult,
     }).success,
   ).toBe(false);
+});
+
+describe("executions that report truncated references", () => {
+  const record = (referencesTruncated: boolean | undefined) => {
+    const cache = new AnalysisSnapshotCache();
+    const parameters = { address: "0x1000", document: "fixture" };
+    cache.record({
+      target: ANALYSIS_SNAPSHOT_TARGET,
+      profile: ANALYSIS_SNAPSHOT_PROFILE,
+      operation: "xrefs",
+      parameters,
+      execution: createAnalysisExecution(
+        ["0x2000"],
+        ANALYSIS_SNAPSHOT_PROVIDER,
+        {
+          subject: ANALYSIS_SNAPSHOT_TARGET,
+          analysisProfile: ANALYSIS_SNAPSHOT_PROFILE,
+          ...(referencesTruncated === undefined ? {} : { referencesTruncated }),
+        },
+      ),
+    });
+    return cache.lookup(
+      ANALYSIS_SNAPSHOT_TARGET,
+      ANALYSIS_SNAPSHOT_PROFILE,
+      "xrefs",
+      parameters,
+    );
+  };
+
+  it("are not replayed, because a replay would lose the truncation", () => {
+    expect(record(true)).toBeUndefined();
+  });
+
+  it("do not stop an execution that is complete or silent from being replayed", () => {
+    expect(record(false)?.result).toEqual(["0x2000"]);
+    expect(record(undefined)?.result).toEqual(["0x2000"]);
+  });
+});
+
+it("revises the trace_feature workflow profile so earlier results are not replayed", () => {
+  const profile = ANALYSIS_SNAPSHOT_PROFILE;
+
+  expect(workflowAnalysisProfile(profile, "trace_feature")).not.toEqual(
+    workflowAnalysisProfile(profile),
+  );
+  expect(
+    workflowAnalysisProfile(profile, "trace_call_path"),
+    "other workflows keep their profile",
+  ).toEqual(workflowAnalysisProfile(profile));
 });

@@ -1,18 +1,21 @@
 # JavaScript static/runtime reconciliation
 
 REA can combine an existing static JavaScript Application Graph with one or
-more passive browser, Electron page, or Node/Electron V8 Inspector captures without collapsing their different
-authorities. The `reconcile_javascript_runtime` MCP tool and
+more browser, Electron, or Node/Electron V8 Inspector observations while
+preserving their different authorities. The `reconcile_javascript_runtime` MCP tool and
 `rea reconcile-javascript-runtime` CLI command accept Evidence records and
 return derived Evidence containing a combined JavaScript Application Graph
 and explicit match, ambiguity, mismatch, and unknown classifications.
 
 The operation performs no filesystem, browser, or Electron I/O. It accepts only
 semantically verified Evidence produced by `analyze_javascript_application`,
-`inspect_web_page`, `inspect_electron_page`, or
-`observe_javascript_runtime`; matching operation names alone
+`inspect_web_page`, `inspect_electron_page`, `observe_javascript_runtime`, or
+`capture_electron_scenario`; matching operation names alone
 is insufficient. Provider identity, predicate type, subject digest, target
 parameters, and normalized-result schemas are checked before reconciliation.
+
+`capture_electron_scenario` supplies target-only partial observations. It does
+not establish loaded-script coverage; see [Electron observation](electron-observation.md).
 
 ## Workflow
 
@@ -20,9 +23,9 @@ parameters, and normalized-result schemas are checked before reconciliation.
    Optional cache or assets directories can be analyzed independently and
    supplied as additional layers.
 2. Run `inspect_web_page`, `inspect_electron_page`, or the attach-only
-   `observe_javascript_runtime`. Capturing script sources
-   is optional, but a source capture provides the strongest byte
-   identity.
+   `observe_javascript_runtime`, or supply existing `capture_electron_scenario`
+   Evidence with the partial scope above. Capturing script sources is optional,
+   but a source capture provides the strongest byte identity.
 3. Pass the resulting Evidence records to `reconcile_javascript_runtime`.
    Browser URLs normally need an explicit URL-prefix mapping. Extracted
    Electron and V8 Inspector file locations are mapped automatically when runtime files remain
@@ -88,23 +91,26 @@ nodes. REA evaluates compatible static candidates conservatively:
 
 1. A captured-source SHA-256 plus one matching mapped location yields
    a content-and-location match.
-2. One unique exact content digest can match even when no location mapping is
-   available. Whole-asset digests and reconstructed module-factory source
+2. When no static candidate exists at a mapped location, one unique exact
+   content digest can match. Whole-asset digests and reconstructed module-factory source
    digests remain distinguishable in the reported basis.
 3. Without captured bytes, one unique mapped artifact path can produce a
    medium-confidence location match.
 4. Multiple candidates remain `ambiguous`; no `observed_as` edge is emitted.
+   With captured source and mapped candidates, only mapped content matches
+   qualify; unrelated content matches elsewhere are excluded.
    `candidate_static_count` reports the full qualified layer/node count, and
    `candidate_static_nodes` includes every unique candidate reference.
 5. If captured bytes disagree with the static candidate at the mapped path,
-   the result is an explicit mismatch. A path never overrides a digest
-   disagreement.
+   the result is an explicit mismatch. An equal digest elsewhere cannot hide
+   that disagreement. If a mapped candidate's digest is unavailable and no
+   mapped content match is known, the comparison remains `unknown`.
 6. Missing authorization mappings and incomplete or truncated input coverage
    remain unknown or truncated rather than becoming absence claims.
 
 Every successful cross-layer `observed_as` edge has
 `authority: cross-layer-reconciliation` and `state: inferred`. The underlying
-artifact/AST observations and passive-CDP observations remain unchanged and
+artifact/AST observations and runtime observations remain unchanged and
 retain their own Evidence links.
 
 ## Loaded, resident, and not observed

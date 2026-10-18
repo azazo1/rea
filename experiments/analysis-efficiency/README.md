@@ -1,11 +1,59 @@
 # Analysis efficiency measurements
 
+For Hopper literal string queries, see the [decoded-record checkpoint](hopper-string-records.md).
+It measures record reuse through real Linux CLI/MCP workflows, preserving
+native recognition gaps, guard-stopped attempts and negative whole-task costs.
+
+For JEB on Linux, see the [CE native audit](jeb-linux-native.md). It qualifies
+the direct headless launch route and measures selected function reads through
+real CLI and production stdio MCP, preserving timeout attempts and the limits
+of wrapper-cache and token claims.
+
+For Apktool locale queries, see the
+[shared-decode and table-only checkpoint](apktool-string-tables.md). It separates
+the existing decode reuse from duplicate string delivery, with three real APKs,
+CLI/MCP parity, whole-task estimates and negative timing results.
+
+For immutable imported native/JavaScript parents, see the
+[validation-reuse checkpoint](immutable-parent-validation.md). It measures the
+owning format change with the existing retained-query driver, including first
+view costs, small cases, unchanged token estimates, and noisy whole-task results.
+
+For authentic old Evidence and mixed investigations, see the
+[retained-query checkpoint](retained-investigation-workflows.md).
+`retained-investigation.mjs` compares existing complete delivery with selected
+pages, including capacity-refusal recovery and original-record round trips.
+It records negative model results and separates imported-format validation work
+from the query contract.
+
+For genuine Fiddler captures, see the [SAZ selection checkpoint](saz-selection-workflows.md).
+`measure.mjs --saz-selection baseline|focused|retained` compares default complete
+delivery (including retained-reference recovery), caller-selected ordinals, and
+summary/preview/complete/repeated pages. Each failed RPC remains in task costs.
+The body question uses stored bytes, not decoded HTTP application payloads.
+
 Tracks the experiments for [#2016](https://github.com/morluto/rea/issues/2016).
 The production CLI/MCP contracts and defaults remain the compatibility baseline.
 Downloaded artifacts, runtime copies, exported Evidence, transcripts and detailed
 JSON measurements belong outside the checkout. This document keeps the measured
 findings, verification scope and revision references; the scripts and `corpus.json`
 keep the reproduction inputs. Generated `results/` is ignored.
+
+Follow-up: [latest-main capability audit](latest-main-audit.md) records the
+Flutter, SQLite, TShark and sigrok priorities and the first shipped Dart AOT
+baseline, preserving existing controls before introducing another selector.
+
+Follow-up: [Dart AOT summary and retained string pools](flutter-aot-summary.md)
+records real LocalSend delivery pairs and old Evidence continuation, preserving
+ABI selection, snapshot identity, original lower bounds and partial coverage.
+
+Follow-up: [SQLite existing-control measurements](sqlite-existing-controls.md)
+tests QGIS's shipped GeoPackage through the existing column selection, preserving
+full selected-table schema and typed cells before considering another API.
+
+Follow-up: [small real PCAP recordings](pcap-small-captures.md) compares existing
+complete delivery with summary/pages. Preserve the negative SDK/model input
+results: compact captures do not justify another production mechanism.
 
 Follow-up: [native PE/DOS entry views and real model verification](native-entry-views.md)
 records the post-merge native continuation, including a small-function case where
@@ -37,6 +85,11 @@ raw MCP replies from observed client execution/discovery and usage. Optional
 trial capture retains tool/usage items while excluding account and ambient state;
 existing ephemeral trials keep their default behavior.
 
+Follow-up: [Android package delivery and retained manifest](android-package-summary.md)
+records real NewPipe SDK pairs, unchanged old requests/Evidence, exact retained
+text, and actual Codex outcomes including client errors and a failed discovery.
+Reply bytes fall; model-token/time gains are not established.
+
 Follow-up: [resource counters at payload completion](resource-counters.md) adds
 optional owned counter observations while preserving unknown whole-scope final
 counters, default receipt shape and the unchanged CPU/memory safeguards.
@@ -50,6 +103,18 @@ private lab. These local files are not required to build or use REA. Historical
 checkpoint commits retain their original receipts; no history was rewritten.
 
 ## Optimization priorities and gradual migration
+
+The [larger/non-HTTP packet checkpoint](packet-field-workflows.md) records
+same-question SDK and actual Codex comparisons using existing input limits,
+field/filter selection, discovery and output windows. Lower delivered JSON did
+not establish stable total-token or speed gains; failed plans and negative
+controls remain visible.
+
+The [sigrok selection checkpoint](signal-selection-workflows.md) records two
+real hardware recordings, independently verified bytes, repeated decoder/pages,
+and an eight-task Codex cohort with mixed token/time results. Existing annotation
+controls reduce replies; these measurements introduce no production cache,
+default or API changes.
 
 Agent token consumption and end-to-end task time are the primary objectives.
 Memory and CPU consumption are also measured and controlled. Correctness,

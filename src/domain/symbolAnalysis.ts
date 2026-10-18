@@ -2,6 +2,7 @@ import type { JsonValue } from "./jsonValue.js";
 import type { AddressedName } from "./hopperValues.js";
 import {
   classifySwiftSymbol,
+  isSwiftMangledSymbolName,
   type SwiftTypeCategory,
 } from "./swiftSymbolClassification.js";
 
@@ -58,6 +59,16 @@ export const discoverObjcProtocols = (
   };
 };
 
+/**
+ * A Swift symbol carries either a demangler mangling or a name the category
+ * decoder already accepts, including visible runtime class names (`_Tt…`) and
+ * the optional leading underscore of legacy encodings (`__T0…`). Whether the
+ * nominal category can be decoded is a separate question, so it must not decide
+ * whether the symbol is Swift at all.
+ */
+const isSwiftSymbolName = (name: string): boolean =>
+  isSwiftMangledSymbolName(name) || classifySwiftSymbol(name) !== undefined;
+
 /** Categorize procedure names using Swift manglings at their exact addresses. */
 export const categorizeSwiftTypes = (
   procedures: readonly AddressedName[],
@@ -94,7 +105,7 @@ export const categorizeSwiftTypes = (
     if (seen.has(entry.name)) continue;
     const mangledNames = [
       ...new Set([
-        ...(classifySwiftSymbol(entry.name) === undefined ? [] : [entry.name]),
+        ...(isSwiftSymbolName(entry.name) ? [entry.name] : []),
         ...(aliases.get(entry.address) ?? []),
       ]),
     ];
@@ -104,9 +115,13 @@ export const categorizeSwiftTypes = (
       ![entry.name, ...mangledNames].some((name) => name.includes(pattern))
     )
       continue;
-    const kinds = new Set(
-      mangledNames.map((name) => classifySwiftSymbol(name)?.category ?? null),
-    );
+    // Only decoded categories vote. A Swift-looking alias whose category is
+    // not decoded remains evidence without erasing a decoded category.
+    const kinds = new Set<SwiftTypeCategory>();
+    for (const name of mangledNames) {
+      const decoded = classifySwiftSymbol(name)?.category;
+      if (decoded !== undefined && decoded !== null) kinds.add(decoded);
+    }
     const category = kinds.size === 1 ? ([...kinds][0] ?? null) : null;
     const item = {
       address: entry.address,
@@ -118,9 +133,7 @@ export const categorizeSwiftTypes = (
       unclassified.push({
         ...item,
         reason:
-          kinds.size > 1 && !kinds.has(null)
-            ? "conflicting_categories"
-            : "category_not_decoded",
+          kinds.size > 1 ? "conflicting_categories" : "category_not_decoded",
       });
     }
     const bucket = category ?? "other";
@@ -154,7 +167,7 @@ export const categorizeSwiftTypes = (
 const swiftAliasesByAddress = (symbols: readonly AddressedName[]) => {
   const aliases = new Map<string, string[]>();
   for (const { address, name } of symbols) {
-    if (classifySwiftSymbol(name) === undefined) continue;
+    if (!isSwiftSymbolName(name)) continue;
     const existing = aliases.get(address);
     if (existing === undefined) aliases.set(address, [name]);
     else existing.push(name);

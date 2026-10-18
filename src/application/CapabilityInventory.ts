@@ -22,6 +22,7 @@ import type { ToolKind } from "../contracts/toolContractTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { isMachOFormat } from "../domain/binaryTargetTypes.js";
 import type { ProviderAvailability } from "./AnalysisProvider.js";
+import type { JebAnalysisAvailability } from "./jeb/JebAnalysisPort.js";
 import { TOOL_CONTRACTS } from "../contracts/toolContracts.js";
 import { FRIDA_TOOL_CONTRACTS } from "../contracts/fridaToolContracts.js";
 import {
@@ -54,7 +55,9 @@ export type AvailabilityPolicy = {
   readonly firmwareInspectionEnabled?: boolean;
   readonly firmwareExtractionEnabled?: boolean;
   readonly androidAnalysisAvailability?: ProviderAvailability;
-  readonly jebAnalysisAvailability?: ProviderAvailability;
+  readonly adbAnalysisAvailability?: ProviderAvailability;
+  readonly apktoolAnalysisAvailability?: ProviderAvailability;
+  readonly jebAnalysisAvailability?: JebAnalysisAvailability;
   readonly javascriptRecoveryEnabled?: boolean;
   readonly webModuleResolutionEnabled?: boolean;
   readonly browserObservationEnabled?: boolean;
@@ -98,7 +101,9 @@ type AvailabilityContext = {
   readonly policy: AvailabilityPolicy;
 };
 
-const ENHANCED_REQUIREMENTS: Readonly<Record<string, readonly string[]>> = {
+const ENHANCED_REQUIREMENTS: Readonly<
+  Record<string, readonly (string | readonly string[])[]>
+> = {
   trace_native_values: ["analyze_function", "resolve_native_call_targets"],
   trace_native_ui_action: [
     "decode_interface_builder",
@@ -113,16 +118,15 @@ const ENHANCED_REQUIREMENTS: Readonly<Record<string, readonly string[]>> = {
   analyze_swift_types: ["list_procedures"],
   find_xrefs_to_name: ["list_names", "xrefs"],
   binary_overview: [
-    "list_segments",
-    "list_documents",
+    ["current_document", "list_documents"],
     "list_procedures",
     "list_strings",
   ],
   analyze_function: ["analyze_function"],
   inspect_native_api: ["analyze_function"],
   trace_feature: [
-    "list_strings",
-    "list_procedures",
+    "search_strings",
+    "search_procedures",
     "xrefs",
     "resolve_containing_procedure",
   ],
@@ -141,6 +145,7 @@ const FRIDA_OPERATION_NAMES: ReadonlySet<string> = new Set(
 
 /** Native contracts defined only for an active Mach-O executable. */
 const MACHO_TARGET_OPERATIONS: ReadonlySet<string> = new Set([
+  "inspect_signature",
   "inspect_macho",
   "list_architectures",
   "observe_native_calls",
@@ -342,7 +347,11 @@ const workflowAvailabilityFor = ({
   kind,
   policy,
 }: AvailabilityContext): Availability | null => {
-  if (name === "inspect_go_binary")
+  if (
+    name === "inspect_go_binary" ||
+    name === "inspect_rust_binary" ||
+    name === "inspect_electron_fuses"
+  )
     return { reason: "available", remediation: null };
   if (name === "inspect_sqlite_database") {
     const capability = sqliteDatabaseCapability(process.versions.node);
@@ -397,7 +406,7 @@ const workflowAvailabilityFor = ({
           remediation:
             "On Linux x64, set absolute REA_PWNTOOLS_PYTHON to caller-supplied Python with pwntools 4.15.0. No active binary target is required.",
         };
-  if (name === "inspect_packet_capture")
+  if (name === "inspect_packet_capture" || name === "inspect_packet_fields")
     return policy.packetCaptureEnabled === true
       ? { reason: "available", remediation: null }
       : {
@@ -405,7 +414,7 @@ const workflowAvailabilityFor = ({
           remediation:
             "On Linux, supply TShark 4.x via absolute REA_TSHARK_COMMAND and util-linux prlimit (REA_TSHARK_PRLIMIT_COMMAND, default /usr/bin/prlimit). No active binary target or hardware is required; the tool is checked at execution.",
         };
-  if (name === "decode_signal_recording")
+  if (name === "decode_signal_recording" || name === "inspect_signal_decoders")
     return policy.signalRecordingEnabled === true
       ? { reason: "available", remediation: null }
       : {
@@ -459,20 +468,40 @@ const workflowAvailabilityFor = ({
           reason:
             policy.androidAnalysisAvailability?.code === "unsupported_host"
               ? "unsupported_host"
-              : "provider_missing",
+              : policy.androidAnalysisAvailability?.code ===
+                  "runtime_unavailable"
+                ? "provider_unavailable"
+                : "provider_missing",
           remediation:
             policy.androidAnalysisAvailability?.reason ??
             "Set REA_JADX_MCP_JAR to a caller-supplied jadx-headless-mcp 0.7.1 JAR and provide a full JDK on Linux, macOS, or Windows x64 with its matching bundled native controls.",
         };
-  if (kind === "jeb-provider")
-    return policy.jebAnalysisAvailability?.status === "available"
-      ? { reason: "available", remediation: null }
-      : {
-          reason: "provider_missing",
-          remediation:
-            policy.jebAnalysisAvailability?.reason ??
-            "Start a JEB client serving MCP (GUI client, or headless via its programmatic launcher) and point REA_JEB_MCP_URL at it (default http://127.0.0.1:8425/mcp). REA does not install or launch JEB.",
-        };
+  if (kind === "adb-provider")
+    return ownerProbeAvailability(
+      policy.adbAnalysisAvailability,
+      "Set REA_ADB_PATH to a caller-supplied adb executable or make adb available on PATH. This checks the client version only; device and serial availability depend on the request.",
+    );
+  if (kind === "apktool-provider")
+    return ownerProbeAvailability(
+      policy.apktoolAnalysisAvailability,
+      "Set REA_APKTOOL_COMMAND to a caller-supplied Apktool executable or make Apktool 2.7.0 or newer available on PATH.",
+    );
+  if (kind === "jeb-provider") {
+    const availability = policy.jebAnalysisAvailability;
+    if (availability?.status === "available")
+      return availability.supportedOperations.some(
+        (operation) => operation === name,
+      )
+        ? { reason: "available", remediation: null }
+        : {
+            reason: "provider_unavailable",
+            remediation: `The running JEB endpoint does not advertise support for ${name}. Use a JEB client build that provides this operation.`,
+          };
+    return ownerProbeAvailability(
+      availability,
+      "Start a JEB client serving MCP (GUI client, or headless via its programmatic launcher) and point REA_JEB_MCP_URL at it (default http://127.0.0.1:8425/mcp). REA does not install or launch JEB.",
+    );
+  }
   const browser = browserProviderAvailability(name, kind, policy);
   if (browser !== null) return browser;
   if (name === "capture_process_scenario" && !policy.processCaptureEnabled)
@@ -481,7 +510,7 @@ const workflowAvailabilityFor = ({
       remediation: "Run process capture on a supported Linux or macOS host.",
     };
   if (kind === "application") return { reason: "available", remediation: null };
-  if (kind === "flutter-provider")
+  if (kind === "pcap-provider" || kind === "flutter-provider")
     return { reason: "available", remediation: null };
   const electron = electronProviderAvailability(name, kind, policy);
   if (electron !== null) return electron;
@@ -495,6 +524,25 @@ const workflowAvailabilityFor = ({
         };
   if (kind === "session") return { reason: "available", remediation: null };
   return null;
+};
+
+const ownerProbeAvailability = (
+  observation: ProviderAvailability | undefined,
+  missingRemediation: string,
+): Availability => {
+  if (observation === undefined)
+    return { reason: "provider_missing", remediation: missingRemediation };
+  if (observation.status === "available")
+    return { reason: "available", remediation: null };
+  return {
+    reason:
+      observation.code === "unsupported_host"
+        ? "unsupported_host"
+        : observation.code === "not_configured"
+          ? "provider_missing"
+          : "provider_unavailable",
+    remediation: observation.reason,
+  };
 };
 
 const electronProviderAvailability = (
@@ -631,6 +679,11 @@ const composedAvailability = (
   name: string,
   descriptors: ReadonlyMap<string, ProviderDescriptor>,
 ): Availability => {
+  if (
+    name === "binary_overview" &&
+    descriptors.get("read_binary_inventory_summary")?.available === true
+  )
+    return { reason: "available", remediation: null };
   const requirements = ENHANCED_REQUIREMENTS[name];
   if (requirements === undefined)
     return {
@@ -641,27 +694,62 @@ const composedAvailability = (
 };
 
 const composedAvailabilityFor = (
-  requirements: readonly string[],
+  requirements: readonly (string | readonly string[])[],
   descriptors: ReadonlyMap<string, ProviderDescriptor>,
 ): Availability => {
-  const missing = requirements.find((operation) => !descriptors.has(operation));
-  if (missing !== undefined)
-    return {
-      reason: "provider_missing",
-      remediation: `Configure a provider for required operation ${missing}.`,
-    };
-  const unavailable = requirements
-    .map((operation) => descriptors.get(operation))
-    .find((descriptor) => descriptor?.available === false);
-  if (unavailable !== undefined)
-    return {
-      reason:
-        unavailable.availability_code === "unsupported_host"
-          ? "unsupported_host"
-          : "provider_unavailable",
-      remediation:
-        unavailable.reason ?? "Choose another target or configured provider.",
-    };
+  for (const requirement of requirements) {
+    if (typeof requirement === "string") {
+      if (!descriptors.has(requirement))
+        return {
+          reason: "provider_missing",
+          remediation: `Configure a provider for required operation ${requirement}.`,
+        };
+    } else {
+      const declared = requirement.some((operation) =>
+        descriptors.has(operation),
+      );
+      if (!declared)
+        return {
+          reason: "provider_missing",
+          remediation: `Configure a provider for one of: ${requirement.join(", ")}.`,
+        };
+    }
+  }
+
+  for (const requirement of requirements) {
+    if (typeof requirement === "string") {
+      const descriptor = descriptors.get(requirement);
+      if (descriptor?.available === false)
+        return {
+          reason:
+            descriptor.availability_code === "unsupported_host"
+              ? "unsupported_host"
+              : "provider_unavailable",
+          remediation:
+            descriptor.reason ??
+            "Choose another target or configured provider.",
+        };
+    } else {
+      const anyAvailable = requirement.some(
+        (operation) => descriptors.get(operation)?.available === true,
+      );
+      if (!anyAvailable) {
+        const unavailable = requirement
+          .map((operation) => descriptors.get(operation))
+          .find((descriptor) => descriptor?.available === false);
+        if (unavailable !== undefined)
+          return {
+            reason:
+              unavailable.availability_code === "unsupported_host"
+                ? "unsupported_host"
+                : "provider_unavailable",
+            remediation:
+              unavailable.reason ??
+              "Choose another target or configured provider.",
+          };
+      }
+    }
+  }
   return { reason: "available", remediation: null };
 };
 

@@ -1,5 +1,4 @@
 import { z } from "incur";
-import { resolve } from "node:path";
 import {
   createRecordedCrashService,
   createBinaryLayoutService,
@@ -7,11 +6,13 @@ import {
 } from "../composition/binaryDiagnostics.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
-import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 import { inspectPeResourcesInputSchema } from "../domain/native/peResources.js";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
 
 /** Inspect operator-selected files through the same shared workflow as MCP. */
 export const registerBinaryDiagnosticsCommands = (
@@ -19,7 +20,6 @@ export const registerBinaryDiagnosticsCommands = (
   logger: Logger,
   environment: Readonly<NodeJS.ProcessEnv>,
 ): void => {
-  const pe = createPeResourcesService();
   cli.command(CLI_COMMANDS.inspectPeResources, {
     description:
       "Inspect PE resource identities, payload ranges, hashes and icon-group relationships",
@@ -29,19 +29,29 @@ export const registerBinaryDiagnosticsCommands = (
       maxEntries: inspectPeResourcesInputSchema.shape.max_entries,
     }),
     run: ({ args, options }) =>
-      withCommandCancellation((signal) =>
-        logCliCommand(logger, CLI_COMMANDS.inspectPeResources, async () => {
-          const result = await pe.inspect(
-            {
-              path: resolve(args.path),
-              max_file_bytes: options.maxFileBytes,
-              max_entries: options.maxEntries,
-            },
-            { signal },
-          );
-          return result.ok ? result.value : projectAnalysisError(result.error);
-        }),
-      ),
+      withCommandCancellation(async (signal) => {
+        const pe = createPeResourcesService();
+        return await logCliCommand(
+          logger,
+          CLI_COMMANDS.inspectPeResources,
+          async () =>
+            finishAnalysisCommand(
+              () =>
+                pe.inspect(
+                  {
+                    path: absoluteCallerPath(args.path),
+                    max_file_bytes: options.maxFileBytes,
+                    max_entries: options.maxEntries,
+                  },
+                  { signal },
+                ),
+              pe,
+              "rea-pe-resources",
+              "inspect_pe_resources",
+              signal,
+            ),
+        );
+      }),
   });
   const service = createBinaryLayoutService(environment);
   cli.command(CLI_COMMANDS.inspectBinaryLayout, {
@@ -54,7 +64,7 @@ export const registerBinaryDiagnosticsCommands = (
       withCommandCancellation((signal) =>
         logCliCommand(logger, CLI_COMMANDS.inspectBinaryLayout, async () => {
           const result = await service.inspectAndClose(
-            { path: resolve(args.path) },
+            { path: absoluteCallerPath(args.path) },
             { signal },
           );
           return result.ok ? result.value : projectAnalysisError(result.error);
@@ -65,7 +75,11 @@ export const registerBinaryDiagnosticsCommands = (
   cli.command(CLI_COMMANDS.inspectRecordedCrash, {
     description:
       "Inspect supplied core registers/signals and optional debugger mapping evidence",
-    args: z.object({ path: z.string().describe("Local Linux amd64 ELF core") }),
+    args: z.object({
+      path: z
+        .string()
+        .describe("Local Linux ELF64 amd64 or AArch64 little-endian core"),
+    }),
     options: z.object({
       debuggerContext: z
         .boolean()
@@ -77,7 +91,7 @@ export const registerBinaryDiagnosticsCommands = (
         logCliCommand(logger, CLI_COMMANDS.inspectRecordedCrash, async () => {
           const result = await recorded.inspectAndClose(
             {
-              path: resolve(args.path),
+              path: absoluteCallerPath(args.path),
               include_debugger_context: options.debuggerContext,
             },
             { signal },

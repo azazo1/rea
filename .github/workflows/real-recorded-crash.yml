@@ -3,13 +3,15 @@ name: Real recorded crash evidence
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      build_cache_artifact:
+        description: Portable build cache artifact from the calling CI run.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
-
-concurrency:
-  group: real-recorded-crash-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 env:
   NODE_OPTIONS: --max-old-space-size=768
@@ -22,19 +24,30 @@ jobs:
   real-recorded-crash:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "debian:trixie-slim"]
+    container: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-      - run: npm ci
-      - uses: ./.github/actions/portable-build-cache
-      - name: Install GDB on the disposable CI runner
+      - name: Install fixture and debugger prerequisites in the disposable container
         shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install --yes --no-install-recommends gdb
+          apt-get update -qq
+          apt-get install --yes --no-install-recommends \
+            ca-certificates git python3-venv gcc libc6-dev strace gdb
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Cache npm package downloads
+        id: npm-cache
+        uses: ./.github/actions/npm-cache
+      - run: npm ci
+      - uses: ./.github/actions/portable-build-cache
+        with:
+          build_cache_artifact: ${{ inputs.build_cache_artifact }}
       - name: Acquire exact unchanged upstreams in isolated runner storage
         shell: bash
         run: |

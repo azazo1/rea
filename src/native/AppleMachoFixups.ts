@@ -42,6 +42,8 @@ export interface PointerFixups {
   readonly issues: readonly DecodeIssue[];
   /** Fixup segments or bind streams this reader walked. */
   readonly examined: number;
+  /** Fully decoded fixup segments or bind streams, in the same units as `examined`. */
+  readonly decoded: number;
   /** Rebase opcode bytes present in the load command and not decoded. */
   readonly unreadRebaseBytes: number;
   /** Decode the pointer stored at `address` whose raw 64-bit value is `raw`. */
@@ -260,6 +262,7 @@ const readChainedPage = (
 const chainedFixups = (
   image: FixupImage,
   range: { readonly offset: number; readonly size: number },
+  unreadRebaseBytes: number,
 ): PointerFixups => {
   const { bytes, segments, dylibs, baseAddress } = image;
   const base = range.offset;
@@ -400,19 +403,25 @@ const chainedFixups = (
         ]
       : [],
   );
-  const examinedViews = new Set<string>();
-  for (const chain of ranges) {
+  const examinedViews = new Map<string, boolean>();
+  const decodedRanges = new Set<number>();
+  for (const [chainIndex, chain] of ranges.entries()) {
     // Unknown formats retain their compact starts table; only a queried page
     // needs its NONE/presence value. Do not expand unsupported declarations.
     if (POINTER_FORMATS[chain.format] === undefined) continue;
-    const view = `${chain.pageStarts}:${chain.segment.offset}:${chain.segment.size}:${chain.segment.address}`;
-    if (examinedViews.has(view)) continue;
-    examinedViews.add(view);
+    const view = `${chain.pageStarts}:${chain.segment.offset}:${chain.segment.size}:${chain.segment.address}:${chain.format}:${chain.pageSize}:${chain.pageCount}`;
+    const prior = examinedViews.get(view);
+    if (prior !== undefined) {
+      if (prior) decodedRanges.add(chainIndex);
+      continue;
+    }
+    let complete = true;
     for (let page = 0; page < chain.pageCount; page++) {
       const start = bytes.readUInt16LE(chain.pageStarts + page * 2);
       if (start === 0xffff) continue;
       const facts = pageFacts(chain, page, start);
       if (facts.failure !== undefined) {
+        complete = false;
         issues.push(
           issue(
             "pointer_fixups",
@@ -427,6 +436,8 @@ const chainedFixups = (
         break;
       }
     }
+    examinedViews.set(view, complete);
+    if (complete) decodedRanges.add(chainIndex);
   }
   const failures = issues.map(({ message }) => message);
   return {
@@ -435,13 +446,17 @@ const chainedFixups = (
     failures,
     issues,
     examined: Math.max(ranges.length, 1),
-    unreadRebaseBytes: 0,
+    get decoded() {
+      return ranges.length === 0 ? 1 : decodedRanges.size;
+    },
+    unreadRebaseBytes,
     decode(address, raw) {
-      const chain = ranges.find(
+      const chainIndex = ranges.findIndex(
         ({ segment }) =>
           address >= segment.address &&
           address < segment.address + segment.size,
       );
+      const chain = ranges[chainIndex];
       // Pointers outside fixup segments, such as in __TEXT, are stored plainly.
       if (chain === undefined) return { kind: "rebase", target: raw };
       const within = Number(address - chain.segment.address);
@@ -486,6 +501,7 @@ const chainedFixups = (
           );
           failures.push(reason);
         }
+        decodedRanges.delete(chainIndex);
         return { kind: "unsupported", reason };
       }
     },
@@ -494,28 +510,40 @@ const chainedFixups = (
 
 const uleb = (bytes: Buffer, cursor: { at: number }, end: number): bigint => {
   let value = 0n;
-  let shift = 0n;
+  let shift = 0;
   for (;;) {
     if (cursor.at >= end) throw new RangeError("Truncated bind opcode operand");
     const byte = bytes[cursor.at++] ?? 0;
-    value |= BigInt(byte & 0x7f) << shift;
-    shift += 7n;
+    const slice = byte & 0x7f;
+    if ((shift === 63 && slice > 1) || (shift === 64 && slice !== 0))
+      throw new RangeError("Oversized bind opcode operand");
+    if (shift < 64) value |= BigInt(slice) << BigInt(shift);
+    // Padding may extend the encoding, but never the represented integer.
+    shift = Math.min(64, shift + 7);
     if ((byte & 0x80) === 0) return value;
-    if (shift > 63n) throw new RangeError("Oversized bind opcode operand");
   }
 };
 
 const sleb = (bytes: Buffer, cursor: { at: number }, end: number): bigint => {
   let value = 0n;
-  let shift = 0n;
+  let shift = 0;
   let byte = 0;
   do {
     if (cursor.at >= end) throw new RangeError("Truncated bind opcode operand");
     byte = bytes[cursor.at++] ?? 0;
-    value |= BigInt(byte & 0x7f) << shift;
-    shift += 7n;
-  } while ((byte & 0x80) !== 0 && shift <= 63n);
-  return (byte & 0x40) !== 0 ? value - (1n << shift) : value;
+    const slice = byte & 0x7f;
+    if (
+      (shift === 63 && slice !== 0 && slice !== 0x7f) ||
+      (shift === 64 && slice !== (value < 0n ? 0x7f : 0))
+    )
+      throw new RangeError("Oversized bind opcode operand");
+    if (shift < 64)
+      value = BigInt.asIntN(64, value | (BigInt(slice) << BigInt(shift)));
+    shift = Math.min(64, shift + 7);
+  } while ((byte & 0x80) !== 0);
+  return shift < 64 && (byte & 0x40) !== 0
+    ? value - (1n << BigInt(shift))
+    : value;
 };
 
 /** Registers of the `LC_DYLD_INFO` bind state machine. */
@@ -636,7 +664,9 @@ const readBindStream = (
     } else {
       binds.push({ start: state.address, count, stride, binding });
     }
-    state.address += count * stride;
+    // The dyld bind stream advances addresses modulo 64 bits; ld uses -8 to
+    // bind the current pointer slot again with DO_BIND_ADD_ADDR_ULEB.
+    state.address = (state.address + count * stride) & 0xffffffffffffffffn;
   };
   while (cursor.at < end) {
     const byte = bytes[cursor.at++] ?? 0;
@@ -684,10 +714,7 @@ export const parsePointerFixups = (
     0,
   );
   if (commands.chained !== null) {
-    const chained = chainedFixups(image, commands.chained);
-    return unreadRebaseBytes === 0
-      ? chained
-      : { ...chained, unreadRebaseBytes };
+    return chainedFixups(image, commands.chained, unreadRebaseBytes);
   }
   if (commands.binds.length === 0)
     return {
@@ -696,14 +723,17 @@ export const parsePointerFixups = (
       failures: [],
       issues: [],
       examined: 0,
+      decoded: 0,
       unreadRebaseBytes,
       decode: (_address, raw) => ({ kind: "rebase", target: raw }),
     };
   const binds: BindRun[] = [];
   const failures: string[] = [];
+  let decoded = 0;
   for (const stream of commands.binds)
     try {
       readBindStream(image, stream, binds);
+      decoded++;
     } catch (cause: unknown) {
       failures.push(
         `${stream.stream} bind opcodes: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -717,6 +747,7 @@ export const parsePointerFixups = (
       issue("pointer_fixups", "bind_stream_decode_failed", message),
     ),
     examined: commands.binds.length,
+    decoded,
     unreadRebaseBytes,
     decode(address, raw) {
       let match: BindRun | undefined;

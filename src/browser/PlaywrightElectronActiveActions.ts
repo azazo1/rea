@@ -10,6 +10,8 @@ import {
 } from "../domain/javascript/electronActiveObservation.js";
 
 const OPERATION = "capture_electron_scenario" as const;
+const CANCELLED_STATE_READ_TIMEOUT_MS = 5_000;
+const GRACE_EXPIRED = Symbol("cancellation grace expired");
 
 const hookSnapshotSchema = z.strictObject({
   events: z.array(electronActiveTimelineEventSchema),
@@ -63,6 +65,9 @@ export type ElectronHookEvent = z.infer<
 >;
 export type ElectronMetrics = z.infer<typeof metricSchema>[];
 type ElectronWindowMetadata = z.infer<typeof windowMetadataSchema>;
+type ElectronApplicationState = Awaited<
+  ReturnType<typeof readApplicationState>
+>;
 
 /** Run explicit actions against provider-owned Electron windows. */
 export const runElectronActions = async (
@@ -72,7 +77,7 @@ export const runElectronActions = async (
 ): Promise<ElectronActions> => {
   const actions: ElectronActions = [];
   for (const action of input.actions) {
-    const actionStartedAt = Date.now();
+    const actionStartedAt = performance.now();
     const windowIndex = actionWindowIndex(action);
     let selectedWindow: Page | undefined;
     try {
@@ -107,7 +112,10 @@ export const runElectronActions = async (
         target:
           selectedWindow === undefined ? null : `window:${String(windowIndex)}`,
         status: "completed",
-        elapsed_ms: Date.now() - actionStartedAt,
+        elapsed_ms: Math.max(
+          0,
+          Math.round(performance.now() - actionStartedAt),
+        ),
         error: null,
       });
     } catch (cause: unknown) {
@@ -118,7 +126,10 @@ export const runElectronActions = async (
         target:
           selectedWindow === undefined ? null : `window:${String(windowIndex)}`,
         status: options.signal?.aborted ? "cancelled" : "failed",
-        elapsed_ms: Date.now() - actionStartedAt,
+        elapsed_ms: Math.max(
+          0,
+          Math.round(performance.now() - actionStartedAt),
+        ),
         error: safeActionErrorMessage(cause),
       });
       break;
@@ -154,9 +165,12 @@ const runAction = async ({
     case "wait": {
       const page =
         selectedWindow ??
-        (await application.firstWindow({
-          timeout: 0,
-        }));
+        (await runWithExecutionLimits(
+          application.firstWindow({
+            timeout: 0,
+          }),
+          options.signal,
+        ));
       await runWithExecutionLimits(
         page.waitForTimeout(action.duration_ms),
         options.signal,
@@ -349,14 +363,64 @@ export const readApplicationState = async (
   };
 };
 
+/**
+ * Read the post-action state. Cancellation before or during the read leaves the
+ * same bounded grace period so a responsive app still yields its final state;
+ * expiry of that period is the caller's cancellation, with the expiry kept in
+ * the error diagnostics.
+ */
+export const readFinalApplicationState = async (
+  application: ElectronApplication,
+  signal: AbortSignal | undefined,
+): Promise<ElectronApplicationState> => {
+  const state = readApplicationState(application);
+  if (signal?.aborted !== true)
+    try {
+      return await runWithExecutionLimits(state, signal);
+    } catch (cause: unknown) {
+      if (
+        !(cause instanceof BrowserObservationError) ||
+        cause.reason !== "cancelled"
+      )
+        throw cause;
+    }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const graceExpired = new Promise<typeof GRACE_EXPIRED>((resolve) => {
+    timer = setTimeout(
+      () => resolve(GRACE_EXPIRED),
+      CANCELLED_STATE_READ_TIMEOUT_MS,
+    );
+  });
+  try {
+    const settled = await Promise.race([state, graceExpired]);
+    if (settled !== GRACE_EXPIRED) return settled;
+  } finally {
+    clearTimeout(timer);
+  }
+  // The grace period exists only because of cancellation, so its expiry is
+  // reported as that cancellation; a read failure inside it stays primary.
+  throw new BrowserObservationError(OPERATION, "cancelled", {
+    cause: signal?.reason,
+    diagnostics: {
+      final_state_read: "cancellation_grace_expired",
+      cancellation_grace_ms: CANCELLED_STATE_READ_TIMEOUT_MS,
+    },
+  });
+};
+
 /** Apply an optional lifecycle deadline and caller cancellation to an operation. */
 export const runWithExecutionLimits = async <Value>(
   operation: Promise<Value>,
   signal: AbortSignal | undefined,
   deadline?: number,
 ): Promise<Value> => {
-  if (signal?.aborted === true)
-    throw new BrowserObservationError(OPERATION, "cancelled");
+  if (signal?.aborted === true) {
+    // The operation has already started; observe its abandoned settlement.
+    void operation.catch(() => undefined);
+    throw new BrowserObservationError(OPERATION, "cancelled", {
+      cause: signal.reason,
+    });
+  }
   if (signal === undefined && deadline === undefined) return operation;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abortListener: (() => void) | undefined;
@@ -366,7 +430,7 @@ export const runWithExecutionLimits = async <Value>(
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new BrowserObservationError(OPERATION, "timeout")),
-          Math.max(1, deadline - Date.now()),
+          Math.max(1, deadline - performance.now()),
         );
       }),
     );
@@ -374,7 +438,11 @@ export const runWithExecutionLimits = async <Value>(
     interruptions.push(
       new Promise<never>((_, reject) => {
         abortListener = () =>
-          reject(new BrowserObservationError(OPERATION, "cancelled"));
+          reject(
+            new BrowserObservationError(OPERATION, "cancelled", {
+              cause: signal.reason,
+            }),
+          );
         signal.addEventListener("abort", abortListener, { once: true });
       }),
     );

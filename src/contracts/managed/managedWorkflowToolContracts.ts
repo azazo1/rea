@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { evidenceSchema } from "../../domain/evidence.js";
+import { managedNativeVerificationInputSchema } from "../../domain/managed/managedNativeVerificationSchemas.js";
 
 import { managedReconstructionImportInputSchema } from "../../domain/managed/managedReconstruction.js";
 import type { ToolContract } from "../toolContractTypes.js";
@@ -32,35 +33,6 @@ export const compareManagedMembersReferenceInputSchema = z
 export const managedReconstructionReferenceInputSchema =
   managedReconstructionImportInputSchema.extend({
     static_members: evidenceSchema,
-  });
-
-/** Inline Evidence inputs for managed/native verification. */
-export const managedNativeVerificationReferenceInputSchema = z
-  .strictObject({
-    managed_boundaries: evidenceSchema,
-    native_observations: z
-      .array(evidenceSchema)
-      .min(1)
-      .describe("Native function or export Evidence records"),
-  })
-  .superRefine((input, context) => {
-    const ids = new Set<string>([input.managed_boundaries.evidence_id]);
-    for (const [index, evidence] of input.native_observations.entries()) {
-      if (evidence.evidence_id === input.managed_boundaries.evidence_id)
-        context.addIssue({
-          code: "custom",
-          path: ["native_observations", index],
-          message:
-            "Native observation Evidence must be distinct from managed boundary Evidence",
-        });
-      if (ids.has(evidence.evidence_id))
-        context.addIssue({
-          code: "custom",
-          path: ["native_observations", index],
-          message: "Native observation Evidence IDs must be unique",
-        });
-      ids.add(evidence.evidence_id);
-    }
   });
 
 const managedApplicationGraphReferenceFacts = {} as const;
@@ -126,7 +98,7 @@ export const MANAGED_WORKFLOW_TOOL_CONTRACTS = [
     name: "compare_managed_members",
     ...toolContractMetadata("compare_managed_members"),
     description:
-      "Compare two authenticated inspect_managed_members Evidence records using unique-only tiers: exact CIL/signature, exact declared type, name, and raw signature (decoded or not), and decoded structural method shape. Names alone are never a matching basis; a member whose signature was not decoded, or whose same-named counterpart's was not, stays unknown rather than added or removed. Metadata tokens remain build-local coordinates bound to each artifact SHA-256 and MVID, and the tuple digest does not itself remap them.",
+      "Compare two authenticated inspect_managed_members Evidence records using unique-only tiers: exact declared type, name, and CIL/signature; exact declared type, name, and signature (decoded or not); exact declared type, name, and decoded structural method shape; then exact CIL/signature or decoded structural method shape alone, which never takes a member whose own declared type and name remain unpaired on the other side or whose declaring type is unresolved. Signatures compare type operands by name, not by build-local metadata row. Names alone are never a matching basis; a member whose signature was not decoded, or whose same-named counterpart's was not, stays unknown rather than added or removed. Metadata tokens remain build-local coordinates bound to each artifact SHA-256 and MVID, and the tuple digest does not itself remap them.",
     kind: "application",
     inputSchema: compareManagedMembersReferenceInputSchema,
     outputSchema: comparisonOutputSchema,
@@ -144,9 +116,9 @@ export const MANAGED_WORKFLOW_TOOL_CONTRACTS = [
     name: "verify_managed_native_boundaries",
     ...toolContractMetadata("verify_managed_native_boundaries"),
     description:
-      "Verify managed P/Invoke/native-boundary declarations against authenticated native export or function Evidence without executing managed code or translating managed metadata tokens into native addresses. The workflow preserves declaration-only, verified, inferred, contradicted, and unresolved states.",
+      "Verify managed P/Invoke/native-boundary declarations against authenticated native export or function Evidence without executing managed code or translating managed metadata tokens into native addresses. The workflow preserves declaration-only, verified, inferred, contradicted, and unresolved states; a name candidate with missing managed or native module identity remains unresolved with its candidate evidence retained.",
     kind: "application",
-    inputSchema: managedNativeVerificationReferenceInputSchema,
+    inputSchema: managedNativeVerificationInputSchema,
     outputSchema: nativeVerificationOutputSchema,
     examples: [
       {

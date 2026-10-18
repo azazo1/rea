@@ -11,6 +11,7 @@ import {
   mkdtemp,
   readFile,
   rename,
+  readdir,
   rm,
   symlink,
   writeFile,
@@ -21,6 +22,8 @@ import { dirname, join, parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { verifyWindowsProtocolInput } from "./lib/windows-protocol-input.mjs";
 import { verifyWindowsJobMemoryLimit } from "./lib/windows-job-memory-limit.mjs";
+import { verifyVolumeRootAppendLease } from "./lib/windows-volume-root-append-lease.mjs";
+import { closeVerifierResources } from "./lib/verifier-cleanup.mjs";
 
 if (process.platform !== "win32")
   throw new Error(
@@ -37,7 +40,22 @@ const { WindowsPrivateRuntime, windowsPrivateRuntime } = await import(
 const { ghidraSessionRoot } = await import(
   pathToFileURL(join(packageRoot, "dist/ghidra/GhidraSessionRoot.js"))
 );
+const { PrivateRuntimeRoot } = await import(
+  pathToFileURL(join(packageRoot, "dist/process/PrivateRuntimeRoot.js"))
+);
+const { PrivateRuntimeRootUnavailableError } = await import(
+  pathToFileURL(
+    join(packageRoot, "dist/process/PrivateRuntimeRootUnavailableError.js"),
+  )
+);
 const workspace = await mkdtemp(join(tmpdir(), "rea-native-conformance-"));
+// A pwsh caller can supply module paths incompatible with Windows PowerShell.
+// Each independent observer must discover its own module path.
+const windowsPowerShellEnvironment = Object.fromEntries(
+  Object.entries(process.env).filter(
+    ([name]) => name.toLowerCase() !== "psmodulepath",
+  ),
+);
 const environment = Object.entries(process.env)
   .filter(([, value]) => value !== undefined)
   .map(([key, value]) => `${key}=${value}`);
@@ -49,6 +67,49 @@ const exists = (path) =>
     () => true,
     () => false,
   );
+const startDeleteSharingDeniedReader = async (path) => {
+  const child = spawn(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ErrorActionPreference = 'Stop'; " +
+        "$stream = [IO.File]::Open($env:REA_CLEANUP_HELD_PATH, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite); " +
+        "try { [Console]::WriteLine('ready'); [Console]::In.ReadLine() | Out-Null } " +
+        "finally { $stream.Dispose() }",
+    ],
+    {
+      env: { ...process.env, REA_CLEANUP_HELD_PATH: path },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  const closed = once(child, "close");
+  void closed.catch(() => undefined);
+  try {
+    const [ready] = await once(child.stdout, "data", {
+      signal: AbortSignal.timeout(15_000),
+    });
+    assert.equal(String(ready).trim(), "ready");
+  } catch (cause) {
+    try {
+      child.kill();
+      await closed;
+    } catch (cleanupCause) {
+      throw new AggregateError(
+        [cause, cleanupCause],
+        "Reader startup and child cleanup failed",
+        { cause },
+      );
+    }
+    throw cause;
+  }
+  return { child, closed };
+};
+const stopDeleteSharingDeniedReader = async ({ child, closed }) => {
+  child.kill();
+  await closed;
+};
 const live = (pid) => {
   try {
     process.kill(pid, 0);
@@ -139,7 +200,35 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
     "//localhost/share/target.bin",
   ])
     assert.throws(() => native.call("open", [rejected]));
+  assert.throws(
+    () => native.call("cutter_bridge_verify_directory", [sourceDirectory]),
+    /owner|DACL/u,
+  );
   report.controls.ordinaryDriveSeparatorsAndRequestedIdentity = true;
+  // An owned runtime's DELETE lease conflicts with a fresh parent admission.
+  // This produces a genuine sharing failure after successful authority caching,
+  // without another executable, and proves that no child runtime was created.
+  const sharingParent = WindowsPrivateRuntime.create(
+    workspace,
+    "rea-sharing-parent-",
+  );
+  try {
+    await assert.rejects(
+      PrivateRuntimeRoot.create({ parent: sharingParent.observation.path }),
+      (failure) => {
+        assert.ok(failure instanceof PrivateRuntimeRootUnavailableError);
+        assert.equal(failure.retryable, true);
+        assert.ok(failure.cause instanceof Error);
+        assert.equal(failure.cause.win32Code, 32);
+        assert.equal(failure.cause.runtimeAllocation, "not-started");
+        return true;
+      },
+    );
+    assert.deepEqual(await readdir(sharingParent.observation.path), []);
+    report.controls.transientRuntimeAdmissionBeforeAllocation = true;
+  } finally {
+    await sharingParent.close();
+  }
   const driveRoot = parse(workspace).root;
   const runtimeParent = ghidraSessionRoot({
     base: join(driveRoot, ".Tmp", "scratch"),
@@ -214,6 +303,17 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
   }
   const unrelatedFile = join(workspace, "unrelated-file");
   await writeFile(unrelatedFile, "preserve unrelated writes");
+  if (process.argv[3] !== undefined) {
+    await verifyVolumeRootAppendLease({
+      fixturePath: process.argv[3],
+      volumeRoot: parse(source).root,
+      verifyAdmission: () => {
+        const rootGuard = native.call("open", [source]);
+        native.call("close", [rootGuard.handle]);
+      },
+    });
+    report.controls.volumeRootAdmissionWithAppendHandle = true;
+  }
   const admitted = native.call("open", [source]);
   try {
     await assert.rejects(
@@ -249,6 +349,10 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
     () => native.call("open", [join(junction, "target.bin")]),
     /Reparse/u,
   );
+  assert.throws(
+    () => native.call("cutter_bridge_verify_directory", [junction]),
+    /Reparse/u,
+  );
   assert.throws(() => native.call("open", [source + ":stream"]));
   const runtime = native.call("runtime_create", [
     workspace.replaceAll("\\", "/"),
@@ -256,6 +360,7 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
   ]);
   const sentinel = join(sourceDirectory, "sentinel");
   await writeFile(sentinel, "preserve");
+  const runtimeVerificationErrors = [];
   try {
     const acl = JSON.parse(
       execFileSync(
@@ -264,18 +369,13 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
           "-NoProfile",
           "-NonInteractive",
           "-Command",
-          "$a=Get-Acl -LiteralPath $env:REA_TEST_PRIVATE_RUNTIME_PATH; $u=[Security.Principal.WindowsIdentity]::GetCurrent().User; @{protected=$a.AreAccessRulesProtected; ownerMatchesUser=($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $u.Value); trusteesOnlyUserAndSystem=(@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object {$_.IdentityReference.Value -ne $u.Value -and $_.IdentityReference.Value -ne 'S-1-5-18'}).Count -eq 0); count=@($a.Access).Count} | ConvertTo-Json -Compress",
+          "$ErrorActionPreference='Stop'; $p=$env:REA_TEST_PRIVATE_RUNTIME_PATH; $a=Get-Acl -LiteralPath $p; $u=[Security.Principal.WindowsIdentity]::GetCurrent().User; [IO.File]::SetAttributes($p,[IO.FileAttributes]([int][IO.File]::GetAttributes($p) -bor 1)); @{protected=$a.AreAccessRulesProtected; ownerMatchesUser=($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $u.Value); trusteesOnlyUserAndSystem=(@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object {$_.IdentityReference.Value -ne $u.Value -and $_.IdentityReference.Value -ne 'S-1-5-18'}).Count -eq 0); count=@($a.Access).Count; rootReadonly=(([int][IO.File]::GetAttributes($p) -band 1) -ne 0)} | ConvertTo-Json -Compress",
         ],
         {
           encoding: "utf8",
-          // A pwsh caller can supply module paths incompatible with the
-          // Windows PowerShell observer. Let that observer build its own path.
+          timeout: 15_000,
           env: {
-            ...Object.fromEntries(
-              Object.entries(process.env).filter(
-                ([name]) => name.toLowerCase() !== "psmodulepath",
-              ),
-            ),
+            ...windowsPowerShellEnvironment,
             REA_TEST_PRIVATE_RUNTIME_PATH: runtime.path,
           },
         },
@@ -286,6 +386,7 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
       ownerMatchesUser: true,
       trusteesOnlyUserAndSystem: true,
       count: 2,
+      rootReadonly: true,
     });
     native.call("runtime_mkdir", [runtime.handle, "inputs"]);
     native.call("runtime_write", [
@@ -293,6 +394,47 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
       "descriptor.json",
       Buffer.from("fixture"),
     ]);
+    assert.equal(
+      native.call("cutter_bridge_verify_directory", [runtime.path]).privateDacl,
+      true,
+    );
+    assert.equal(
+      native
+        .call("cutter_bridge_read_descriptor", [
+          runtime.path,
+          "descriptor.json",
+          64 * 1024,
+        ])
+        .toString("utf8"),
+      "fixture",
+    );
+    const descriptorJunction = join(runtime.path, "descriptor-link.json");
+    await symlink(sourceDirectory, descriptorJunction, "junction");
+    assert.throws(() =>
+      native.call("cutter_bridge_read_descriptor", [
+        runtime.path,
+        "descriptor-link.json",
+        64 * 1024,
+      ]),
+    );
+    assert.throws(
+      () =>
+        native.call("cutter_bridge_read_descriptor", [
+          runtime.path,
+          "descriptor.json",
+          3,
+        ]),
+      /byte limit/u,
+    );
+    assert.throws(
+      () =>
+        native.call("cutter_bridge_read_descriptor", [
+          runtime.path,
+          "..\\escape.json",
+          64 * 1024,
+        ]),
+      /filename component/u,
+    );
     assert.throws(() =>
       native.call("runtime_write", [
         runtime.handle,
@@ -390,7 +532,10 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
         {
           encoding: "utf8",
           timeout: 15_000,
-          env: { ...process.env, REA_SNAPSHOT_READER_PATH: snapshotPath },
+          env: {
+            ...windowsPowerShellEnvironment,
+            REA_SNAPSHOT_READER_PATH: snapshotPath,
+          },
         },
       ).trim();
       assert.equal(readerDigest, readbackSnapshot.sha256);
@@ -415,34 +560,15 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
       "cleanup-retry-",
     );
     const heldPath = join(retryRuntime.observation.path, "snapshot.bin");
-    await retryRuntime.snapshot(source, "snapshot.bin");
-    const holder = spawn(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "$ErrorActionPreference = 'Stop'; " +
-          "$stream = [IO.File]::Open($env:REA_CLEANUP_HELD_PATH, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite); " +
-          "try { [Console]::WriteLine('ready'); [Console]::In.ReadLine() | Out-Null } " +
-          "finally { $stream.Dispose() }",
-      ],
-      {
-        env: { ...process.env, REA_CLEANUP_HELD_PATH: heldPath },
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    const holderClosed = once(holder, "close");
-    void holderClosed.catch(() => undefined);
+    let holder;
+    let primaryError;
     try {
-      const [ready] = await once(holder.stdout, "data", {
-        signal: AbortSignal.timeout(15_000),
-      });
-      assert.equal(String(ready).trim(), "ready");
-      await assert.rejects(
-        retryRuntime.close(),
-        /owned cleanup object|Delete owned object/u,
-      );
+      await retryRuntime.snapshot(source, "snapshot.bin");
+      holder = await startDeleteSharingDeniedReader(heldPath);
+      // The reader denies delete sharing. Cleanup must retain ownership when
+      // its handle-relative open receives ERROR_SHARING_VIOLATION (32) through
+      // the bounded automatic retries; a later explicit close must succeed.
+      await assert.rejects(retryRuntime.close(), { win32Code: 32 });
       assert.equal(
         windowsPrivateRuntime(retryRuntime.observation.path),
         retryRuntime,
@@ -452,8 +578,8 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
         () => retryRuntime.writeFile("after-close.txt", "forbidden"),
         /cleanup is pending/u,
       );
-      holder.stdin.end("\n");
-      const [exitCode] = await holderClosed;
+      holder.child.stdin.end("\n");
+      const [exitCode] = await holder.closed;
       assert.equal(exitCode, 0);
       await retryRuntime.close();
       await retryRuntime.close();
@@ -463,10 +589,73 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
         /No native private runtime/u,
       );
       report.controls.cleanupFailureRetainsOwnershipForRetry = true;
+    } catch (cause) {
+      primaryError = cause;
+      throw cause;
     } finally {
-      holder.kill();
-      await holderClosed.catch(() => undefined);
-      await retryRuntime.close();
+      await closeVerifierResources(
+        [
+          ...(holder === undefined
+            ? []
+            : [() => stopDeleteSharingDeniedReader(holder)]),
+          () => retryRuntime.close(),
+        ],
+        primaryError,
+      );
+    }
+    const transientRuntime = WindowsPrivateRuntime.create(
+      workspace,
+      "cleanup-transient-",
+    );
+    const transientHeldPath = join(
+      transientRuntime.observation.path,
+      "snapshot.bin",
+    );
+    let transientHolder;
+    let transientPrimaryError;
+    try {
+      await transientRuntime.snapshot(source, "snapshot.bin");
+      transientHolder = await startDeleteSharingDeniedReader(transientHeldPath);
+      // Keep the reader held through the first close attempt. Without retries,
+      // close rejects before the next event-loop turn; with retries, it remains
+      // pending until the caller releases this sharing conflict.
+      let closeSettled = false;
+      const closing = transientRuntime.close();
+      void closing.then(
+        () => {
+          closeSettled = true;
+        },
+        () => {
+          closeSettled = true;
+        },
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(closeSettled, false);
+      transientHolder.child.stdin.end("\n");
+      const [, [exitCode]] = await Promise.all([
+        closing,
+        transientHolder.closed,
+      ]);
+      assert.equal(exitCode, 0);
+      assert.equal(await exists(transientRuntime.observation.path), false);
+      assert.throws(
+        () => windowsPrivateRuntime(transientRuntime.observation.path),
+        /No native private runtime/u,
+      );
+      report.controls.cleanupTransientConflictRetries = true;
+    } catch (cause) {
+      transientPrimaryError = cause;
+      throw cause;
+    } finally {
+      await closeVerifierResources(
+        [
+          ...(transientHolder === undefined
+            ? []
+            : [() => stopDeleteSharingDeniedReader(transientHolder)]),
+          () => transientRuntime.close(),
+        ],
+        transientPrimaryError,
+      );
     }
     report.controls = {
       ...report.controls,
@@ -481,12 +670,52 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
       asynchronousSnapshot: true,
       snapshotCancellation: true,
     };
-  } finally {
-    native.call("runtime_close", [runtime.handle]);
+    const readonlyChildren = JSON.parse(
+      execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "$ErrorActionPreference='Stop'; $items=ConvertFrom-Json -InputObject $env:REA_TEST_READONLY_CHILDREN; @($items | ForEach-Object { $current=[int][IO.File]::GetAttributes($_); $next=if(($current -band 16) -ne 0){$current -bor 1}else{1}; [IO.File]::SetAttributes($_,[IO.FileAttributes]$next); $a=[int][IO.File]::GetAttributes($_); @{readonly=(($a -band 1) -ne 0); directory=(($a -band 16) -ne 0); onlyReadonly=($a -eq 1)} }) | ConvertTo-Json -Compress",
+        ],
+        {
+          encoding: "utf8",
+          timeout: 15_000,
+          env: {
+            ...windowsPowerShellEnvironment,
+            REA_TEST_READONLY_CHILDREN: JSON.stringify([
+              join(runtime.path, "inputs"),
+              join(runtime.path, "inputs", "target.bin"),
+            ]),
+          },
+        },
+      ),
+    );
+    assert.deepEqual(readonlyChildren, [
+      { readonly: true, directory: true, onlyReadonly: false },
+      { readonly: true, directory: false, onlyReadonly: true },
+    ]);
+  } catch (failure) {
+    runtimeVerificationErrors.push(failure);
   }
+  try {
+    native.call("runtime_close", [runtime.handle]);
+  } catch (cleanupFailure) {
+    runtimeVerificationErrors.push(cleanupFailure);
+  }
+  if (runtimeVerificationErrors.length === 1)
+    throw runtimeVerificationErrors[0];
+  if (runtimeVerificationErrors.length > 1)
+    throw new AggregateError(
+      runtimeVerificationErrors,
+      "Native runtime verification and cleanup failed",
+    );
   assert.equal(await exists(runtime.path), false);
   assert.equal(await readFile(sentinel, "utf8"), "preserve");
   report.controls.cleanupDoesNotTraverseJunctions = true;
+  report.controls.readonlyRootAndChildrenRemoved = true;
+  report.controls.readonlyFileWithoutArchiveAttributeRemoved = true;
   const fixture = join(workspace, "tree.mjs");
   await writeFile(
     fixture,
@@ -629,6 +858,42 @@ setInterval(()=>{},1000);\n`,
       unicodeNamesPreserved: true,
     });
     report.processes.windowsEnvironmentSemantics = true;
+    // Observed through this process's own id: a separate probe process would
+    // get its own processor group, so it cannot stand in for the process that
+    // spawns the child.
+    const callerAffinity = JSON.parse(
+      execFileSync(boundaryFixture, ["affinity", String(process.pid)], {
+        encoding: "utf8",
+      }),
+    );
+    const affinityChild = native.call("process_spawn", [
+      boundaryFixture,
+      `${quote(boundaryFixture)} affinity`,
+      workspace,
+      environment,
+    ]);
+    const observedAffinity = await wait(affinityChild);
+    native.call("process_close", [affinityChild.handle]);
+    assert.equal(observedAffinity.exitCode, 0);
+    const childAffinity = JSON.parse(observedAffinity.output);
+    // Masks cross as hexadecimal strings because a mask can exceed the
+    // safe-integer range. Sharing one processor group makes the caller's mask
+    // applicable, so it must be inherited exactly. Windows placing the child in
+    // another group is only permitted when the caller asked for no bound of its
+    // own, which its group's whole active set establishes; a narrower mask has
+    // to fail the spawn rather than widen to that group's default.
+    const sharedGroup =
+      callerAffinity.singleProcessorGroup &&
+      childAffinity.singleProcessorGroup &&
+      callerAffinity.processorGroup === childAffinity.processorGroup;
+    if (sharedGroup)
+      assert.equal(childAffinity.affinityMask, callerAffinity.affinityMask);
+    else assert.equal(callerAffinity.affinityMask, callerAffinity.systemMask);
+    report.processes.callerAffinityBoundsOwnedProcessOrRefusesToWiden = true;
+    report.callerAffinity = {
+      ...callerAffinity,
+      sharedGroupWithChild: sharedGroup,
+    };
   }
   const ownerFixture = join(workspace, "owner.mjs");
   const ownerPidFile = join(workspace, "crash-child.pid");

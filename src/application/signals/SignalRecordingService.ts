@@ -1,3 +1,9 @@
+import {
+  inspectSignalDecodersInputSchema,
+  signalDecodersSchema,
+  type InspectSignalDecodersInput,
+} from "../../domain/signals/signalDecoders.js";
+import type { JsonValue } from "../../domain/jsonValue.js";
 import { isAbsolute } from "node:path";
 import type {
   AnalysisExecution,
@@ -24,6 +30,10 @@ export interface SignalRecordingPort {
     input: DecodeSignalRecordingInput,
     options?: ExecutionOptions,
   ): Promise<Result<AnalysisExecution, AnalysisError>>;
+  inspectDecoders(
+    input: InspectSignalDecodersInput,
+    options?: ExecutionOptions,
+  ): Promise<Result<AnalysisExecution, AnalysisError>>;
   close(): Promise<void>;
 }
 
@@ -39,7 +49,9 @@ export class SignalRecordingService {
   ): Promise<Result<Evidence, AnalysisError>> {
     const operation = "decode_signal_recording";
     if (options?.signal?.aborted)
-      return err(new AnalysisCancelledError(operation));
+      return err(
+        new AnalysisCancelledError(operation, { cause: options.signal.reason }),
+      );
     const input = decodeSignalRecordingInputSchema.safeParse(raw);
     if (!input.success)
       return err(
@@ -74,17 +86,64 @@ export class SignalRecordingService {
           "Decoder returned malformed data or changed the selected recording identity/options.",
         ),
       );
-    const evidence = createEvidence(execution.subject, execution.provider, {
-      operation,
-      parameters: input.data,
-      result: report.data,
-      confidence: "observed",
-      locations: execution.locations,
-      limitations: execution.limitations,
-    });
+    return this.#evidence(operation, input.data, execution, options);
+  }
+  async inspectDecoders(
+    raw: unknown,
+    options?: ExecutionOptions,
+  ): Promise<Result<Evidence, AnalysisError>> {
+    const operation = "inspect_signal_decoders";
+    if (options?.signal?.aborted)
+      return err(
+        new AnalysisCancelledError(operation, { cause: options.signal.reason }),
+      );
+    const input = inspectSignalDecodersInputSchema.safeParse(raw);
+    if (!input.success)
+      return err(
+        analysisInputErrorFromIssues(operation, input.error.issues, raw, {
+          cause: input.error,
+        }),
+      );
+    const decoded = await this.provider.inspectDecoders(input.data, options);
+    if (!decoded.ok) return decoded;
+    const execution = decoded.value;
+    const report = signalDecodersSchema.safeParse(execution.result);
+    if (
+      !report.success ||
+      JSON.stringify(report.data.selection) !== JSON.stringify(input.data) ||
+      execution.subject?.path !== report.data.tool.path ||
+      execution.subject.sha256 !== report.data.tool.sha256
+    )
+      return err(
+        new AnalysisOutputError(
+          operation,
+          "Decoder discovery returned malformed data or changed the selected installation/options.",
+        ),
+      );
+    return this.#evidence(operation, input.data, execution, options);
+  }
+  #evidence(
+    operation: string,
+    parameters: Readonly<Record<string, JsonValue>>,
+    execution: AnalysisExecution,
+    options?: ExecutionOptions,
+  ): Result<Evidence, AnalysisError> {
+    const evidence = createEvidence(
+      execution.subject ?? undefined,
+      execution.provider,
+      {
+        operation,
+        parameters,
+        result: execution.result,
+        confidence: "observed",
+        locations: execution.locations,
+        limitations: execution.limitations,
+      },
+    );
     return options?.signal?.aborted
       ? err(
           new AnalysisCancelledError(operation, {
+            cause: options.signal.reason,
             partialObservation: evidence,
           }),
         )

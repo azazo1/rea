@@ -6,11 +6,16 @@ import {
   AnalysisInputError,
   AnalysisUnsupportedTargetError,
 } from "../../domain/analysisErrorCore.js";
-import { projectPlistValue } from "../../domain/apple/plistValue.js";
+import {
+  negativeZeroRealLimitation,
+  nonFiniteRealLimitation,
+  unknownDateLimitation,
+  unknownRealLimitation,
+} from "../../domain/apple/plistValue.js";
 import { createPlistNumberProjection } from "../../domain/apple/plistNumbers.js";
 import {
-  binaryPlistNumberLiterals,
-  xmlPlistNumberLiterals,
+  decodeBinaryPlistNumbers,
+  scanBinaryPlistNumberLiterals,
 } from "./PlistNumberLiterals.js";
 import {
   omittedPrototypeKeysLimitation,
@@ -64,26 +69,32 @@ export const decodeKeyedArchiveBytes = (
               )
             : new RangeError(message),
         bounds: "decoder",
+        numberProjection: true,
       })
+    : undefined;
+  const binaryNumberMetadata = binary
+    ? scanBinaryPlistNumberLiterals(bytes)
     : undefined;
   const parsed =
     binaryExpansion !== undefined
       ? {
-          value: parseBinary(bytes),
+          value: parseBinary(
+            decodeBinaryPlistNumbers(bytes, binaryNumberMetadata!),
+          ),
+          numberLiterals: binaryNumberMetadata!.literals,
           omittedPrototypeKeys: binaryExpansion.binaryPrototypeKeyObserved
             ? null
             : 0,
         }
       : parseXmlPropertyList(xmlText ?? "");
-  const { value: plistValue, unknownRealCount } = projectPlistValue(
-    parsed.value,
-  );
-  const graph = projectKeyedArchive(plistValue, selection);
-  const numbers = createPlistNumberProjection(
-    binary
-      ? binaryPlistNumberLiterals(bytes)
-      : xmlPlistNumberLiterals(xmlText ?? ""),
-  );
+  const {
+    nonFiniteRealCount,
+    unknownRealCount,
+    negativeZeroRealCount,
+    unknownDateCount,
+    ...graph
+  } = projectKeyedArchive(parsed.value, selection);
+  const numbers = createPlistNumberProjection(parsed.numberLiterals);
   // Classify the serialized graph before projecting values to typed decimals.
   // Numeric IDs, node kinds, references and pagination retain their original meaning.
   const roots = Object.fromEntries(
@@ -107,11 +118,18 @@ export const decodeKeyedArchiveBytes = (
       ...(parsed.omittedPrototypeKeys === 0
         ? []
         : [omittedPrototypeKeysLimitation(parsed.omittedPrototypeKeys)]),
+      ...(nonFiniteRealCount === 0
+        ? []
+        : [nonFiniteRealLimitation(nonFiniteRealCount)]),
       ...(unknownRealCount === 0
         ? []
-        : [
-            `${String(unknownRealCount)} non-finite real value(s) are reported as { "$plist_type": "real", "value": null } because JSON evidence cannot preserve NaN vs infinity.`,
-          ]),
+        : [unknownRealLimitation(unknownRealCount)]),
+      ...(negativeZeroRealCount === 0
+        ? []
+        : [negativeZeroRealLimitation(negativeZeroRealCount)]),
+      ...(unknownDateCount === 0
+        ? []
+        : [unknownDateLimitation(unknownDateCount)]),
     ],
   };
 };

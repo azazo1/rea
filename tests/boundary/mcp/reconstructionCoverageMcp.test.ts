@@ -3,8 +3,13 @@ import { ok as resultOk } from "../../../src/domain/result.js";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { describe, expect, it } from "vitest";
 
-import { completeReconstructionCoverageData } from "../../../src/domain/reconstructionCoverage.fixture.js";
+import {
+  completeReconstructionCoverageData,
+  reconstructionCoverageEvidenceId,
+} from "../../../src/domain/reconstructionCoverage.fixture.js";
 import { createReconstructionCoverageData } from "../../../src/domain/reconstructionCoverage.js";
+import { createEvidence } from "../../../src/domain/evidence.js";
+import { createEvidenceBundle } from "../../../src/domain/evidenceBundle.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed } from "../../fixtures/analysisExecution.js";
@@ -35,6 +40,100 @@ describe("reconstruction coverage MCP", () => {
         status: "ready",
         boundary_id: boundaryId,
         summary: { reasons: 0 },
+      });
+      const coverage = currentFixtureCoverage(boundaryId);
+      const latest = coverage.verifier_results[0];
+      if (latest === undefined)
+        throw new Error("Expected fixture verifier result");
+      const inference = createEvidence(
+        undefined,
+        { id: "weak-proof", name: "Weak proof fixture", version: "1" },
+        {
+          operation: "infer",
+          parameters: {},
+          result: { status: "unknown", note: "No replay was performed" },
+          authority: "analyst-inference",
+          confidence: "inferred",
+        },
+      );
+      const weakCoverage = createReconstructionCoverageData({
+        ...coverage,
+        evidence_bundle: createEvidenceBundle([
+          ...coverage.evidence_bundle.records,
+          inference,
+        ]),
+        verifier_results: [
+          { ...latest, evidence_ids: [inference.evidence_id] },
+        ],
+      });
+      const weak = await client.callTool({
+        name: "evaluate_reconstruction_coverage",
+        arguments: { coverage: weakCoverage, boundary_id: boundaryId },
+      });
+      expect(weak.isError).not.toBe(true);
+      expect(weak.structuredContent).toMatchObject({
+        status: "unknown",
+        reasons: [
+          expect.objectContaining({ code: "verifier-result-incompatible" }),
+        ],
+        evidence_ids: expect.arrayContaining([inference.evidence_id]),
+      });
+      const tampered = await client.callTool({
+        name: "evaluate_reconstruction_coverage",
+        arguments: {
+          boundary_id: boundaryId,
+          coverage: {
+            ...weakCoverage,
+            evidence_bundle: {
+              ...weakCoverage.evidence_bundle,
+              records: weakCoverage.evidence_bundle.records.map((record) =>
+                record.evidence_id === inference.evidence_id
+                  ? {
+                      ...record,
+                      authority: "controlled-replay",
+                      confidence: "observed",
+                    }
+                  : record,
+              ),
+            },
+          },
+        },
+      });
+      expect(tampered.isError).toBe(true);
+      expect(parseMcpToolError(tampered)).toMatchObject({
+        error: { code: "invalid_request" },
+      });
+      const ambiguous = await client.callTool({
+        name: "evaluate_reconstruction_coverage",
+        arguments: {
+          coverage: createReconstructionCoverageData({
+            ...coverage,
+            verifier_results: [
+              latest,
+              {
+                ...latest,
+                status: "fail",
+                evidence_ids: [reconstructionCoverageEvidenceId("1")],
+              },
+            ],
+          }),
+          boundary_id: boundaryId,
+        },
+      });
+      expect(ambiguous.isError).not.toBe(true);
+      expect(ambiguous.structuredContent).toMatchObject({
+        status: "unknown",
+        boundary_id: boundaryId,
+        reasons: [
+          expect.objectContaining({
+            code: "verifier-result-ambiguous",
+            subject_id: "claim.cli.help",
+          }),
+        ],
+        evidence_ids: expect.arrayContaining([
+          reconstructionCoverageEvidenceId("3"),
+          reconstructionCoverageEvidenceId("1"),
+        ]),
       });
       const unknown = await client.callTool({
         name: "evaluate_reconstruction_coverage",

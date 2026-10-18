@@ -7,7 +7,7 @@ import {
   realpath,
   type FileHandle,
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { streamChunkToBuffer } from "./StreamBytes.js";
@@ -17,6 +17,7 @@ import {
   destinationCaseCollisionMessage,
   normalizeArtifactPath,
 } from "./ArtifactPaths.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import { SafeOutputTreeCreationFailure } from "./SafeOutputTreeCreationFailure.js";
 import { hashOutputFile } from "./SafeOutputTreeReadback.js";
@@ -92,7 +93,8 @@ export class SafeOutputTree {
         "path",
         "Extraction output root must be absolute",
       );
-    const requested = resolve(outputRoot);
+    // Path syntax follows the host; `platform` selects only the name policy.
+    const requested = absoluteCallerPath(outputRoot);
     const name = basename(requested);
     if (name === "." || name === "..")
       throw new ArtifactReaderFailure("path", "Invalid extraction output root");
@@ -280,9 +282,11 @@ export class SafeOutputTree {
   }
 
   /** Sync the owned output tree and prevent further writes through this instance. */
-  async commit(): Promise<void> {
+  async commit(signal?: AbortSignal): Promise<void> {
     this.#assertWritable();
+    abortIfNeeded(signal);
     await this.#assertOwnedDirectories();
+    abortIfNeeded(signal);
     // Windows has no directory fsync; file contents are already synced in write().
     if (this.platform === "win32") {
       this.#published = true;
@@ -315,6 +319,7 @@ export class SafeOutputTree {
       );
       await output.handle.sync();
       await parent.handle.sync();
+      abortIfNeeded(signal);
       this.#published = true;
     } catch (cause: unknown) {
       sync = { kind: "failed", cause };
@@ -336,23 +341,26 @@ export class SafeOutputTree {
         closeFailure,
         this.#outputRoot,
       );
-      if (sync.kind === "failed")
-        throw ArtifactReaderFailure.withCleanup(
-          new ArtifactReaderFailure(
-            "path",
-            "Could not durably sync extraction output",
-            { cause: sync.cause },
-          ),
-          cleanup,
-        );
+      if (sync.kind === "failed") {
+        const primary = isCancellationFailure(sync.cause)
+          ? sync.cause
+          : new ArtifactReaderFailure(
+              "path",
+              "Could not durably sync extraction output",
+              { cause: sync.cause },
+            );
+        throw ArtifactReaderFailure.withCleanup(primary, cleanup);
+      }
       throw ArtifactReaderFailure.withCleanup(closeFailure, cleanup);
     }
-    if (sync.kind === "failed")
+    if (sync.kind === "failed") {
+      if (isCancellationFailure(sync.cause)) throw sync.cause;
       throw new ArtifactReaderFailure(
         "path",
         "Could not durably sync extraction output",
         { cause: sync.cause },
       );
+    }
   }
 
   /** Remove only this operation's unsealed tree and verify absence. */
@@ -574,10 +582,20 @@ const normalizeDestinationPath = (
   platform: NodeJS.Platform,
 ): string => {
   const path = normalizeArtifactPath(relativePath);
+  if (platform === "win32" && path.includes("\\"))
+    throw new ArtifactReaderFailure(
+      "path",
+      `Windows destination cannot materialize artifact path: ${JSON.stringify(path)}; backslashes denote path separators.`,
+    );
   if (platform === "win32" && path.includes(":"))
     throw new ArtifactReaderFailure(
       "path",
       `Windows destination cannot materialize artifact path as a regular file: ${path}; ':' denotes alternate data stream syntax.`,
+    );
+  if (platform === "win32" && /[\u0001-\u001f]/u.test(path))
+    throw new ArtifactReaderFailure(
+      "path",
+      `Windows destination cannot materialize artifact path: ${JSON.stringify(path)}; Windows names cannot contain U+0001-U+001F.`,
     );
   return path;
 };
@@ -587,8 +605,14 @@ const abortIfNeeded = (signal?: AbortSignal): void => {
     throw new ArtifactReaderFailure(
       "cancelled",
       "Artifact extraction cancelled",
+      { cause: signal.reason },
     );
 };
+
+const isCancellationFailure = (
+  cause: unknown,
+): cause is ArtifactReaderFailure =>
+  cause instanceof ArtifactReaderFailure && cause.reason === "cancelled";
 
 const isAlreadyExists = (cause: unknown): boolean =>
   cause instanceof Error && "code" in cause && cause.code === "EEXIST";

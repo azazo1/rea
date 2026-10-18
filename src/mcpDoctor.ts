@@ -1,9 +1,16 @@
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Formatter, Help, z } from "incur";
+import { performance } from "node:perf_hooks";
 import { resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
-import { CATALOG_IDENTITY } from "./catalogIdentity.js";
+import { createCatalogIdentity } from "./catalogIdentity.js";
+import {
+  compactPresentationForMcpInputSchemaProfile,
+  parseMcpInputSchemaProfile,
+} from "./config/mcpInputSchemaProfile.js";
+import { parseMcpOutputSchemaProfile } from "./config/mcpOutputSchemaProfile.js";
 import { PROMPT_CONTRACTS } from "./contracts/promptContracts.js";
 import { TOOL_CONTRACTS } from "./contracts/toolContracts.js";
 import { err, ok } from "./domain/result.js";
@@ -73,15 +80,17 @@ interface McpDoctorCheck {
 
 /** Diagnose the actual production stdio adapter with one startup-bounded SDK session. */
 export const runProductionMcpDoctor = async (options: McpDoctorOptions) => {
+  const catalog = catalogIdentityForEnvironment(options.environment);
   const deadline =
-    Date.now() + (options.deadlineMs ?? MCP_STARTUP_POLICY.doctorDeadlineMs);
+    performance.now() +
+    (options.deadlineMs ?? MCP_STARTUP_POLICY.doctorDeadlineMs);
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(new Error("Production MCP doctor deadline expired")),
-    Math.max(1, deadline - Date.now()),
+    Math.max(1, Math.ceil(deadline - performance.now())),
   );
   const stderr = captureStderr();
-  const transport = new TrackedStdioClientTransport({
+  const transport = new OwnedStdioClientTransport({
     command: options.command,
     args: [...options.args],
     cwd: options.cwd,
@@ -90,21 +99,21 @@ export const runProductionMcpDoctor = async (options: McpDoctorOptions) => {
   });
   transport.stderr?.on("data", stderr.append);
   const client = new Client({ name: "rea-mcp-doctor", version: "1" });
+  let result: ProductionMcpDoctorResult;
+  let cleanupFailure: { readonly cause: unknown } | undefined;
   try {
     await client.connect(
       transport,
       requestOptions(deadline, controller.signal),
     );
-    return {
-      ...(await inspectProductionMcpSession(
-        client,
-        deadline,
-        controller.signal,
-      )),
-      diagnostics: stderr.value(),
-    };
+    result = await inspectProductionMcpSession(
+      client,
+      deadline,
+      controller.signal,
+      catalog,
+    );
   } catch (cause: unknown) {
-    return {
+    result = {
       healthy: false,
       adapter: "production-stdio" as const,
       server: null,
@@ -118,18 +127,76 @@ export const runProductionMcpDoctor = async (options: McpDoctorOptions) => {
           detail: errorMessage(cause),
         },
       ],
-      diagnostics: stderr.value(),
     };
   } finally {
     clearTimeout(timer);
-    await closeMcpChild(client, transport);
+    try {
+      await client.close();
+    } catch (cause: unknown) {
+      cleanupFailure = { cause };
+    }
+    try {
+      // An interrupted connect can clear the client's transport reference
+      // before its startup child is closed. The transport retains that child.
+      await transport.close();
+    } catch (cause: unknown) {
+      cleanupFailure = {
+        cause:
+          cleanupFailure === undefined || cleanupFailure.cause === cause
+            ? cause
+            : new AggregateError(
+                [cleanupFailure.cause, cause],
+                `MCP client and transport cleanup failed: ${errorMessage(cleanupFailure.cause)}; ${errorMessage(cause)}`,
+              ),
+      };
+    }
   }
+  if (cleanupFailure !== undefined)
+    result = {
+      ...result,
+      healthy: false,
+      checks: [
+        ...result.checks,
+        {
+          name: "cleanup",
+          ok: false,
+          detail: `MCP stdio cleanup failed: ${errorMessage(cleanupFailure.cause)}`,
+        },
+      ],
+    };
+  return { ...result, diagnostics: stderr.value() };
 };
+
+type ProductionMcpDoctorResult =
+  | Awaited<ReturnType<typeof inspectProductionMcpSession>>
+  | {
+      readonly healthy: false;
+      readonly adapter: "production-stdio";
+      readonly server: null;
+      readonly inventory: null;
+      readonly identity: null;
+      readonly request_flow: {
+        readonly tool: "binary_session";
+        readonly ok: false;
+      };
+      readonly checks: readonly McpDoctorCheck[];
+    };
+
+/** Join SDK-triggered and caller-triggered close calls for the same child. */
+class OwnedStdioClientTransport extends StdioClientTransport {
+  #closePromise: Promise<void> | undefined;
+
+  override close(): Promise<void> {
+    this.#closePromise ??= super.close();
+    return this.#closePromise;
+  }
+}
 
 const inspectProductionMcpSession = async (
   client: Client,
   deadline: number,
   signal: AbortSignal,
+  catalog: ReturnType<typeof createCatalogIdentity>,
 ) => {
   const request = requestOptions(deadline, signal);
   const [tools, prompts] = await Promise.all([
@@ -179,8 +246,7 @@ const inspectProductionMcpSession = async (
       name: "server-identity",
       ok:
         observedIdentity.packageVersion === PRODUCT_IDENTITY.packageVersion &&
-        observedIdentity.catalogDigest ===
-          CATALOG_IDENTITY.digests.combined_sha256,
+        observedIdentity.catalogDigest === catalog.digests.combined_sha256,
       detail: `package=${observedIdentity.packageVersion ?? "missing"}; catalog=${observedIdentity.catalogDigest ?? "missing"}`,
     },
     {
@@ -203,7 +269,7 @@ const inspectProductionMcpSession = async (
     identity: {
       expected_package_version: PRODUCT_IDENTITY.packageVersion,
       observed_package_version: observedIdentity.packageVersion,
-      expected_catalog_digest: CATALOG_IDENTITY.digests.combined_sha256,
+      expected_catalog_digest: catalog.digests.combined_sha256,
       observed_catalog_digest: observedIdentity.catalogDigest,
     },
     request_flow: {
@@ -222,6 +288,7 @@ export const runProductionMcpDoctorCli = async (
   arguments_: readonly string[],
   input: { readonly dispatcherPath: string; readonly packageRoot: string },
 ): Promise<{ readonly output: string; readonly exitCode: number }> => {
+  const started = performance.now();
   const parsed = parseOutputArguments(arguments_);
   if (!parsed.ok) {
     if (parsed.help)
@@ -240,8 +307,18 @@ export const runProductionMcpDoctorCli = async (
     cwd: input.packageRoot,
     environment: process.env,
   });
+  const outputValue = parsed.fullOutput
+    ? {
+        ok: result.healthy,
+        ...(result.healthy ? { data: result } : { error: result }),
+        meta: {
+          command: MCP_DOCTOR_COMMAND,
+          duration: `${Math.round(performance.now() - started)}ms`,
+        },
+      }
+    : result;
   return {
-    output: `${Formatter.format(result, parsed.format)}\n`,
+    output: `${Formatter.format(outputValue, parsed.format)}\n`,
     exitCode: result.healthy ? 0 : 1,
   };
 };
@@ -311,7 +388,11 @@ const parseIdentityToolResult = (
  * flag is an output selector declared in `MCP_DOCTOR_OPTIONS`.
  */
 type McpDoctorArguments =
-  | { readonly ok: true; readonly format: OutputFormat }
+  | {
+      readonly ok: true;
+      readonly format: OutputFormat;
+      readonly fullOutput: boolean;
+    }
   | { readonly ok: false; readonly help: true }
   | {
       readonly ok: false;
@@ -329,6 +410,7 @@ const parseOutputArguments = (
   // masking the typo with usage.
   if (hasHelpInOptionPosition(arguments_)) return { ok: false, help: true };
   let format: OutputFormat = "toon";
+  let fullOutput = false;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--json") {
@@ -351,7 +433,10 @@ const parseOutputArguments = (
       format = candidate;
       continue;
     }
-    if (argument === "--full-output") continue;
+    if (argument === "--full-output") {
+      fullOutput = true;
+      continue;
+    }
     if (HELP_FLAGS.has(argument ?? "")) return { ok: false, help: true };
     return {
       ok: false,
@@ -360,7 +445,7 @@ const parseOutputArguments = (
       message: `Unknown mcp doctor option: ${argument ?? "missing"}`,
     };
   }
-  return { ok: true, format };
+  return { ok: true, format, fullOutput };
 };
 
 /**
@@ -385,7 +470,7 @@ const isOutputFormat = (value: string | undefined): value is OutputFormat =>
 
 const requestOptions = (deadline: number, signal: AbortSignal) => ({
   signal,
-  timeout: Math.max(1, deadline - Date.now()),
+  timeout: Math.max(1, Math.ceil(deadline - performance.now())),
 });
 
 const targetFreeEnvironment = (
@@ -405,20 +490,48 @@ const targetFreeEnvironment = (
   return result;
 };
 
+const catalogIdentityForEnvironment = (
+  environment: Readonly<Record<string, string | undefined>>,
+): ReturnType<typeof createCatalogIdentity> => {
+  const inputProfile = parseMcpInputSchemaProfile(
+    environment.REA_MCP_INPUT_SCHEMA_PROFILE,
+  );
+  const outputProfile = parseMcpOutputSchemaProfile(
+    environment.REA_MCP_OUTPUT_SCHEMA_PROFILE,
+  );
+  return createCatalogIdentity(
+    compactPresentationForMcpInputSchemaProfile(
+      inputProfile.ok ? inputProfile.value : undefined,
+    ),
+    outputProfile.ok ? (outputProfile.value ?? "full") : "full",
+  );
+};
+
 const captureStderr = () => {
-  const chunks: Buffer[] = [];
+  const retained = Buffer.allocUnsafe(MCP_STARTUP_POLICY.doctorStderrBytes);
+  let retainedBytes = 0;
   let bytes = 0;
+  let truncated = false;
   return {
     append(chunk: unknown) {
       const buffer = Buffer.isBuffer(chunk)
         ? chunk
         : Buffer.from(String(chunk), "utf8");
       bytes += buffer.byteLength;
-      chunks.push(Buffer.from(buffer));
+      const remaining = retained.byteLength - retainedBytes;
+      const copied = Math.min(remaining, buffer.byteLength);
+      if (copied > 0) {
+        buffer.copy(retained, retainedBytes, 0, copied);
+        retainedBytes += copied;
+      }
+      if (copied < buffer.byteLength) truncated = true;
     },
     value: () => ({
-      stderr: Buffer.concat(chunks, bytes).toString("utf8"),
+      stderr: truncated
+        ? new StringDecoder("utf8").write(retained.subarray(0, retainedBytes))
+        : retained.toString("utf8", 0, retainedBytes),
       stderr_bytes: bytes,
+      stderr_truncated: truncated,
     }),
   };
 };
@@ -428,61 +541,3 @@ const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
 
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
-
-class TrackedStdioClientTransport extends StdioClientTransport {
-  spawnedPid: number | null = null;
-
-  override async start(): Promise<void> {
-    await super.start();
-    this.spawnedPid = this.pid;
-  }
-}
-
-const closeMcpChild = async (
-  client: Client,
-  transport: TrackedStdioClientTransport,
-): Promise<void> => {
-  const pid = transport.spawnedPid ?? transport.pid;
-  await Promise.allSettled([client.close()]);
-  await Promise.allSettled([transport.close()]);
-  if (pid === null || !(await processExists(pid))) return;
-  await terminateProcess(pid, "SIGTERM");
-  if (await waitForProcessExit(pid, 1_000)) return;
-  await terminateProcess(pid, "SIGKILL");
-  await waitForProcessExit(pid, 1_000);
-};
-
-const terminateProcess = async (
-  pid: number,
-  signal: NodeJS.Signals,
-): Promise<void> => {
-  try {
-    process.kill(pid, signal);
-  } catch (cause: unknown) {
-    if (!(cause instanceof Error && "code" in cause && cause.code === "ESRCH"))
-      throw cause;
-  }
-};
-
-const waitForProcessExit = async (
-  pid: number,
-  timeoutMs: number,
-): Promise<boolean> => {
-  const deadline = Date.now() + timeoutMs;
-  do {
-    if (!(await processExists(pid))) return true;
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
-  } while (Date.now() < deadline);
-  return !(await processExists(pid));
-};
-
-const processExists = async (pid: number): Promise<boolean> => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (cause: unknown) {
-    if (cause instanceof Error && "code" in cause && cause.code === "ESRCH")
-      return false;
-    throw cause;
-  }
-};

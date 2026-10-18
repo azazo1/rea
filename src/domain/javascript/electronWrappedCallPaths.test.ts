@@ -140,6 +140,40 @@ it("preserves an observed empty contextBridge API object", () => {
   expect(result.parse_status).toBe("complete");
 });
 
+it.each([
+  [
+    "explicit nested paths after an unknown spread",
+    `{ ...extra, a: { b: 1 }, c: 2 }`,
+    ["a", "a.b", "c"],
+    1,
+    "dynamic",
+  ],
+  [
+    "a direct object literal",
+    `{ a: { b: 1 }, c: 2 }`,
+    ["a", "a.b", "c"],
+    0,
+    "object-literal",
+  ],
+  ["a dynamic API argument", "getApi()", [], 1, "dynamic"],
+] as const)(
+  "preserves directly observed nested bridge members for %s",
+  (_name, api, members, unknownMembers, apiStatus) => {
+    const result = analyzeJavaScriptStaticSource(`
+      const { contextBridge } = require("electron");
+      contextBridge.exposeInMainWorld("api", ${api});
+    `);
+    expect(result.electron.context_bridge_apis).toContainEqual(
+      expect.objectContaining({
+        api_key: "api",
+        api_status: apiStatus,
+        members,
+        unknown_members: unknownMembers,
+      }),
+    );
+  },
+);
+
 describe("wrapped contextBridge exposure methods", () => {
   it("retains the original expression for a dynamic isolated world id", () => {
     const result = analyzeJavaScriptStaticSource(
@@ -147,7 +181,9 @@ describe("wrapped contextBridge exposure methods", () => {
         `const worldId = selectWorld(); electron.contextBridge.exposeInIsolatedWorld(worldId, "isolatedApi", {ping: true});`,
       ),
     );
-    expect(result.electron.context_bridge_apis).toContainEqual(
+    // The proven Webpack bootstrap resolves `load(2)` directly, so the complete
+    // direct observation is retained instead of a wrapper substitution.
+    expect(result.electron.context_bridge_apis).toEqual([
       expect.objectContaining({
         world: "isolated",
         world_id: {
@@ -156,9 +192,15 @@ describe("wrapped contextBridge exposure methods", () => {
           expression: "worldId",
         },
         api_key: "isolatedApi",
+        api_status: "object-literal",
         members: ["ping"],
-        resolution_basis: "wrapper-substitution",
+        unknown_members: 0,
+        module_key: "9",
+        module_runtime: "webpack-bootstrap@0",
       }),
+    ]);
+    expect(result.electron.context_bridge_apis[0]).not.toHaveProperty(
+      "resolution_basis",
     );
     expect(result.parse_status).toBe("partial");
   });
@@ -311,6 +353,22 @@ it("retains distinct wrapper invocation ranges for one IPC API source", () => {
     findings[1]?.invocation_location,
   );
 });
+it("keeps one wrapper registration when one invocation reaches it twice", () => {
+  const result = analyzeJavaScriptStaticSource(`
+      const e=require("electron");
+      const copy=event=>event.sender.copy();
+      function register(channel,handler){e.ipcMain.on(channel,handler);}
+      function twice(channel){register(channel,copy);register(channel,copy);}
+      twice("same:invocation");
+    `);
+  expect(
+    result.electron.ipc.filter(
+      ({ resolution_basis, channel }) =>
+        resolution_basis === "wrapper-substitution" &&
+        channel === "same:invocation",
+    ),
+  ).toHaveLength(1);
+});
 it("keeps a directly observed renderer operation singular when tracing its exposed callback", () => {
   const result = analyzeJavaScriptStaticSource(`
     const {contextBridge,ipcRenderer}=require("electron");
@@ -356,6 +414,83 @@ it("preserves guarded alternatives in direct exposed object literals", () => {
       }),
     ]),
   );
+});
+it("preserves bridge member segments and excludes prototype setters", () => {
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    const write=()=>e.ipcRenderer.send("write");
+    e.contextBridge.exposeInMainWorld("desktop", {
+      "nested.write": write,
+      nested: { write },
+      __proto__: { inherited: write },
+      ["__proto__"]: { own: write },
+    });
+  `);
+  expect(result.electron.call_paths).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry: "desktop.nested.write",
+        entry_path: ["desktop", "nested.write"],
+      }),
+      expect.objectContaining({
+        entry: "desktop.nested.write",
+        entry_path: ["desktop", "nested", "write"],
+      }),
+      expect.objectContaining({
+        entry: "desktop.__proto__.own",
+        entry_path: ["desktop", "__proto__", "own"],
+      }),
+    ]),
+  );
+  expect(result.electron.call_paths).not.toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry_path: ["desktop", "__proto__", "inherited"],
+      }),
+    ]),
+  );
+});
+it("follows an explicit object-literal prototype lookup in a bridge wrapper", () => {
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    const prototype={send:()=>e.ipcRenderer.send("through-prototype")};
+    const object={__proto__:prototype};
+    e.contextBridge.exposeInMainWorld("desktop", {
+      action:()=>object.__proto__.send(),
+    });
+  `);
+  expect(result.electron.call_paths).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry_path: ["desktop", "action"],
+        channel: "through-prototype",
+      }),
+    ]),
+  );
+});
+it("does not spread a large nested bridge member list into function arguments", () => {
+  const members = Array.from(
+    { length: 125_000 },
+    (_, index) => `m${index}(){}`,
+  ).join(",");
+  const source = `const e=require("electron");e.contextBridge.exposeInMainWorld("desktop",{nested:{${members}}});`;
+  expect(() => analyzeJavaScriptStaticSource(source)).not.toThrow();
+});
+it("reports nested bridge depth truncation while retaining shallow paths", () => {
+  const nested =
+    Array.from({ length: 130 }, (_, index) => `level${index}:{`).join("") +
+    `deep:()=>e.ipcRenderer.send("deep")` +
+    "}".repeat(130);
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    e.contextBridge.exposeInMainWorld("desktop", {
+      shallow:()=>e.ipcRenderer.send("shallow"), ${nested}
+    });
+  `);
+  expect(result.electron.call_paths).toContainEqual(
+    expect.objectContaining({ entry: "desktop.shallow", channel: "shallow" }),
+  );
+  expect(result.limitations.join(" ")).toContain("depth 128");
 });
 it("preserves conditions when a wrapper dispatches through conditional external methods", () => {
   const result = analyzeJavaScriptStaticSource(`
@@ -486,6 +621,624 @@ it.each(["({})", "load(2)"])(
         electron.ipcMain.on("guard", event => { ${left} || event.sender.copy(); });
       `),
     );
+    expect(result.electron.call_paths ?? []).toEqual([]);
+  },
+);
+it.each([
+  ["flag -= 1", true],
+  ["flag = 0", false],
+  ["flag -= step", true],
+  ["flag += 0", true],
+  ["flag &= 2", true],
+  ["flag &&= 0", true],
+  ["flag ||= 0", true],
+  ["flag ??= 0", true],
+] as const)(
+  "preserves contextual IPC candidates for assignment test %s",
+  (test, uncertain) => {
+    const result = analyzeJavaScriptStaticSource(`
+      const {contextBridge, ipcRenderer} = require("electron");
+      function action(step) {
+        let flag = 1;
+        if ((${test})) ipcRenderer.send("channel-then");
+        else ipcRenderer.send("channel-else");
+      }
+      contextBridge.exposeInMainWorld("desktop", {action});
+    `);
+    expect(result.electron.ipc.map(({ channel }) => channel).sort()).toEqual([
+      "channel-else",
+      "channel-then",
+    ]);
+    const paths = result.electron.call_paths
+      ?.filter(({ entry }) => entry === "desktop.action")
+      .map(({ channel, conditions, resolution }) => ({
+        channel,
+        conditions: conditions.map(({ expression }) => expression),
+        resolution,
+      }))
+      .sort((a, b) => String(a.channel).localeCompare(String(b.channel)));
+    expect(paths).toEqual([
+      {
+        channel: "channel-else",
+        conditions: uncertain ? [`!(${test})`] : [],
+        resolution: "candidate",
+      },
+      ...(uncertain
+        ? [
+            {
+              channel: "channel-then",
+              conditions: [test],
+              resolution: "candidate",
+            },
+          ]
+        : []),
+    ]);
+  },
+);
+it.each([
+  ["exports.flag = 1; exports.flag -= 1", "helper.flag", true],
+  ["exports.flag = 0", "helper.flag", false],
+  [
+    "module.exports = {flag: 1}; module.exports += {flag: 0}",
+    "helper.flag",
+    true,
+  ],
+  ["module.exports = {flag: 0}", "helper.flag", false],
+] as const)(
+  "preserves assignment semantics through module writes: %s",
+  (writes, test, uncertain) => {
+    const source = bundle(`
+      electron.contextBridge.exposeInMainWorld("desktop", {action() {
+        if (${test}) electron.ipcRenderer.send("channel-then");
+        else electron.ipcRenderer.send("channel-else");
+      }});
+    `).replace("exports.sender =", `${writes}; exports.sender =`);
+    const result = analyzeJavaScriptStaticSource(source);
+    const paths = result.electron.call_paths
+      ?.filter(({ entry }) => entry === "desktop.action")
+      .map(({ channel, conditions }) => ({
+        channel,
+        conditions: conditions.map(({ expression }) => expression),
+      }))
+      .sort((a, b) => String(a.channel).localeCompare(String(b.channel)));
+    expect(paths).toEqual([
+      { channel: "channel-else", conditions: uncertain ? [`!(${test})`] : [] },
+      ...(uncertain ? [{ channel: "channel-then", conditions: [test] }] : []),
+    ]);
+  },
+);
+it.each([
+  ["cb ||=", ["!(cb)"]],
+  ["cb &&=", ["cb"]],
+  ["cb ??=", ["(cb) === null || (cb) === undefined"]],
+  ["({cb: false}).cb ||=", []],
+  ["({cb: true}).cb &&=", []],
+  ["({cb: null}).cb ??=", []],
+] as const)(
+  "retains the reachable callable RHS of %s",
+  (assignment, conditions) => {
+    const result = analyzeJavaScriptStaticSource(`
+      const {contextBridge, ipcRenderer} = require("electron");
+      contextBridge.exposeInMainWorld("desktop", {action(cb) {
+        (${assignment} () => ipcRenderer.send("rhs"))();
+      }});
+    `);
+    expect(
+      result.electron.call_paths?.map(
+        ({ channel, conditions, resolution }) => ({
+          channel,
+          conditions: conditions.map(({ expression }) => expression),
+          resolution,
+        }),
+      ),
+    ).toEqual([{ channel: "rhs", conditions, resolution: "candidate" }]);
+  },
+);
+it.each([
+  "({cb: true}).cb ||=",
+  "({cb: false}).cb &&=",
+  "({cb: false}).cb ??=",
+])("does not invoke the skipped callable RHS of %s", (assignment) => {
+  const result = analyzeJavaScriptStaticSource(`
+    const {contextBridge, ipcRenderer} = require("electron");
+    contextBridge.exposeInMainWorld("desktop", {action() {
+      (${assignment} () => ipcRenderer.send("skipped"))();
+    }});
+  `);
+  expect(result.electron.call_paths ?? []).toEqual([]);
+  expect(result.electron.ipc).toContainEqual(
+    expect.objectContaining({ channel: "skipped" }),
+  );
+});
+it.each(["||=", "??="])(
+  "retains the selected left callable of %s",
+  (operator) => {
+    const result = analyzeJavaScriptStaticSource(`
+    const {contextBridge, ipcRenderer} = require("electron");
+    contextBridge.exposeInMainWorld("desktop", {action() {
+      (({cb: () => ipcRenderer.send("left")}).cb ${operator} () => ipcRenderer.send("right"))();
+    }});
+  `);
+    expect(
+      result.electron.call_paths?.map(({ channel, conditions }) => ({
+        channel,
+        conditions,
+      })),
+    ).toEqual([{ channel: "left", conditions: [] }]);
+  },
+);
+it.each([
+  ["||=", "!(exports.action)"],
+  ["&&=", "exports.action"],
+  ["??=", "(exports.action) === null || (exports.action) === undefined"],
+])(
+  "retains a guarded namespace callable assigned with %s",
+  (operator, condition) => {
+    const source = bundle(`
+    electron.contextBridge.exposeInMainWorld("desktop", {action: helper.action});
+  `).replace(
+      "exports.sender =",
+      `exports.action ${operator} () => electron.ipcRenderer.send("rhs"); exports.sender =`,
+    );
+    const result = analyzeJavaScriptStaticSource(source);
+    expect(
+      result.electron.call_paths?.map(({ channel, conditions }) => ({
+        channel,
+        conditions: conditions.map(({ expression }) => expression),
+      })),
+    ).toEqual([{ channel: "rhs", conditions: [condition] }]);
+  },
+);
+// A synthetic module record establishes identity, not the value of its mutable
+// exports slot. These are guarded candidates, including when runtime evaluation
+// might skip the RHS; they must not claim execution or select a stale value.
+const expectGuardedRoot = (
+  source: string,
+  operator: string,
+  target = "module.exports",
+  channel = "rhs",
+) => {
+  const result = analyzeJavaScriptStaticSource(source);
+  const condition =
+    operator === "&&="
+      ? target
+      : operator === "||="
+        ? `!(${target})`
+        : `(${target}) === null || (${target}) === undefined`;
+  expect(
+    result.electron.call_paths
+      ?.filter(({ entry }) => entry === "desktop.action")
+      .map(({ channel, conditions, resolution }) => ({
+        channel,
+        conditions: conditions.map(({ expression }) => expression),
+        resolution,
+      })) ?? [],
+  ).toEqual([{ channel, conditions: [condition], resolution: "candidate" }]);
+  expect(result.electron.ipc).toContainEqual(
+    expect.objectContaining({ channel }),
+  );
+};
+const rootFixture = (body: string, expose = true) =>
+  bundle(
+    expose
+      ? `electron.contextBridge.exposeInMainWorld("desktop", helper);`
+      : "",
+  ).replace("exports.sender =", `${body}; exports.sender =`);
+
+it.each([
+  ["null", "||="],
+  ["0", "||="],
+  ["false", "??="],
+  ["null", "??="],
+  ["void 0", "??="],
+  ["true", "&&="],
+  ["null", "&&="],
+  ["({action: () => electron.ipcRenderer.send('prior')})", "||="],
+  ["({action: () => electron.ipcRenderer.send('prior')})", "??="],
+  ["({action: () => electron.ipcRenderer.send('prior')})", "&&="],
+])(
+  "keeps mutable root result uncertain after %s with %s",
+  (prior, operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `module.exports = ${prior}; module.exports ${operator} {action: () => electron.ipcRenderer.send("rhs")}`,
+      ),
+      operator,
+    );
+  },
+);
+it.each(["||=", "??=", "&&="])(
+  "keeps a guarded candidate without a prior root write for %s",
+  (operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `module.exports ${operator} {action: () => electron.ipcRenderer.send("rhs")}`,
+      ),
+      operator,
+    );
+  },
+);
+it.each(["||=", "??=", "&&="])(
+  "keeps unknown prior root replacement guarded for %s",
+  (operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `module.exports = unknownValue; module.exports ${operator} {action: () => electron.ipcRenderer.send("rhs")}`,
+      ),
+      operator,
+    );
+  },
+);
+it.each(["||=", "??="])(
+  "does not claim a known prior root callable for %s",
+  (operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `module.exports = () => electron.ipcRenderer.send("prior");
+    const selected = (module.exports ${operator} () => electron.ipcRenderer.send("rhs"));
+    electron.contextBridge.exposeInMainWorld("desktop", {action: selected});`,
+        false,
+      ),
+      operator,
+    );
+  },
+);
+it.each(["||=", "??="])(
+  "does not borrow a later root write when evaluating %s",
+  (operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `module.exports = null;
+    const selected = (module.exports ${operator} {action: () => electron.ipcRenderer.send("selected")});
+    module.exports = {action: () => electron.ipcRenderer.send("later")};
+    electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+        false,
+      ),
+      operator,
+      "module.exports",
+      "selected",
+    );
+  },
+);
+it.each(["if (flag) module.exports = null;", "module[key] = null;"])(
+  "keeps ambiguous earlier root writes uncertain: %s",
+  (prior) => {
+    expectGuardedRoot(
+      rootFixture(
+        `${prior}
+    const selected = (module.exports ||= () => electron.ipcRenderer.send("rhs"));
+    electron.contextBridge.exposeInMainWorld("desktop", {action: selected});`,
+        false,
+      ),
+      "||=",
+    );
+  },
+);
+it.each([
+  ["null", "const alias = module; alias.exports = {};", "&&="],
+  ["{}", "const alias = module; alias.exports = null;", "||="],
+  ["{}", "const alias = module; alias.exports = null;", "??="],
+  ["null", "Object.assign(module, {exports: {}});", "&&="],
+  ["null", "replaceExports(module);", "&&="],
+  ["null", "const box = {holder: module}; box.holder.exports = {};", "&&="],
+  [
+    "null",
+    "const {holder: alias} = {holder: module}; alias.exports = {};",
+    "&&=",
+  ],
+])(
+  "keeps guarded root candidates after escape: %s; %s; %s",
+  (prior, escape, operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `module.exports = ${prior}; ${escape} module.exports ${operator} {action: () => electron.ipcRenderer.send("rhs")}`,
+      ),
+      operator,
+    );
+  },
+);
+it("keeps root candidates guarded in the presence of a shadowed module parameter", () => {
+  expectGuardedRoot(
+    rootFixture(`function unrelated(module) {replaceExports(module);}
+    module.exports = null; module.exports ||= {action: () => electron.ipcRenderer.send("rhs")}`),
+    "||=",
+  );
+});
+it.each([
+  "module.exports()",
+  "module.exports?.()",
+  "module.exports``",
+  "(module.exports)()",
+  "(module.exports as Function)()",
+  "(module.exports!)()",
+  "const fn = module.exports; fn()",
+  "(0, module.exports)()",
+])(
+  "keeps mutable root candidates guarded across invocation: %s",
+  (invocation) => {
+    expectGuardedRoot(
+      rootFixture(`module.exports = function() {this.exports = null;};
+    ${invocation}; module.exports ||= {action: () => electron.ipcRenderer.send("rhs")}`),
+      "||=",
+    );
+  },
+);
+it.each([
+  "module.exports = null; exports = {};",
+  "module.exports = null; module.exports = module.exports;",
+])(
+  "does not infer a root value from detached or self-referential writes: %s",
+  (prior) => {
+    expectGuardedRoot(
+      rootFixture(
+        `${prior} module.exports ||= {action: () => electron.ipcRenderer.send("rhs")}`,
+      ),
+      "||=",
+    );
+  },
+);
+it.each(["||=", "??=", "&&="])(
+  "keeps aliased logical assignment targets guarded for %s",
+  (operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `const alias = module;
+    const selected = (alias.exports ${operator} {action: () => electron.ipcRenderer.send("rhs")});
+    electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+        false,
+      ),
+      operator,
+      "alias.exports",
+    );
+  },
+);
+it.each(["||=", "??=", "&&="])(
+  "keeps conditional synthetic receivers guarded for %s",
+  (operator) => {
+    for (const receiver of [
+      "(flag ? module : module)",
+      "(flag ? {exports: true} : module)",
+      "(flag ? module : {exports: true})",
+    ]) {
+      expectGuardedRoot(
+        rootFixture(
+          `module.exports = null;
+    const selected = (${receiver}.exports ${operator} {action: () => electron.ipcRenderer.send("rhs")});
+    electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+          false,
+        ),
+        operator,
+        `${receiver}.exports`,
+      );
+    }
+  },
+);
+it.each(["||=", "??=", "&&="])(
+  "preserves ordinary values beside synthetic receivers for %s",
+  (operator) => {
+    for (const moduleFirst of [false, true]) {
+      const ordinary =
+        operator === "&&="
+          ? "{exports: false}"
+          : "{exports: () => electron.ipcRenderer.send('left')}";
+      const receiver = moduleFirst
+        ? `(flag ? module : ${ordinary})`
+        : `(flag ? ${ordinary} : module)`;
+      const target = `${receiver}.exports`;
+      const result = analyzeJavaScriptStaticSource(
+        rootFixture(
+          `const selected = (${target} ${operator} () => electron.ipcRenderer.send("right"));
+        electron.contextBridge.exposeInMainWorld("desktop", {action: selected});`,
+          false,
+        ),
+      );
+      const paths = result.electron.call_paths
+        ?.map(({ channel, conditions, resolution }) => ({
+          channel,
+          conditions: conditions.map(({ expression }) => expression),
+          resolution,
+        }))
+        .sort((a, b) => String(a.channel).localeCompare(String(b.channel)));
+      expect(paths).toEqual([
+        ...(operator === "&&="
+          ? []
+          : [
+              {
+                channel: "left",
+                conditions: [
+                  moduleFirst ? "!(flag)" : "flag",
+                  operator === "||="
+                    ? target
+                    : `(${target}) !== null && (${target}) !== undefined`,
+                ],
+                resolution: "candidate",
+              },
+            ]),
+        {
+          channel: "right",
+          conditions: [
+            operator === "&&="
+              ? target
+              : operator === "||="
+                ? `!(${target})`
+                : `(${target}) === null || (${target}) === undefined`,
+          ],
+          resolution: "candidate",
+        },
+      ]);
+      expect(result.electron.ipc).toContainEqual(
+        expect.objectContaining({ channel: "right" }),
+      );
+      if (operator !== "&&=")
+        expect(result.electron.ipc).toContainEqual(
+          expect.objectContaining({ channel: "left" }),
+        );
+    }
+  },
+);
+it.each(["(module)", "(module as any)", "(module!)"])(
+  "recognizes wrapped synthetic receivers: %s",
+  (receiver) => {
+    expectGuardedRoot(
+      rootFixture(
+        `const selected = (${receiver}.exports ||= {action: () => electron.ipcRenderer.send("rhs")});
+    electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+        false,
+      ),
+      "||=",
+      `${receiver}.exports`,
+    );
+  },
+);
+it.each(["||=", "??=", "&&="])(
+  "preserves uncertainty through module exports snapshots for %s",
+  (operator) => {
+    for (const [setup, target] of [
+      ["", "({exports: module.exports}).exports"],
+      ["const snapshot = module.exports;", "({exports: snapshot}).exports"],
+      ["", "[module.exports][0]"],
+    ]) {
+      expectGuardedRoot(
+        rootFixture(
+          `module.exports = null; ${setup}
+          const selected = (${target} ${operator} {action: () => electron.ipcRenderer.send("rhs")});
+          electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+          false,
+        ),
+        operator,
+        target,
+      );
+    }
+  },
+);
+it.each(["saved", "!saved"])(
+  "keeps primitive root snapshot branch uncertainty for %s",
+  (test) => {
+    const result = analyzeJavaScriptStaticSource(
+      rootFixture(
+        `module.exports = null; const saved = module.exports;
+      electron.contextBridge.exposeInMainWorld("desktop", {action() {
+        if (${test}) electron.ipcRenderer.send("then");
+        else electron.ipcRenderer.send("else");
+      }});`,
+        false,
+      ),
+    );
+    expect(
+      result.electron.call_paths
+        ?.map(({ channel, conditions }) => ({
+          channel,
+          conditions: conditions.map((c) => c.expression),
+        }))
+        .sort((a, b) => String(a.channel).localeCompare(String(b.channel))),
+    ).toEqual([
+      { channel: "else", conditions: [`!(${test})`] },
+      { channel: "then", conditions: [test] },
+    ]);
+  },
+);
+it.each(["||", "??", "&&"])(
+  "keeps primitive root logical snapshots uncertain for %s",
+  (operator) => {
+    expectGuardedRoot(
+      rootFixture(
+        `module.exports = null; const saved = module.exports;
+      const selected = saved ${operator} {action: () => electron.ipcRenderer.send("rhs")};
+      electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+        false,
+      ),
+      `${operator}=`,
+      "saved",
+    );
+  },
+);
+it.each(["module.exports", "({saved: module.exports}).saved"])(
+  "preserves namespace members through plain logical selection of %s",
+  (target) => {
+    for (const operator of ["||", "??"]) {
+      const result = analyzeJavaScriptStaticSource(
+        rootFixture(
+          `exports.action = () => electron.ipcRenderer.send("left");
+        const selected = ${target} ${operator} {};
+        electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+          false,
+        ),
+      );
+      expect(
+        result.electron.call_paths?.map(({ channel, conditions }) => ({
+          channel,
+          conditions: conditions.map((c) => c.expression),
+        })),
+      ).toEqual([
+        {
+          channel: "left",
+          conditions: [
+            operator === "||"
+              ? target
+              : `(${target}) !== null && (${target}) !== undefined`,
+          ],
+        },
+      ]);
+    }
+  },
+);
+it("preserves later member writes through a saved module exports reference", () => {
+  const result = analyzeJavaScriptStaticSource(
+    rootFixture(
+      `const saved = module.exports;
+    exports.action = () => electron.ipcRenderer.send("later-member");
+    electron.contextBridge.exposeInMainWorld("desktop", saved);`,
+      false,
+    ),
+  );
+  expect(
+    result.electron.call_paths?.map(({ channel, conditions }) => ({
+      channel,
+      conditions,
+    })),
+  ).toEqual([{ channel: "later-member", conditions: [] }]);
+});
+it.each(["||=", "??=", "&&="])(
+  "recognizes whole-target wrappers for %s",
+  (operator) => {
+    for (const target of [
+      "(module.exports as any)",
+      "(module.exports!)",
+      "(module.exports satisfies any)",
+      "(module.exports)",
+    ]) {
+      expectGuardedRoot(
+        rootFixture(
+          `module.exports = null;
+          const selected = (${target} ${operator} {action: () => electron.ipcRenderer.send("rhs")});
+          electron.contextBridge.exposeInMainWorld("desktop", selected);`,
+          false,
+        ),
+        operator,
+        target.slice(1, -1),
+      );
+      const ordinary = target.replace(
+        "module.exports",
+        `({exports: ${operator === "&&=" ? "false" : "true"}}).exports`,
+      );
+      const result =
+        analyzeJavaScriptStaticSource(`const e = require("electron");
+        e.contextBridge.exposeInMainWorld("desktop", {action() {
+          (${ordinary} ${operator} () => e.ipcRenderer.send("skipped"))();
+        }});`);
+      expect(result.electron.call_paths ?? []).toEqual([]);
+      expect(result.electron.ipc).toContainEqual(
+        expect.objectContaining({ channel: "skipped" }),
+      );
+    }
+  },
+);
+it.each(["||=", "??="])(
+  "keeps an ordinary object's exports slot precise for %s",
+  (operator) => {
+    const result = analyzeJavaScriptStaticSource(`const e=require("electron");
+    function action(){(({exports: true}).exports ${operator} () => e.ipcRenderer.send("skipped"))();}
+    e.contextBridge.exposeInMainWorld("desktop",{action});`);
     expect(result.electron.call_paths ?? []).toEqual([]);
   },
 );
@@ -636,3 +1389,24 @@ describe("wrapped Electron API identity", () => {
     );
   });
 });
+
+it.each([false, true])(
+  "preserves a guarded bridge entry sharing a registration with an unconditional member (reverse=%s)",
+  (reverse) => {
+    const members = ["always:register", "conditional:flag?register:()=>{}"];
+    if (reverse) members.reverse();
+    const result = analyzeJavaScriptStaticSource(`const e=require("electron");
+    function register(){e.ipcMain.on("bridge:register",()=>{});}
+    e.contextBridge.exposeInMainWorld("api",{${members.join(",")}});`);
+    expect(result.electron.call_paths).toContainEqual(
+      expect.objectContaining({
+        entry_kind: "bridge-member",
+        entry: "api.conditional",
+        terminal: "electron.ipcMain.on",
+        conditions: expect.arrayContaining([
+          expect.objectContaining({ expression: "flag" }),
+        ]),
+      }),
+    );
+  },
+);

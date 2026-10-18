@@ -5,9 +5,11 @@ import {
   nativeCalleesSchema,
   nativeXrefsSchema,
   nativeLiteralSearchPattern,
-  nativeStringsSchema,
 } from "./IdaNativeProtocol.js";
-import { analysisSearchInput } from "../contracts/analysisSearchContract.js";
+import {
+  analysisSearchPredicate,
+  analysisSearchQuerySchema,
+} from "../domain/analysisSearch.js";
 import {
   AnalysisInputError,
   AnalysisCancelledError,
@@ -32,6 +34,7 @@ import {
   disassemblySchema,
   idaAddressSchema,
   idaFunctionSchema,
+  idaStringsPageSchema,
   legacyCalleesSchema,
   legacyPageSchema,
   legacyStringSchema,
@@ -42,9 +45,9 @@ import {
   modernLookupSchema,
   modernLookupBatchSchema,
   modernPageSchema,
-  modernStringsSchema,
   modernXrefsSchema,
   nextOffset,
+  surveySegmentsSchema,
   type IdaDisassembly,
   type IdaFunction,
 } from "./IdaProtocolValues.js";
@@ -69,6 +72,9 @@ const identity = (fn: IdaFunction) => ({
 interface IdaRelationships {
   readonly items: ReturnType<typeof identity>[];
   readonly coverage: RelationshipCoverage;
+  readonly availability:
+    | { readonly available: true }
+    | { readonly available: false; readonly reason: string };
 }
 
 /** The only lookup answers upstream reports for a name or address that is not a function. */
@@ -78,7 +84,6 @@ const MISSING_PROCEDURE_ANSWERS: ReadonlySet<string> = new Set([
 ]);
 const lines = (asm: IdaDisassembly) =>
   asm.lines.map(({ address, instruction }) => `${address}: ${instruction}`);
-const searchQuerySchema = z.object(analysisSearchInput);
 
 /** Translate explicit analyst questions into a closed set of read-only upstream requests. */
 export class IdaOperationRunner {
@@ -86,6 +91,8 @@ export class IdaOperationRunner {
   readonly locations: EvidenceLocation[] = [];
   readonly limitations: string[] = [];
   relationshipCoverage: RelationshipCoverage | undefined;
+  /** The upstream cap flag of the last `xrefs_to` read, when the producer reported one. */
+  referencesTruncated: boolean | undefined;
   constructor(
     private readonly connection: IdaMcpConnection,
     private readonly protocol: "legacy" | "modern" | "native",
@@ -97,6 +104,10 @@ export class IdaOperationRunner {
       readonly x86Only?: boolean;
       /** False when the upstream server does not advertise `callgraph`. */
       readonly callGraphAvailable?: boolean;
+      /** False when the upstream server does not advertise `survey_binary`. */
+      readonly surveyAvailable?: boolean;
+      /** The program identity REA admitted, reported by `list_documents`. */
+      readonly admittedDocument?: string;
     } = {},
   ) {}
 
@@ -177,41 +188,89 @@ export class IdaOperationRunner {
     return entry;
   }
 
-  private lookupFunction(
+  /** Parse one lookup row: a function, an expected "missing" answer, or a producer failure. */
+  private lookupOutcome(
     query: string,
     item: z.infer<typeof modernLookupBatchSchema>[number] | undefined,
-    requestedBy?: string,
-  ): IdaFunction {
+  ): { readonly fn: IdaFunction } | { readonly missing: string } {
     if (item?.query !== query)
       throw new AnalysisProtocolError(
         `IDA function lookup answered for a different query than ${JSON.stringify(query)}.`,
       );
     if (
-      requestedBy !== undefined &&
       item.fn === null &&
       item.error !== null &&
       MISSING_PROCEDURE_ANSWERS.has(item.error)
     )
-      throw new AnalysisInputError(
-        requestedBy,
-        {
-          cause: new AnalysisProtocolError(
-            `IDA function lookup failed for ${query}: ${item.error}`,
-          ),
-        },
-        [
-          {
-            path: [],
-            reason: "invalid_value",
-            message: `IDA could not resolve procedure ${JSON.stringify(query)}: ${item.error}.`,
-          },
-        ],
-      );
+      return { missing: item.error };
     if (item.fn === null || item.error !== null)
       throw new AnalysisProtocolError(
         `IDA function lookup failed for ${query}: ${item.error ?? "missing function"}`,
       );
-    return item.fn;
+    return { fn: item.fn };
+  }
+
+  private lookupFunction(
+    query: string,
+    item: z.infer<typeof modernLookupBatchSchema>[number] | undefined,
+    requestedBy?: string,
+  ): IdaFunction {
+    const outcome = this.lookupOutcome(query, item);
+    if ("fn" in outcome) return outcome.fn;
+    if (requestedBy === undefined)
+      throw new AnalysisProtocolError(
+        `IDA function lookup failed for ${query}: ${outcome.missing}`,
+      );
+    throw new AnalysisInputError(
+      requestedBy,
+      {
+        cause: new AnalysisProtocolError(
+          `IDA function lookup failed for ${query}: ${outcome.missing}`,
+        ),
+      },
+      [
+        {
+          path: [],
+          reason: "invalid_value",
+          message: `IDA could not resolve procedure ${JSON.stringify(query)}: ${outcome.missing}.`,
+        },
+      ],
+    );
+  }
+
+  /** The containing function of an address, or why none contains it. */
+  private async containingProcedure(address: string): Promise<JsonValue> {
+    const item = modernLookupSchema.parse(
+      await this.call("lookup_funcs", { queries: [address] }),
+    )[0];
+    const outcome = this.lookupOutcome(address, item);
+    if ("fn" in outcome)
+      return {
+        query_address: address,
+        found: true,
+        procedure: identity(outcome.fn),
+      };
+    return {
+      query_address: address,
+      found: false,
+      procedure: null,
+      reason: (await this.addressInSegment(address))
+        ? "not_in_procedure"
+        : "outside_segments",
+    };
+  }
+
+  /** Segment membership from the database-scoped minimal survey; a missing fact is a failure. */
+  private async addressInSegment(address: string): Promise<boolean> {
+    if (this.options.surveyAvailable === false)
+      throw new AnalysisProtocolError(
+        "The upstream server does not advertise survey_binary, so segment membership cannot be established.",
+      );
+    const { segments } = surveySegmentsSchema.parse(
+      await this.call("survey_binary", { detail_level: "minimal" }),
+    );
+    const value = BigInt(address);
+    return segments.some(({ start, end }) => start <= value && value < end);
   }
 
   /** True only for modern callee reads on targets not proven x86-only; x86 reads never reach the graph code. */
@@ -253,19 +312,15 @@ export class IdaOperationRunner {
       const current: number = offset;
       if (this.protocol === "legacy") {
         const page = legacyPageSchema.parse(
-          await this.call("list_strings", { offset, count: 100 }),
+          await this.call("list_strings", { offset, count: 0 }),
         );
-        result.push(
-          ...page.data.map((item) => {
-            const s = legacyStringSchema.parse(item);
-            return { address: s.address, value: s.string };
-          }),
-        );
+        for (const item of page.data) {
+          const s = legacyStringSchema.parse(item);
+          result.push({ address: s.address, value: s.string });
+        }
         offset = page.next_offset;
       } else {
-        const page = (
-          this.protocol === "native" ? nativeStringsSchema : modernStringsSchema
-        ).parse(
+        const page = idaStringsPageSchema.parse(
           await this.call("find_regex", {
             pattern:
               this.protocol === "native"
@@ -275,6 +330,10 @@ export class IdaOperationRunner {
             limit: 100,
           }),
         );
+        if (page.error !== undefined && page.error !== null)
+          throw new AnalysisProtocolError(
+            `${this.protocol === "native" ? "Native IDA" : "IDA"} string search failed: ${page.error}`,
+          );
         result.push(
           ...page.matches.map((s) => ({ address: s.addr, value: s.string })),
         );
@@ -390,6 +449,7 @@ export class IdaOperationRunner {
       throw new AnalysisProtocolError(
         `IDA xrefs failed: ${page?.error ?? "missing references"}`,
       );
+    if (page.more !== undefined) this.referencesTruncated = page.more;
     if (page.more === true)
       this.limitations.push(
         "Upstream xrefs_to capped results at 1000 references; additional references remain unknown.",
@@ -413,7 +473,14 @@ export class IdaOperationRunner {
     };
     if (this.readsCallGraph(direction)) {
       coverage = await this.addCallGraphCallees(fn, result);
-      return { items: [...result.values()], coverage };
+      return {
+        items: [...result.values()],
+        coverage,
+        availability:
+          coverage.status === "unknown"
+            ? { available: false, reason: coverage.reason }
+            : { available: true },
+      };
     }
     if (this.protocol === "legacy") {
       const value = await this.call(
@@ -435,6 +502,11 @@ export class IdaOperationRunner {
       );
       return {
         items: [],
+        availability: {
+          available: false,
+          reason:
+            "Upstream xrefs do not establish direct caller relationships.",
+        },
         coverage: {
           status: "unknown",
           reason:
@@ -499,7 +571,11 @@ export class IdaOperationRunner {
         result.set(resolved.address, resolved);
       }
     }
-    return { items: [...result.values()], coverage };
+    return {
+      items: [...result.values()],
+      coverage,
+      availability: { available: true },
+    };
   }
 
   async run(
@@ -508,10 +584,10 @@ export class IdaOperationRunner {
   ): Promise<JsonValue> {
     const query =
       operation === "search_procedures" || operation === "search_strings"
-        ? searchQuerySchema.parse(parameters)
+        ? analysisSearchQuerySchema.parse(parameters)
         : undefined;
     const matches =
-      query === undefined ? undefined : this.searchPredicate(query);
+      query === undefined ? undefined : analysisSearchPredicate(query);
     if (operation === "list_procedures" || operation === "search_procedures") {
       const items = (await this.functions()).map((fn) => ({
         address: fn.address,
@@ -535,6 +611,16 @@ export class IdaOperationRunner {
               ({ address }) =>
                 address === idaAddressSchema.parse(parameters.address),
             );
+    }
+    if (operation === "list_documents") {
+      if (this.options.admittedDocument === undefined)
+        throw new AnalysisProtocolError("The admitted IDA program is unknown.");
+      return [this.options.admittedDocument];
+    }
+    if (operation === "resolve_containing_procedure") {
+      const queried = idaAddressSchema.parse(parameters.address);
+      this.locations.push({ kind: "address", address: queried });
+      return this.containingProcedure(queried);
     }
     if (operation === "xrefs") {
       const inspectedAddress = idaAddressSchema.parse(parameters.address);
@@ -577,30 +663,6 @@ export class IdaOperationRunner {
     }
   }
 
-  private searchPredicate(
-    query: z.infer<typeof searchQuerySchema>,
-  ): (value: string) => boolean {
-    let matches: (value: string) => boolean;
-    if (query.mode === "regex") {
-      try {
-        const regex = new RegExp(
-          query.pattern,
-          query.case_sensitive ? "u" : "iu",
-        );
-        matches = (value) => regex.test(value);
-      } catch (cause: unknown) {
-        throw new AnalysisInputError("search", { cause });
-      }
-    } else {
-      const needle = query.case_sensitive
-        ? query.pattern
-        : query.pattern.toLowerCase();
-      matches = (value) =>
-        (query.case_sensitive ? value : value.toLowerCase()).includes(needle);
-    }
-    return matches;
-  }
-
   private async dossier(fn: IdaFunction): Promise<JsonValue> {
     const asm = await this.assembly(fn);
     const pseudocode = await this.pseudocode(fn);
@@ -628,6 +690,32 @@ export class IdaOperationRunner {
       basic_blocks: [],
       native_api: null,
       native_value_flow: null,
+      facet_availability: {
+        pseudocode:
+          pseudocode === null
+            ? { available: false, reason: "IDA did not supply pseudocode." }
+            : { available: true },
+        assembly: { available: true },
+        comments: {
+          available: false,
+          reason: "IDA adapter does not expose typed comments.",
+        },
+        callers: callers.availability,
+        callees: callees.availability,
+        references: {
+          available: false,
+          reason: "IDA adapter does not expose typed reference edges.",
+        },
+        strings_names: {
+          available: false,
+          reason:
+            "IDA adapter does not expose function-referenced strings and names.",
+        },
+        cfg: {
+          available: false,
+          reason: "IDA adapter does not expose basic blocks.",
+        },
+      },
       limitations: [
         ...IDA_LIMITATIONS,
         ...this.limitations,

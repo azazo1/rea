@@ -33,16 +33,26 @@ export const ANALYSIS_RESOURCE_KINDS = [
 export class AnalysisResourceConstraintError extends AnalysisError {
   readonly _tag = "AnalysisResourceConstraintError";
   readonly remediationAction: string | undefined;
+  /**
+   * Whether retrying the same request can succeed. A caller-selected bound is
+   * deterministic for the same input, so it is not retryable even when its
+   * resource kind would otherwise be treated as admission capacity.
+   */
+  readonly retryable: boolean | undefined;
 
   constructor(
     readonly operation: string,
     readonly resource: (typeof ANALYSIS_RESOURCE_KINDS)[number],
     readonly reason: string,
     readonly reportedLimits: Readonly<Record<string, JsonValue>> | null,
-    options?: AnalysisErrorOptions & { readonly remediationAction?: string },
+    options?: AnalysisErrorOptions & {
+      readonly remediationAction?: string;
+      readonly retryable?: boolean;
+    },
   ) {
     super(`Resource constraint during ${operation}: ${reason}`, options);
     this.remediationAction = options?.remediationAction;
+    this.retryable = options?.retryable;
   }
 }
 
@@ -83,16 +93,30 @@ export interface AnalysisInputIssue {
   readonly maximum?: number;
 }
 
+/** Refusal-specific context a producer projects with an output failure. */
+export interface AnalysisOutputErrorOptions extends AnalysisErrorOptions {
+  /** Caller-facing explanation for a deterministic, diagnosable refusal. */
+  readonly userMessage?: string;
+  readonly remediationAction?: string;
+  readonly cleanupOnly?: boolean;
+}
+
 /** Provider output failed provider-neutral application parsing. */
 export class AnalysisOutputError extends AnalysisError {
   readonly _tag = "AnalysisOutputError";
+  override readonly userMessage: string | undefined;
+  readonly remediationAction: string | undefined;
+  readonly cleanupOnly: boolean;
 
   constructor(
     readonly operation: string,
     readonly reason: string,
-    options?: AnalysisErrorOptions,
+    options?: AnalysisOutputErrorOptions,
   ) {
     super(`Invalid analysis output for ${operation}: ${reason}`, options);
+    this.userMessage = options?.userMessage;
+    this.remediationAction = options?.remediationAction;
+    this.cleanupOnly = options?.cleanupOnly ?? false;
   }
 }
 
@@ -100,18 +124,27 @@ export class AnalysisOutputError extends AnalysisError {
 export class AnalysisCapabilityUnavailableError extends AnalysisError {
   readonly _tag = "AnalysisCapabilityUnavailableError";
   override readonly userMessage: string | undefined;
+  readonly remediationAction: string | undefined;
+  /** Incomplete cleanup must settle before the operation can be retried. */
+  readonly retryable: boolean;
 
   constructor(
     readonly providerId: string,
     readonly operation: string,
     readonly reason: string,
-    options?: AnalysisErrorOptions & { readonly userMessage?: string },
+    options?: AnalysisErrorOptions & {
+      readonly userMessage?: string;
+      readonly remediationAction?: string;
+      readonly retryable?: boolean;
+    },
   ) {
     super(
       `Provider ${providerId} cannot execute ${operation}: ${reason}`,
       options,
     );
     this.userMessage = options?.userMessage;
+    this.remediationAction = options?.remediationAction;
+    this.retryable = options?.retryable === true && !this.cleanupIncomplete;
   }
 }
 
@@ -130,16 +163,25 @@ export class AnalysisCancelledError extends AnalysisError {
 /** Provider-neutral operation exceeded its declared execution deadline. */
 export class AnalysisTimeoutError extends AnalysisError {
   readonly _tag = "AnalysisTimeoutError";
+  override readonly userMessage: string | undefined;
+  readonly remediationAction: string | undefined;
 
   constructor(
     readonly operation: string,
     readonly timeoutMs: number,
-    options?: AnalysisErrorOptions,
+    options?: AnalysisErrorOptions & {
+      /** Provider-specific explanation of which deadline elapsed. */
+      readonly userMessage?: string;
+      /** Provider-specific setting or action that changes that deadline. */
+      readonly remediationAction?: string;
+    },
   ) {
     super(
       `Analysis operation timed out after ${String(timeoutMs)}ms: ${operation}`,
       options,
     );
+    this.userMessage = options?.userMessage;
+    this.remediationAction = options?.remediationAction;
   }
 }
 

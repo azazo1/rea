@@ -1,3 +1,4 @@
+import { withCommandCancellation } from "./commandCancellation.js";
 import { z } from "incur";
 
 import type { DoctorScope } from "../application/Doctor.js";
@@ -120,18 +121,20 @@ const registerDoctorCommand = (
         .describe("Require the installed REA skill identity to be aligned"),
     }),
     run: ({ options }) =>
-      logCliCommand(logger, "doctor", async () => {
-        const [{ runDoctorOwned }, { createSystemDoctorHost }] =
-          await Promise.all([
-            import("../application/Doctor.js"),
-            import("../doctorRuntime.js"),
-          ]);
-        return runDoctorOwned(
-          options.target,
-          createSystemDoctorHost(environment),
-          doctorScope(options),
-        );
-      }),
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, "doctor", async () => {
+          const [{ runDoctorOwned }, { createSystemDoctorHost }] =
+            await Promise.all([
+              import("../application/Doctor.js"),
+              import("../doctorRuntime.js"),
+            ]);
+          return runDoctorOwned(
+            options.target,
+            createSystemDoctorHost(environment, signal),
+            doctorScope(options),
+          );
+        }),
+      ),
   });
 };
 
@@ -226,8 +229,14 @@ const runSetupCommand = async (
       : undefined,
   );
   if (interactive) renderInteractiveSetupResult(result, environment);
-  else if (options.dryRun && !input.formatExplicit && hasInteractiveTerminal())
-    renderSetupDryRun(result.plannedActions);
+  else if (
+    options.dryRun &&
+    !input.formatExplicit &&
+    hasInteractiveTerminal()
+  ) {
+    if (result.status === "planned") renderSetupDryRun(result.plannedActions);
+    else renderInteractiveSetupResult(result, environment);
+  }
   return result;
 };
 

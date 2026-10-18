@@ -1,3 +1,4 @@
+import { REGEX_MATCHING_LIMITATION } from "../process/RegexMatcher.js";
 import type {
   CapabilityDescriptor,
   ProviderIdentity,
@@ -62,12 +63,16 @@ const MUTATING_OPERATIONS = new Set<string>([
 
 /** Source-owned capabilities without acquiring or probing a Hopper session. */
 export const CAPABILITIES: readonly CapabilityDescriptor[] = Object.freeze(
-  HOPPER_OPERATIONS.map((operation) =>
+  [...HOPPER_OPERATIONS, "search_bytes" as const].map((operation) =>
     Object.freeze({
       provider: HOPPER_PROVIDER_IDENTITY,
       operation,
-      available: true,
-      reason: null,
+      ...(operation === "search_bytes"
+        ? {
+            available: false as const,
+            reason: "Masked byte search has not been verified for Hopper.",
+          }
+        : { available: true as const, reason: null }),
       effects: Object.freeze({
         mutatesArtifact: MUTATING_OPERATIONS.has(operation),
         launchesProcess: true,
@@ -86,7 +91,7 @@ export const CAPABILITIES: readonly CapabilityDescriptor[] = Object.freeze(
           : []),
         ...(operation === "search_strings" || operation === "search_procedures"
           ? [
-              "Regex mode uses ECMAScript Unicode semantics in a supervised worker with a five-second matching deadline. Cancellation or deadline failure stops matching without blocking Hopper; literal mode retains native casefold semantics.",
+              `${REGEX_MATCHING_LIMITATION} Literal mode retains native casefold semantics.`,
             ]
           : []),
         ...(operation === "list_strings" ||

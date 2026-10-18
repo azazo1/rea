@@ -479,6 +479,61 @@ describe("Ghidra Windows launcher", () => {
       }),
     ).toThrow(/metacharacters/u);
   });
+});
+
+describe("Ghidra Windows launcher runtime", () => {
+  it
+    .skipIf(process.platform !== "win32")
+    .each(["ghidra_12.1.4_PUBLIC", "ghidra_12.1.2_DEV"])(
+    "prepares the inspected release directory through the Windows runtime (%s)",
+    async (release) => {
+      const parent = await createTestTempDirectory("rea-launch-config-");
+      const installRoot = join(parent, "renamed-install");
+      const runtime = await createGhidraTestRuntime(parent);
+      runtimes.push(runtime);
+      const spawnProcess = vi.fn(async () => {
+        throw new Error("fixture stops before process creation");
+      });
+      const launcher = new GhidraHeadlessLauncher({
+        environment: process.env,
+        platform: "win32",
+        configurationDirectoryName: release,
+        analyzeHeadlessPath: join(
+          installRoot,
+          "support",
+          "analyzeHeadless.bat",
+        ),
+        javaHome: "C:\\Java\\jdk-21",
+        bridgeScriptPath: join(parent, "ReaGhidraBridge.java"),
+        // The preflight validates the inspected JVM's LaunchSupport output;
+        // these fixtures assert batch-spawn behavior without a working JDK.
+        javaLaunch: async () => ({
+          command: "C:\\Java\\jdk-21\\bin\\java.exe",
+          arguments: [],
+          environment: {},
+        }),
+        spawnProcess,
+      });
+      const launched = await launcher.launch({
+        runtimeRoot: runtime.path,
+        transport: "unix-socket",
+        endpointPath: join(runtime.path, "bridge.sock"),
+        token: "fixture-token",
+        runId: "d6fcbb66-e829-4ff6-a535-0035aec63139",
+        targetPath: join(parent, "fixture.exe"),
+        targetSha256: "b".repeat(64),
+        providerVersion: "12.1.4",
+        profileDigest: "a".repeat(64),
+      });
+      expect(launched.ok).toBe(false);
+      expect(spawnProcess).toHaveBeenCalledOnce();
+      expect(
+        (
+          await stat(join(runtime.path, "config", "ghidra", release))
+        ).isDirectory(),
+      ).toBe(true);
+    },
+  );
 
   it.skipIf(process.platform !== "win32")(
     "keeps authority in a private descriptor and isolates Ghidra state through the batch launcher",
@@ -497,11 +552,19 @@ describe("Ghidra Windows launcher", () => {
         // Select the fixture's Node PATH and injected JVM options explicitly.
         environment: process.env,
         analyzeHeadlessPath: fixturePath,
+        configurationDirectoryName: "ghidra_12.1.4_PUBLIC",
         // POSIX follows the real inspected-JVM route; Windows uses the official
         // batch script because its launcher contract differs.
         platform: "win32",
         javaHome,
         bridgeScriptPath: "/package/bridge/ReaGhidraBridge.java",
+        // The preflight validates the inspected JVM's LaunchSupport output;
+        // this fixture captures the batch launcher without a working JDK.
+        javaLaunch: async () => ({
+          command: `${javaHome}\\bin\\java.exe`,
+          arguments: [],
+          environment: {},
+        }),
       });
       const launched = await launcher.launch({
         runtimeRoot,

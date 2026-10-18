@@ -1,8 +1,25 @@
-import { mkdir, open as fsOpen, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  open as fsOpen,
+  readFile,
+  rename,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  readClientRegistrationInspections,
+  readClientRegistrationStatuses,
+} from "../../../src/application/ClientRegistrationStatus.js";
+import {
+  existingMaintenanceScope,
+  planIntegrationMaintenance,
+} from "../../../src/application/UpdateMaintenance.js";
+import { ArtifactResourceScope } from "../../../src/artifacts/ArtifactResourceScope.js";
+import { ok } from "../../../src/domain/result.js";
 import type { DoctorHost } from "../../../src/application/Doctor.js";
 import { ConfigurationError } from "../../../src/domain/configurationErrors.js";
 import {
@@ -11,6 +28,8 @@ import {
 } from "../../../src/application/SetupHost.js";
 import { RegularFileCleanupFailure } from "../../../src/application/RegularFileRead.js";
 import { configureDetectedClients } from "../../../src/application/SetupClients.js";
+import { configureClientConfiguration } from "../../../src/application/SetupClientConfiguration.js";
+import { systemUninstallHost } from "../../../src/application/Uninstall.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -31,6 +50,126 @@ beforeEach(async () => {
 
 afterEach(() => openMock.mockReset());
 
+const holdReadHandle = (path: string, reason: string) => {
+  const closeAttempts: FileHandle[] = [];
+  let released = false;
+  openMock.mockImplementation(async (...args) => {
+    const handle = await actualFs.open(...args);
+    if (String(args[0]) !== path) return handle;
+    const nativeClose = handle.close.bind(handle);
+    vi.spyOn(handle, "close").mockImplementation(async () => {
+      closeAttempts.push(handle);
+      if (!released) throw new Error(reason);
+      await nativeClose();
+    });
+    return handle;
+  });
+  return {
+    closeAttempts,
+    release: () => {
+      released = true;
+    },
+  };
+};
+
+/** Linux setup host with its VS Code client configuration directory prepared. */
+const preparedVsCodeSetupHost = async (prefix: string) => {
+  const home = await createTestTempDirectory(prefix);
+  const host = systemSetupHost(
+    { platform: "linux", homeDirectory: home } as DoctorHost,
+    { HOME: home, XDG_CONFIG_HOME: join(home, "xdg") },
+  );
+  const client = (await host.supportedClients()).find(
+    ({ name }) => name === "vscode",
+  );
+  if (client === undefined) throw new Error("VS Code setup client missing");
+  await mkdir(dirname(client.configPath), { recursive: true });
+  return { home, host, client };
+};
+
+/** Release the held read handle and verify host cleanup retries that same owner. */
+const expectCloseReclaimsHandle = async (
+  host: { close?: () => Promise<string | undefined> },
+  closeAttempts: readonly object[],
+  release: () => void,
+) => {
+  const attemptsBeforeClose = closeAttempts.length;
+  release();
+  expect(await host.close?.()).toBeUndefined();
+  expect(closeAttempts).toHaveLength(attemptsBeforeClose + 1);
+  expect(closeAttempts.at(-1)).toBe(closeAttempts[0]);
+};
+
+/** Give up on the assertion path: release the handle and let cleanup close it. */
+const cleanupHeldHandle = async (
+  host: { close?: () => Promise<string | undefined> },
+  release: () => void,
+) => {
+  release();
+  await host.close?.();
+};
+
+it("retains invalid UTF-8 diagnostics and the uninstall read owner when close fails", async () => {
+  const home = await createTestTempDirectory("rea-uninstall-utf8-close-");
+  const path = join(home, "client.json");
+  const original = Buffer.from([0xff]);
+  await writeFile(path, original);
+  const { closeAttempts, release } = holdReadHandle(
+    path,
+    "held uninstall handle",
+  );
+  const host = systemUninstallHost(home, undefined, { HOME: home }, "linux");
+  try {
+    expect(
+      await host.removeClient({
+        name: "cursor",
+        format: "json",
+        configPath: path,
+      }),
+    ).toMatchObject({
+      status: "failed",
+      detail: expect.stringContaining("not valid UTF-8"),
+    });
+    expect(await readFile(path)).toEqual(original);
+    expect(closeAttempts).toHaveLength(3);
+    expect(closeAttempts.every((handle) => handle === closeAttempts[0])).toBe(
+      true,
+    );
+    await expectCloseReclaimsHandle(host, closeAttempts, release);
+  } finally {
+    await cleanupHeldHandle(host, release);
+  }
+});
+
+it("stops uninstall and retains the backup read owner when its close fails", async () => {
+  const home = await createTestTempDirectory("rea-uninstall-backup-close-");
+  const path = join(home, "client.json");
+  const client = { name: "cursor", format: "json", configPath: path } as const;
+  await writeFile(path, '{"keep":"before setup"}\n');
+  expect(
+    await configureClientConfiguration(client, {}, ["rea", "mcp"]),
+  ).toMatchObject({ status: "configured" });
+  const configured = await readFile(path, "utf8");
+  const { closeAttempts, release } = holdReadHandle(
+    `${path}.rea.backup`,
+    "held backup handle",
+  );
+  const host = systemUninstallHost(home, undefined, { HOME: home }, "linux");
+  try {
+    expect(await host.removeClient(client)).toEqual({
+      name: "cursor",
+      status: "failed",
+      detail:
+        "Configuration could not be backed up, so no change was made. Check file permissions, then rerun uninstall.",
+    });
+    expect(await readFile(path, "utf8")).toBe(configured);
+    expect(closeAttempts).toHaveLength(2);
+    await expectCloseReclaimsHandle(host, closeAttempts, release);
+  } finally {
+    await cleanupHeldHandle(host, release);
+  }
+});
+
 describe("ZCode fallback cleanup ownership", () => {
   it.each(["preflight", "configure"])(
     "retains a failed ZCode fallback close during %s until host cleanup",
@@ -49,19 +188,10 @@ describe("ZCode fallback cleanup ownership", () => {
       await mkdir(dirname(fallback), { recursive: true });
       const original = '{"mcpServers":{"other":{"command":"other"}}}\n';
       await writeFile(fallback, original);
-      const closeAttempts: object[] = [];
-      let allowClose = false;
-      openMock.mockImplementation(async (...args) => {
-        const handle = await actualFs.open(...args);
-        if (String(args[0]) !== fallback) return handle;
-        const nativeClose = handle.close.bind(handle);
-        vi.spyOn(handle, "close").mockImplementation(async () => {
-          closeAttempts.push(handle);
-          if (!allowClose) throw new Error("held fallback handle");
-          await nativeClose();
-        });
-        return handle;
-      });
+      const { closeAttempts, release } = holdReadHandle(
+        fallback,
+        "held fallback handle",
+      );
       try {
         const action =
           operation === "preflight"
@@ -79,112 +209,86 @@ describe("ZCode fallback cleanup ownership", () => {
         await expect(readFile(client.configPath)).rejects.toMatchObject({
           code: "ENOENT",
         });
-        allowClose = true;
-        expect(await host.close?.()).toBeUndefined();
-        expect(closeAttempts).toHaveLength(3);
-        expect(closeAttempts[2]).toBe(closeAttempts[0]);
+        await expectCloseReclaimsHandle(host, closeAttempts, release);
       } finally {
-        allowClose = true;
-        await host.close?.();
+        await cleanupHeldHandle(host, release);
       }
     },
   );
 });
 
 describe("setup client configuration cleanup ownership", () => {
-  it("stops client configuration and retries the same alignment handle from host close", async () => {
-    const home = await createTestTempDirectory("rea-setup-config-close-");
-    const environment = {
-      HOME: home,
-      XDG_CONFIG_HOME: join(home, "xdg"),
-    };
-    const host = systemSetupHost(
-      { platform: "linux", homeDirectory: home } as DoctorHost,
-      environment,
-    );
-    const client = (await host.supportedClients()).find(
-      ({ name }) => name === "vscode",
-    );
-    if (client === undefined) throw new Error("VS Code setup client missing");
-    await mkdir(dirname(client.configPath), { recursive: true });
-    const original = Buffer.from('{"servers": {"other": {}}}\n');
-    await writeFile(client.configPath, original);
+  it.each([
+    ["valid UTF-8", Buffer.from('{"servers": {"other": {}}}\n')],
+    ["malformed UTF-8", Buffer.from([0xff])],
+  ] as const)(
+    "stops configuration and retains the %s read owner until host close",
+    async (encoding, original) => {
+      const { host, client } = await preparedVsCodeSetupHost(
+        "rea-setup-config-close-",
+      );
+      await writeFile(client.configPath, original);
 
-    const closeAttempts: object[] = [];
-    let allowClose = false;
-    openMock.mockImplementation(async (...args) => {
-      const handle = await actualFs.open(...args);
-      if (String(args[0]) !== client.configPath) return handle;
-      const nativeClose = handle.close.bind(handle);
-      vi.spyOn(handle, "close").mockImplementation(async () => {
-        closeAttempts.push(handle);
-        if (!allowClose) throw new Error("test holds the config handle open");
-        await nativeClose();
-      });
-      return handle;
-    });
-    const configure = vi.spyOn(host, "configureClient");
+      const { closeAttempts, release } = holdReadHandle(
+        client.configPath,
+        "test holds the config handle open",
+      );
+      const configure = vi.spyOn(host, "configureClient");
 
-    try {
-      const failure = await filterClientsNeedingConfigure(host, [client], {}, [
-        "rea",
-        "mcp",
-      ])
-        .then((detectedClients) =>
-          configureDetectedClients({
-            host,
-            detectedClients,
-            providerEnvironment: {},
-            command: ["rea", "mcp"],
-            clients: {},
-            appliedActions: [],
-          }),
+      try {
+        const failure = await filterClientsNeedingConfigure(
+          host,
+          [client],
+          {},
+          ["rea", "mcp"],
         )
-        .then(
-          () => undefined,
-          (cause: unknown) => cause,
-        );
-      expect(failure).toBeInstanceOf(ConfigurationError);
-      expect(failure).toMatchObject({
-        _tag: "ConfigurationError",
-        cause: expect.any(RegularFileCleanupFailure),
-        cleanup: {
-          resources: [client.configPath],
-          reason: expect.stringContaining("test holds the config handle open"),
-        },
-      });
-      expect(configure).not.toHaveBeenCalled();
-      expect(closeAttempts).toHaveLength(2);
-      expect(closeAttempts[0]).toBe(closeAttempts[1]);
-      expect(await readFile(client.configPath)).toEqual(original);
+          .then((detectedClients) =>
+            configureDetectedClients({
+              host,
+              detectedClients,
+              providerEnvironment: {},
+              command: ["rea", "mcp"],
+              clients: {},
+              appliedActions: [],
+            }),
+          )
+          .then(
+            () => undefined,
+            (cause: unknown) => cause,
+          );
+        expect(failure).toBeInstanceOf(ConfigurationError);
+        if (encoding === "malformed UTF-8")
+          expect(failure).toMatchObject({
+            cause: {
+              outcome: { kind: "failed", cause: expect.any(TypeError) },
+            },
+          });
+        expect(failure).toMatchObject({
+          _tag: "ConfigurationError",
+          cause: expect.any(RegularFileCleanupFailure),
+          cleanup: {
+            resources: [client.configPath],
+            reason: expect.stringContaining(
+              "test holds the config handle open",
+            ),
+          },
+        });
+        expect(configure).not.toHaveBeenCalled();
+        expect(closeAttempts).toHaveLength(2);
+        expect(closeAttempts[0]).toBe(closeAttempts[1]);
+        expect(await readFile(client.configPath)).toEqual(original);
 
-      allowClose = true;
-      const close = host.close;
-      if (close === undefined) throw new Error("Setup host close is missing");
-      expect(await close()).toBeUndefined();
-      expect(closeAttempts).toHaveLength(3);
-      expect(closeAttempts[2]).toBe(closeAttempts[0]);
-    } finally {
-      allowClose = true;
-      await host.close?.();
-    }
-  });
+        await expectCloseReclaimsHandle(host, closeAttempts, release);
+      } finally {
+        await cleanupHeldHandle(host, release);
+      }
+    },
+  );
 
   it("waits for an admitted configuration read and rejects later admissions", async () => {
-    const home = await createTestTempDirectory("rea-setup-config-inflight-");
-    const environment = {
-      HOME: home,
-      XDG_CONFIG_HOME: join(home, "xdg"),
-    };
-    const host = systemSetupHost(
-      { platform: "linux", homeDirectory: home } as DoctorHost,
-      environment,
+    const { host, client } = await preparedVsCodeSetupHost(
+      "rea-setup-config-inflight-",
     );
-    const client = (await host.supportedClients()).find(
-      ({ name }) => name === "vscode",
-    );
-    if (client === undefined) throw new Error("VS Code setup client missing");
-    await mkdir(dirname(client.configPath), { recursive: true });
     await writeFile(client.configPath, '{"servers": {}}\n');
 
     let beginRead!: () => void;
@@ -244,4 +348,148 @@ describe("setup client configuration cleanup ownership", () => {
       await host.close?.();
     }
   });
+});
+
+const unscopedRegistrationReaders: readonly {
+  readonly name: string;
+  readonly read: (
+    home: string,
+    environment: NodeJS.ProcessEnv,
+    execute: Parameters<typeof planIntegrationMaintenance>[3],
+  ) => Promise<unknown>;
+}[] = [
+  {
+    name: "inspections",
+    read: (home, environment) =>
+      readClientRegistrationInspections(home, "/current/rea", { environment }),
+  },
+  {
+    name: "statuses",
+    read: (home, environment) =>
+      readClientRegistrationStatuses(home, "/current/rea", { environment }),
+  },
+  {
+    name: "maintenance scope",
+    read: (home, environment) =>
+      existingMaintenanceScope(home, "/current/rea", environment),
+  },
+  {
+    name: "maintenance plan",
+    read: (home, environment, execute) =>
+      planIntegrationMaintenance(home, "/current/rea", environment, execute),
+  },
+];
+
+it.each(
+  unscopedRegistrationReaders.flatMap((reader) =>
+    ["configuration", "policy"].flatMap((source) =>
+      ["completed", "failed"].map((readOutcome) => ({
+        ...reader,
+        source,
+        readOutcome,
+      })),
+    ),
+  ),
+)(
+  "$name transfers the exact $source owner after a $readOutcome read without a supplied scope",
+  async ({ read, source, readOutcome }) => {
+    const home = await createTestTempDirectory(
+      "rea-registration-unscoped-close-",
+    );
+    const config = join(
+      home,
+      source === "policy" ? ".gemini/settings.json" : ".cursor/mcp.json",
+    );
+    await mkdir(dirname(config), { recursive: true });
+    const registration =
+      '{"mcpServers":{"rea":{"command":"rea","args":["mcp"]}}}\n';
+    await writeFile(config, registration);
+    const heldPath = source === "policy" ? join(home, "system.json") : config;
+    const heldText = source === "policy" ? "{}\n" : registration;
+    await writeFile(
+      heldPath,
+      readOutcome === "failed" ? Buffer.from([0xff]) : heldText,
+    );
+    const environment = {
+      HOME: home,
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: join(home, "system.json"),
+      GEMINI_CLI_SYSTEM_DEFAULTS_PATH: join(home, "absent-defaults.json"),
+    };
+    const held = holdReadHandle(
+      heldPath,
+      "held standalone registration descriptor",
+    );
+    const execute = vi.fn(async () =>
+      ok('{"status":"planned","plannedActions":[]}'),
+    );
+    try {
+      const outcome = await read(home, environment, execute).then(
+        (value) => ({ kind: "returned" as const, value }),
+        (cause: unknown) => ({ kind: "threw" as const, cause }),
+      );
+      expect(outcome).toMatchObject({
+        kind: "threw",
+        cause: expect.any(RegularFileCleanupFailure),
+      });
+      if (
+        outcome.kind !== "threw" ||
+        !(outcome.cause instanceof RegularFileCleanupFailure)
+      )
+        throw new Error("Read lost its failed cleanup owner");
+      const failure = outcome.cause;
+      expect(failure.path).toBe(heldPath);
+      if (readOutcome === "completed")
+        expect(failure.outcome).toEqual({ kind: "completed", value: heldText });
+      else
+        expect(failure.outcome).toMatchObject({
+          kind: "failed",
+          cause: { _tag: "InvalidUtf8FileError", path: heldPath },
+        });
+      expect(failure.owner.handle).toBe(held.closeAttempts[0]);
+      await expect(failure.owner.close()).rejects.toThrow("held standalone");
+      await rename(heldPath, `${heldPath}.retired`);
+      await writeFile(heldPath, "replacement");
+      held.release();
+      await failure.owner.close();
+      expect(failure.owner.handle.fd).toBe(-1);
+      expect(new Set(held.closeAttempts).size).toBe(1);
+      expect(await readFile(heldPath, "utf8")).toBe("replacement");
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      held.release();
+      for (const handle of new Set(held.closeAttempts)) await handle.close();
+    }
+  },
+);
+
+it("keeps a supplied registration scope responsible for diagnostics and cleanup retry", async () => {
+  const home = await createTestTempDirectory("rea-registration-scoped-close-");
+  const config = join(home, ".cursor/mcp.json");
+  await mkdir(dirname(config), { recursive: true });
+  await writeFile(
+    config,
+    '{"mcpServers":{"rea":{"command":"rea","args":["mcp"]}}}',
+  );
+  const held = holdReadHandle(config, "held scoped registration descriptor");
+  const resources = new ArtifactResourceScope();
+  try {
+    expect(
+      (
+        await readClientRegistrationStatuses(home, "/current/rea", {
+          environment: { HOME: home },
+          resources,
+        })
+      ).find((status) => status.client === "cursor"),
+    ).toMatchObject({ state: "invalid", command: [] });
+    expect(resources.hasPending).toBe(true);
+    await expect(resources.close()).rejects.toThrow();
+    held.release();
+    await resources.close();
+    expect(resources.hasPending).toBe(false);
+    expect(new Set(held.closeAttempts).size).toBe(1);
+    expect(held.closeAttempts[0]!.fd).toBe(-1);
+  } finally {
+    held.release();
+    await resources.close();
+  }
 });

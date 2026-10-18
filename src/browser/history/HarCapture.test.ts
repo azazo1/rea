@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { expect, it } from "vitest";
 import { historicalHar } from "../../../tests/fixtures/historicalHar.js";
-import { decodeHarCapture, decodeHarText } from "./HarCapture.js";
+import { decodeCaptureText } from "./CaptureJson.js";
+import { decodeHarCapture } from "./HarCapture.js";
 
 it.each([
   { values: [] },
@@ -161,6 +162,19 @@ it("rejects identical duplicate core fields before schema validation", () => {
   expect(() => decodeHarCapture(text, [])).toThrow("duplicate");
 });
 
+it("names the violated HAR schema constraint without restating capture values", () => {
+  expect(() =>
+    decodeHarCapture(
+      JSON.stringify({
+        log: { creator: { name: "x", version: "1" }, entries: [] },
+      }),
+      [],
+    ),
+  ).toThrow(
+    "HAR schema validation failed: required (must have required property 'version').",
+  );
+});
+
 it("preserves prototype-named producer members through the capture boundary", () => {
   const text = JSON.stringify(historicalHar()).replace(
     '"cache":{}',
@@ -243,7 +257,40 @@ it.each(["9007199254740993", "4740993", "99"])(
   },
 );
 
-it("keeps unsafe extension numeric lexemes and rejects unsafe mandatory schema numbers", () => {
+it.each([
+  { encoded: "1e3", sensitive: "1000" },
+  { encoded: "123.4500", sensitive: "123.45" },
+  { encoded: "0.0000001", sensitive: "1e-7" },
+])(
+  "excludes sensitive numbers introduced by JSON normalization: $encoded",
+  ({ encoded, sensitive }) => {
+    const text = JSON.stringify(historicalHar())
+      .replace('"log":{', `"_number":${encoded},"log":{`)
+      .replace('"cache":{}', `"cache":{},"_number":${encoded}`);
+    const result = decodeHarCapture(text, [sensitive]);
+    for (const projection of [result.container, ...result.records]) {
+      expect(projection.reported).toMatchObject({ _number: null });
+      expect(projection.numeric_literals).not.toContainEqual(
+        expect.objectContaining({ pointer: "/_number" }),
+      );
+      expect(projection.redactions).toContainEqual({
+        pointer: "/_number",
+        reason: "explicit-sensitive-value",
+      });
+    }
+    const unmarked = decodeHarCapture(text, []);
+    for (const projection of [unmarked.container, ...unmarked.records]) {
+      expect(projection.reported).toMatchObject({ _number: Number(encoded) });
+      expect(projection.numeric_literals).toContainEqual({
+        pointer: "/_number",
+        producer_type: "json-number",
+        literal: encoded,
+      });
+    }
+  },
+);
+
+it("keeps unsafe numeric lexemes in extension and mandatory schema fields", () => {
   const text = JSON.stringify(historicalHar());
   const result = decodeHarCapture(
     text.replace('"cache":{}', '"cache":{},"_big":9007199254740993'),
@@ -255,12 +302,17 @@ it("keeps unsafe extension numeric lexemes and rejects unsafe mandatory schema n
     literal: "9007199254740993",
   });
   expect(result.records[0]?.reported).toMatchObject({ _big: null });
-  expect(() =>
-    decodeHarCapture(
-      text.replace('"bodySize":0', '"bodySize":9007199254740993'),
-      [],
-    ),
-  ).toThrow("HAR schema validation failed");
+  // The pinned schema admits a valid integer the evidence cannot publish exactly.
+  const mandatory = decodeHarCapture(
+    text.replace('"bodySize":0', '"bodySize":9007199254740993'),
+    [],
+  ).records[0];
+  expect(mandatory?.numeric_literals).toContainEqual({
+    pointer: "/request/bodySize",
+    producer_type: "json-number",
+    literal: "9007199254740993",
+  });
+  expect(mandatory?.reported).toMatchObject({ request: { bodySize: null } });
 });
 
 it.each(["container", "record"] as const)(
@@ -433,6 +485,71 @@ it("preserves observed SaveHar null post-data without broadening arbitrary HAR p
   ).toThrow("HAR schema validation failed");
 });
 
+it.each(["[2001:db8::1]", "[::1]", "[::ffff:192.0.2.1]"])(
+  "retains Playwright 1.58.2 bracketed IPv6 spelling in reported Evidence: %s",
+  (address) => {
+    const fixture = historicalHar();
+    const first = fixture.log.entries[0];
+    if (first === undefined) throw new Error("fixture missing");
+    const input = {
+      log: {
+        ...fixture.log,
+        creator: { name: "Playwright", version: "1.58.2" },
+        entries: [
+          {
+            ...first,
+            serverIPAddress: address,
+            _extension: { serverIPAddress: address },
+          },
+          structuredClone(first),
+        ],
+      },
+    };
+    const decoded = decodeHarCapture(JSON.stringify(input), []);
+    expect(decoded.records[0]).toMatchObject({
+      reported: {
+        serverIPAddress: address,
+        _extension: { serverIPAddress: address },
+      },
+    });
+    expect(decoded.records[0]?.limitations).toContain(
+      "This capture declares Playwright 1.58.2 and reports bracketed IPv6 serverIPAddress. Original spellings are retained; brackets were removed only from valid IPv6 values in the validation copy. Producer declarations are not authenticated.",
+    );
+    expect(
+      decoded.records[1]?.limitations.some((limitation) =>
+        limitation.includes("bracketed IPv6 serverIPAddress"),
+      ),
+    ).toBe(false);
+  },
+);
+
+it.each([
+  { name: "other", version: "1.58.2", address: "[2001:db8::1]" },
+  { name: "Playwright", version: "1.58.1", address: "[2001:db8::1]" },
+  { name: "Playwright", version: "1.58.2", address: "[192.0.2.1]" },
+  { name: "Playwright", version: "1.58.2", address: "[2001:db8::1]:443" },
+  { name: "Playwright", version: "1.58.2", address: "[fe80::1%eth0]" },
+])(
+  "rejects unrecognized bracketed HAR address input: $name $version $address",
+  ({ name, version, address }) => {
+    const fixture = historicalHar();
+    const first = fixture.log.entries[0];
+    if (first === undefined) throw new Error("fixture missing");
+    expect(() =>
+      decodeHarCapture(
+        JSON.stringify({
+          log: {
+            ...fixture.log,
+            creator: { name, version },
+            entries: [{ ...first, serverIPAddress: address }],
+          },
+        }),
+        [],
+      ),
+    ).toThrow("HAR schema validation failed");
+  },
+);
+
 it.each([
   "c2VjcmV0",
   "c2Vj",
@@ -563,18 +680,79 @@ it("ignores one leading byte-order mark, as HAR 1.2 requires of readers", () => 
   const text = JSON.stringify(historicalHar());
   const body = Buffer.from(text, "utf8");
   const marked = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body]);
-  expect(decodeHarText(marked)).toBe(text);
-  expect(decodeHarCapture(decodeHarText(marked), [])).toEqual(
-    decodeHarCapture(decodeHarText(body), []),
+  expect(decodeCaptureText(marked, "HAR")).toBe(text);
+  expect(decodeHarCapture(decodeCaptureText(marked, "HAR"), [])).toEqual(
+    decodeHarCapture(decodeCaptureText(body, "HAR"), []),
   );
   // A second mark is content, not an encoding signature.
   expect(() =>
     decodeHarCapture(
-      decodeHarText(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), marked])),
+      decodeCaptureText(
+        Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), marked]),
+        "HAR",
+      ),
       [],
     ),
   ).toThrow("HAR is malformed JSON.");
-  expect(() => decodeHarText(Buffer.from([0x7b, 0xff, 0x7d]))).toThrow(
-    "HAR is not valid UTF-8 JSON.",
-  );
+  expect(() =>
+    decodeCaptureText(Buffer.from([0x7b, 0xff, 0x7d]), "HAR"),
+  ).toThrow("HAR is not valid UTF-8 JSON.");
 });
+
+const reportedAt = (reported: unknown, pointer: string): unknown =>
+  pointer
+    .split("/")
+    .slice(1)
+    .reduce<unknown>(
+      (value, key) =>
+        value !== null && typeof value === "object"
+          ? Reflect.get(value, key)
+          : undefined,
+      reported,
+    );
+
+it.each([
+  {
+    from: '"time":1.25',
+    literal: "0.123456789012345678901",
+    pointer: "/time",
+  },
+  { from: '"bodySize":99', literal: "1e400", pointer: "/response/bodySize" },
+])(
+  "admits a schema-valid number that evidence cannot publish exactly: $literal",
+  ({ from, literal, pointer }) => {
+    const key = from.slice(0, from.indexOf(":") + 1);
+    const text = JSON.stringify(historicalHar()).replace(
+      from,
+      `${key}${literal}`,
+    );
+    expect(text).toContain(`${key}${literal}`);
+    const record = decodeHarCapture(text, []).records[0];
+    // The exact producer lexeme is retained, and the published value stays unknown.
+    expect(record?.numeric_literals).toContainEqual({
+      pointer,
+      producer_type: "json-number",
+      literal,
+    });
+    expect(reportedAt(record?.reported, pointer)).toBeNull();
+  },
+);
+
+it.each([
+  "9007199254740993.5",
+  "1e-400",
+  "1.0000000000000000001",
+  `1${"0".repeat(309)}.5`,
+  `-1${"0".repeat(309)}.5`,
+])(
+  "judges an integer field by the lexeme when rounding or overflow would hide a fraction: %s",
+  (literal) => {
+    const text = JSON.stringify(historicalHar()).replace(
+      '"bodySize":99',
+      `"bodySize":${literal}`,
+    );
+    expect(() => decodeHarCapture(text, [])).toThrow(
+      "HAR schema validation failed: type (must be integer).",
+    );
+  },
+);

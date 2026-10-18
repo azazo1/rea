@@ -7,7 +7,10 @@ import {
   isUIKitRuntimeConnectionClass,
 } from "../../domain/apple/interfaceBuilderKeyedArchive.js";
 import { DirectoryArtifactReader } from "../DirectoryArtifactReader.js";
-import { projectPlistValue } from "../../domain/apple/plistValue.js";
+import {
+  projectPlistValue,
+  unknownDateLimitation,
+} from "../../domain/apple/plistValue.js";
 import {
   omittedPrototypeKeysLimitation,
   parseXmlPropertyList,
@@ -34,6 +37,11 @@ import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js"
 
 import { decodeXmlPlistText } from "../../domain/propertyListXmlText.js";
 import {
+  decodeBinaryPlistNumbers,
+  scanBinaryPlistNumberLiterals,
+} from "./PlistNumberLiterals.js";
+import type { PlistNumberLiterals } from "../../domain/apple/plistNumbers.js";
+import {
   hasBinaryPlistSignature,
   hasNibArchiveSignature,
 } from "../../domain/apple/appleArchiveFormat.js";
@@ -56,7 +64,9 @@ export const analyzeInterfaceBuilderBundle = async (input: {
   const omittedArchives: Array<{ path: string; reason: string }> = [];
   let unreportedOmittedArchives = 0;
   const incompleteHierarchies = new Map<string, number>();
+  const unresolvedConnections = new Map<string, number>();
   const prototypeKeyOmissions = new Map<string, number | null>();
+  const unknownDates = new Map<string, number>();
   let omitted = 0;
   let attempted = 0;
   let aggregateInputBytes = 0;
@@ -79,6 +89,8 @@ export const analyzeInterfaceBuilderBundle = async (input: {
       recordOmittedArchive(entry.path, "max_documents");
     unreportedOmittedArchives += selection.unreportedOmitted;
     for (const entry of selection.selected) {
+      // Plist representation reserved for this document before decoding.
+      let plistReservation = 0;
       try {
         const remainingInputBytes =
           MAX_AGGREGATE_INPUT_BYTES - aggregateInputBytes;
@@ -122,22 +134,37 @@ export const analyzeInterfaceBuilderBundle = async (input: {
             bytes,
             decodeBudget.remainingBytes,
             xmlText,
+            { numberProjection: true },
           );
           decodeBudget.reserve(
             decodedReservation.estimatedBytes,
             "plist representation exceeds the aggregate Interface Builder decode budget",
           );
+          plistReservation = decodedReservation.estimatedBytes;
           binaryPrototypeKeyObserved =
             decodedReservation.binaryPrototypeKeyObserved;
         }
-        const { value: raw, omittedPrototypeKeys } =
-          nib === null
-            ? decodePlist(bytes, xmlText, binaryPrototypeKeyObserved)
-            : { value: nib.raw, omittedPrototypeKeys: 0 };
+        const {
+          value: raw,
+          omittedPrototypeKeys,
+          unknownDateCount,
+          numberLiterals,
+        } = nib === null
+          ? decodePlist(bytes, xmlText, binaryPrototypeKeyObserved)
+          : {
+              value: nib.raw,
+              omittedPrototypeKeys: 0,
+              unknownDateCount: 0,
+              numberLiterals: undefined,
+            };
         if (nib !== null && nib.omitted > 0)
           incompleteHierarchies.set(entry.path, nib.omitted);
+        if (nib !== null && nib.unresolvedConnections > 0)
+          unresolvedConnections.set(entry.path, nib.unresolvedConnections);
         if (omittedPrototypeKeys !== 0)
           prototypeKeyOmissions.set(entry.path, omittedPrototypeKeys);
+        if (unknownDateCount !== 0)
+          unknownDates.set(entry.path, unknownDateCount);
         const documentHash = createHash("sha256").update(bytes).digest("hex");
         documents.push({
           relativePath: entry.path,
@@ -146,10 +173,17 @@ export const analyzeInterfaceBuilderBundle = async (input: {
             ? "storyboard_scene"
             : "nib",
           raw,
+          ...(numberLiterals === undefined ? {} : { numberLiterals }),
+          ...(nib === null || nib.omitted === 0
+            ? {}
+            : { omittedSerializedHierarchyReferences: nib.omitted }),
         });
       } catch (cause: unknown) {
         if (input.signal?.aborted === true) throw cause;
         if (cause instanceof InterfaceBuilderDecodeBudgetExceeded) {
+          // A document rejected while decoding, e.g. beyond the shared depth
+          // limit, retains no representation; later documents keep its share.
+          decodeBudget.release(plistReservation);
           omitted += 1;
           recordOmittedArchive(entry.path, cause.reason);
           continue;
@@ -170,7 +204,9 @@ export const analyzeInterfaceBuilderBundle = async (input: {
   });
   return finalizeHierarchyCoverage(result, {
     incompleteHierarchies,
+    unresolvedConnections,
     prototypeKeyOmissions,
+    unknownDates,
     invalid,
     omittedArchives,
     unreportedOmittedArchives,
@@ -237,7 +273,9 @@ const finalizeHierarchyCoverage = (
   result: ReturnType<typeof buildInterfaceBuilderAnalysis>,
   counts: {
     incompleteHierarchies: ReadonlyMap<string, number>;
+    unresolvedConnections: ReadonlyMap<string, number>;
     prototypeKeyOmissions: ReadonlyMap<string, number | null>;
+    unknownDates: ReadonlyMap<string, number>;
     invalid: readonly string[];
     omittedArchives: readonly { path: string; reason: string }[];
     unreportedOmittedArchives: number;
@@ -247,7 +285,9 @@ const finalizeHierarchyCoverage = (
 ) => {
   const {
     incompleteHierarchies,
+    unresolvedConnections,
     prototypeKeyOmissions,
+    unknownDates,
     invalid,
     omittedArchives,
     unreportedOmittedArchives,
@@ -260,23 +300,27 @@ const finalizeHierarchyCoverage = (
     ...result,
     documents: result.documents.map((document) => ({
       ...document,
-      hierarchy_complete:
-        document.hierarchy_complete &&
-        !incompleteHierarchies.has(document.relative_path),
+      connection_count:
+        document.connection_count +
+        (unresolvedConnections.get(document.relative_path) ?? 0),
     })),
     graph: {
       ...result.graph,
       coverage: [
         ...result.graph.coverage.map((facet) => {
-          const omitted = incompleteHierarchies.get(
-            facet.facet.replace(/^hierarchy:/u, ""),
+          const omittedConnection = unresolvedConnections.get(
+            facet.facet.replace(/^connections:/u, ""),
           );
-          return facet.facet.startsWith("hierarchy:") && omitted !== undefined
+          return facet.facet.startsWith("connections:") &&
+            omittedConnection !== undefined
             ? {
                 ...facet,
                 status: "partial" as const,
-                reason: "serialized_view_hierarchy_incomplete",
-                omitted: facet.omitted + omitted,
+                // A connection dropped by the limit is recoverable by raising
+                // it, so that cause keeps the reason the graph already named.
+                // Only a facet with no other cause reports the omission.
+                reason: facet.reason ?? "connection_unresolved",
+                omitted: facet.omitted + omittedConnection,
               }
             : facet;
         }),
@@ -306,7 +350,7 @@ const finalizeHierarchyCoverage = (
         result.graph.truncated ||
         counts.omitted > 0 ||
         archiveDecodePartial ||
-        incompleteHierarchies.size > 0,
+        unresolvedConnections.size > 0,
     },
     limitations: [
       ...result.limitations,
@@ -316,6 +360,11 @@ const finalizeHierarchyCoverage = (
         : [
             "Some serialized hierarchy links could not be projected within the bounded hierarchy; their parentage remains unknown.",
           ]),
+      ...(unresolvedConnections.size === 0
+        ? []
+        : [
+            "Some recognized NIBArchive connectors declare no resolvable owner; they carry no connection evidence and are reported as omissions.",
+          ]),
       ...(invalid.length === 0
         ? []
         : [
@@ -323,6 +372,9 @@ const finalizeHierarchyCoverage = (
           ]),
       ...[...prototypeKeyOmissions].map(
         ([path, count]) => `${path}: ${omittedPrototypeKeysLimitation(count)}`,
+      ),
+      ...[...unknownDates].map(
+        ([path, count]) => `${path}: ${unknownDateLimitation(count)}`,
       ),
       ...omittedArchives.map(
         ({ path, reason }) =>
@@ -496,6 +548,10 @@ const projectNibArchive = (
   );
   const connections: Record<string, JsonValue[]> = {};
   const hierarchy: NibHierarchyNode[] = [];
+  // A recognized connector whose owner reference cannot be resolved produces no
+  // connection entry, so the omission has to be counted here: the projected
+  // dictionary carries no trace of it for a downstream consumer to find.
+  let unresolvedConnections = 0;
   const reference = (value: JsonValue | undefined): number | null => {
     if (typeof value !== "object" || value === null || Array.isArray(value))
       return null;
@@ -512,7 +568,10 @@ const projectNibArchive = (
     const values = object.values;
     const connectionFields = interfaceBuilderConnectionFieldNames(className);
     const source = reference(values[connectionFields.source]);
-    if (source === null) continue;
+    if (source === null) {
+      unresolvedConnections += 1;
+      continue;
+    }
     const destination = reference(values[connectionFields.destination]);
     const label = referencedString(values[connectionFields.label]);
     const type = className.includes("Outlet")
@@ -608,6 +667,7 @@ const projectNibArchive = (
   );
   return {
     omitted: viewHierarchy.omitted + hierarchyOmitted + merged.omitted,
+    unresolvedConnections,
     raw: jsonValueSchema.parse({
       "com.apple.ibtool.document.objects": objects,
       "com.apple.ibtool.document.connections": connections,
@@ -659,6 +719,24 @@ const readEntry = async (
   return Buffer.concat(chunks, length);
 };
 
+/**
+ * The shared parser bounds plist value nesting before its recursive decode and
+ * reports the limit as a RangeError; that is an omitted archive, not a
+ * malformed one.
+ */
+const parseXmlWithinDecodeBudget = (text: string) => {
+  try {
+    return parseXmlPropertyList(text);
+  } catch (cause: unknown) {
+    if (cause instanceof RangeError)
+      throw new InterfaceBuilderDecodeBudgetExceeded(
+        "aggregate_decode_budget_exhausted",
+        cause.message,
+      );
+    throw cause;
+  }
+};
+
 /** Project decoded plist data and dates while retaining omitted-key coverage. */
 const decodePlist = (
   bytes: Buffer,
@@ -667,13 +745,27 @@ const decodePlist = (
 ): {
   readonly value: JsonValue;
   readonly omittedPrototypeKeys: number | null;
+  readonly unknownDateCount: number;
+  readonly numberLiterals: PlistNumberLiterals;
 } => {
   const binary = hasBinaryPlistSignature(bytes);
-  const { value, omittedPrototypeKeys } = binary
+  const binaryNumberMetadata = binary
+    ? scanBinaryPlistNumberLiterals(bytes)
+    : undefined;
+  const { value, omittedPrototypeKeys, numberLiterals } = binary
     ? {
-        value: parseBinary(bytes),
+        value: parseBinary(
+          decodeBinaryPlistNumbers(bytes, binaryNumberMetadata!),
+        ),
         omittedPrototypeKeys: binaryPrototypeKeyObserved ? null : 0,
+        numberLiterals: binaryNumberMetadata!.literals,
       }
-    : parseXmlPropertyList(xmlText ?? decodeXmlPlistText(bytes));
-  return { value: projectPlistValue(value).value, omittedPrototypeKeys };
+    : parseXmlWithinDecodeBudget(xmlText ?? decodeXmlPlistText(bytes));
+  const projected = projectPlistValue(value);
+  return {
+    value: projected.value,
+    omittedPrototypeKeys,
+    unknownDateCount: projected.unknownDateCount,
+    numberLiterals,
+  };
 };

@@ -2,7 +2,8 @@ import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
 import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import type { ProviderAvailability } from "../application/AnalysisProvider.js";
-import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
+import type { JebAnalysisAvailability } from "../application/jeb/JebAnalysisPort.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
   buildCapabilityInventory,
   compactToolAvailability,
@@ -12,23 +13,37 @@ import type {
   ClientFeatureAvailability,
   ToolAvailability,
 } from "../contracts/toolOutputSchemaPrimitives.js";
-import { jsonObjectSchema } from "../domain/jsonValue.js";
+import { jsonObjectSchema, type JsonValue } from "../domain/jsonValue.js";
 import { createServerIdentity } from "../serverIdentity.js";
 import { mcpClientMetadata } from "./mcpClientMetadata.js";
 import type { AvailabilityPolicy } from "../application/CapabilityInventory.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import { err } from "../domain/result.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
+
+/** Provider-owned live probes used by session discovery. */
+export interface SessionAvailabilityProbes {
+  readonly androidAnalysisAvailability: (
+    signal: AbortSignal,
+  ) => Promise<ProviderAvailability>;
+  readonly adbAnalysisAvailability?: (
+    signal: AbortSignal,
+  ) => Promise<ProviderAvailability>;
+  readonly apktoolAnalysisAvailability?: (
+    signal: AbortSignal,
+  ) => Promise<ProviderAvailability>;
+  readonly jebAnalysisAvailability?: (
+    signal: AbortSignal,
+  ) => Promise<JebAnalysisAvailability>;
+}
 
 /** Inputs required to register the binary session status tool. */
-export interface SessionStatusToolOptions {
+export interface SessionStatusToolOptions extends SessionAvailabilityProbes {
   readonly server: EvidenceMcpServer;
   readonly session: BinarySessionPort;
   readonly contract: ReturnType<typeof toolContract<"binary_session">>;
   readonly startedAt: string;
   readonly availabilityPolicy: () => AvailabilityPolicy;
-  readonly androidAnalysisAvailability: (
-    signal: AbortSignal,
-  ) => Promise<ProviderAvailability>;
 }
 
 /** Register the read-only provider and target status operation. */
@@ -42,6 +57,9 @@ export const registerSessionStatusTool = (
     startedAt,
     availabilityPolicy,
     androidAnalysisAvailability,
+    adbAnalysisAvailability,
+    apktoolAnalysisAvailability,
+    jebAnalysisAvailability,
   } = options;
   server.registerTool(
     contract.name,
@@ -52,29 +70,48 @@ export const registerSessionStatusTool = (
         server.server,
       );
       let androidAvailability: ProviderAvailability;
+      let adbAvailability: ProviderAvailability | undefined;
+      let apktoolAvailability: ProviderAvailability | undefined;
+      let jebAvailability: JebAnalysisAvailability | undefined;
+      let status: JsonValue;
       try {
-        androidAvailability = await androidAnalysisAvailability(
-          context.mcpReq.signal,
-        );
+        const [android, adb, apktool, jeb] = await Promise.all([
+          androidAnalysisAvailability(context.mcpReq.signal),
+          adbAnalysisAvailability?.(context.mcpReq.signal) ?? undefined,
+          apktoolAnalysisAvailability?.(context.mcpReq.signal) ?? undefined,
+          jebAnalysisAvailability?.(context.mcpReq.signal) ?? undefined,
+        ] as const);
+        androidAvailability = android;
+        adbAvailability = adb;
+        apktoolAvailability = apktool;
+        jebAvailability = jeb;
+        status = await session.status({ signal: context.mcpReq.signal });
       } catch (cause) {
-        if (!context.mcpReq.signal.aborted) throw cause;
-        return server.delivery.toCallToolResult(
-          err(new AnalysisCancelledError("binary_session")),
-          contract,
-        );
+        if (!(cause instanceof AnalysisError)) throw cause;
+        return server.delivery.toCallToolResult(err(cause), contract);
       }
-      const status = session.status();
       const statusObject = jsonObjectSchema.parse(status);
       const toolAvailability = buildCapabilityInventory(
         status,
         {
           ...availabilityPolicy(),
           androidAnalysisAvailability: androidAvailability,
+          ...(adbAvailability === undefined
+            ? {}
+            : { adbAnalysisAvailability: adbAvailability }),
+          ...(apktoolAvailability === undefined
+            ? {}
+            : { apktoolAnalysisAvailability: apktoolAvailability }),
+          ...(jebAvailability === undefined
+            ? {}
+            : { jebAnalysisAvailability: jebAvailability }),
         },
         clientFeatures,
       );
       const serverIdentity = createServerIdentity({
         startedAt,
+        commandPath: CURRENT_ENTRYPOINT_PATH,
+        catalog: server.catalogIdentity,
         expected: {
           ...(input.expected_package_version === undefined
             ? {}

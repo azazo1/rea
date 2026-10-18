@@ -110,15 +110,6 @@ describe("browser comparison input boundary", () => {
         },
         { before_scenario: {}, after_scenario: {} },
         { before_scenario: scenario.before_scenario },
-        { ...passive, normalization: { rules: [] } },
-        {
-          before_scenario: scenario.before_scenario,
-          normalization: { rules: [] },
-        },
-        {
-          after_scenario: scenario.after_scenario,
-          normalization: { rules: [] },
-        },
         { ...passive, unexpected: true },
         {
           ...scenario,
@@ -133,8 +124,24 @@ describe("browser comparison input boundary", () => {
           },
         },
       ];
-      // The projection leaves group exclusion to the canonical runtime parser.
-      const mixedGroups = [{ ...passive, ...scenario }];
+      // Strict clients reject combinators and dependentRequired, so the
+      // projection states the groups in its description and leaves group
+      // completeness and exclusion to the canonical runtime parser.
+      expect(advertised.inputSchema.description).toContain(
+        "before + after; before_scenario + after_scenario + [normalization]",
+      );
+      const runtimeOnlyInvalid = [
+        { ...passive, ...scenario },
+        { ...passive, normalization: { rules: [] } },
+        {
+          before_scenario: scenario.before_scenario,
+          normalization: { rules: [] },
+        },
+        {
+          after_scenario: scenario.after_scenario,
+          normalization: { rules: [] },
+        },
+      ];
       for (const { input, advertisedValid, runtimeValid } of [
         ...[passive, scenario, withoutNormalization].map((input) => ({
           input,
@@ -146,7 +153,7 @@ describe("browser comparison input boundary", () => {
           advertisedValid: false,
           runtimeValid: false,
         })),
-        ...mixedGroups.map((input) => ({
+        ...runtimeOnlyInvalid.map((input) => ({
           input,
           advertisedValid: true,
           runtimeValid: false,

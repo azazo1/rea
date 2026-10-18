@@ -1,9 +1,9 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { writeFile } from "node:fs/promises";
+import { truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { describe, expect, it, onTestFinished } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
 import { CPU, fatImage, machoImage } from "./apple/MachoImage.fixture.js";
@@ -155,7 +155,7 @@ describe("Mach-O command cleanup lifecycle", () => {
 });
 
 describe("MachOSliceArtifactReader", () => {
-  it("keeps a borrowed source usable after a cancelled slice read", async () => {
+  it("keeps a borrowed source usable after idle and active cancelled slice reads", async () => {
     const root = await createTestTempDirectory("rea-slices-cancelled-");
     const binary = join(root, "fat");
     const x86 = machoImage({ cpu: CPU.x86_64 });
@@ -202,6 +202,18 @@ describe("MachOSliceArtifactReader", () => {
     const armEntry = entries.find((entry) => entry.path === "slices/arm64");
     if (armEntry === undefined) throw new Error("Expected an arm64 slice");
 
+    const idleController = new AbortController();
+    const idle = await reader.open(armEntry, idleController.signal);
+    const idleFailure = new Promise<Error>((resolve) =>
+      idle.once("error", resolve),
+    );
+    idleController.abort(null);
+    await expect(idleFailure).resolves.toMatchObject({
+      reason: "cancelled",
+      cancellation: { reason: null },
+    });
+    expect((await handle.stat()).isFile()).toBe(true);
+
     const controller = new AbortController();
     const cancelledRead = await reader.open(armEntry, controller.signal);
     const iterator = cancelledRead[Symbol.asyncIterator]();
@@ -224,5 +236,156 @@ describe("MachOSliceArtifactReader", () => {
     for await (const chunk of verifiedRead)
       verifiedChunks.push(Buffer.from(chunk));
     expect(Buffer.concat(verifiedChunks)).toEqual(arm);
+
+    const truncatedController = new AbortController();
+    const truncated = await reader.open(
+      verifiedArmEntry,
+      truncatedController.signal,
+    );
+    await truncate(binary, 8193);
+    let readEOF = false;
+    const read = handle.read.bind(handle);
+    vi.spyOn(handle, "read").mockImplementation((async (...args: unknown[]) => {
+      const result = (await Reflect.apply(read, handle, args)) as {
+        bytesRead: number;
+        buffer: Buffer;
+      };
+      if (result.bytesRead === 0) readEOF = true;
+      return result;
+    }) as typeof handle.read);
+    const failed = new Promise<Error>((resolve) =>
+      truncated.once("error", resolve),
+    );
+    truncated.read(0);
+    await expect.poll(() => readEOF).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(truncated.readableLength).toBeGreaterThan(0);
+    truncatedController.abort(null);
+    await expect(failed).resolves.toMatchObject({ reason: "integrity" });
   });
+});
+
+describe("universal slices outside the structural index", () => {
+  const PPC = { type: 18, subtype: 0 } as const;
+  /** A minimal big-endian 32-bit Mach-O header, as a PowerPC slice stores it. */
+  const bigEndianImage = (): Uint8Array => {
+    const bytes = Buffer.alloc(32);
+    bytes.writeUInt32BE(0xfeed_face, 0);
+    bytes.writeUInt32BE(PPC.type, 4);
+    bytes.writeUInt32BE(1, 12);
+    return bytes;
+  };
+  /** An arm64 image whose load commands claim more bytes than the slice holds. */
+  const malformedImage = (): Uint8Array => {
+    const bytes = machoImage({ cpu: CPU.arm64 });
+    new DataView(bytes.buffer).setUint32(20, 4096, true);
+    return bytes;
+  };
+  const lipoRunner = (
+    binary: string,
+    slices: readonly {
+      readonly name: string;
+      readonly cpu: { readonly type: number; readonly subtype: number };
+      readonly offset: number;
+      readonly size: number;
+    }[],
+    withRanges = true,
+  ): NativeCommandRunner => ({
+    run: () =>
+      Promise.resolve(
+        ok({
+          tool: "lipo",
+          executable: "/usr/bin/lipo",
+          executableSha256: "1".repeat(64),
+          toolVersion: null,
+          versionReason: "fixture",
+          arguments: ["-detailed_info", binary],
+          stdout: slices
+            .map(
+              ({ name, cpu, offset, size }) =>
+                `architecture ${name}\n cputype ${String(cpu.type)}\n cpusubtype ${String(cpu.subtype)}\n${withRanges ? ` offset ${String(offset)}\n size ${String(size)}\n` : ""} align 2^12 (4096)\n`,
+            )
+            .join(""),
+          stderr: "",
+          stdoutBytes: 1,
+          stderrBytes: 0,
+          exitCode: 0,
+          signal: null,
+        }),
+      ),
+  });
+  const readAll = async (
+    slices: readonly {
+      readonly name: string;
+      readonly cpu: { readonly type: number; readonly subtype: number };
+      readonly bytes: Uint8Array;
+    }[],
+    withRanges = true,
+  ) => {
+    const root = await createTestTempDirectory("rea-slices-unsupported-");
+    const binary = join(root, "fat");
+    await writeFile(binary, fatImage(slices));
+    const reader = new MachOSliceArtifactReader(
+      binary,
+      {},
+      lipoRunner(
+        binary,
+        slices.map(({ name, cpu, bytes }, index) => ({
+          name,
+          cpu,
+          offset: 4096 * (index + 1),
+          size: bytes.length,
+        })),
+        withRanges,
+      ),
+    );
+    onTestFinished(() => reader.close());
+    const entries = [];
+    for await (const entry of reader.entries()) entries.push(entry);
+    return entries;
+  };
+
+  it("inventories every lipo range beside a big-endian slice", async () => {
+    const entries = await readAll([
+      { name: "ppc", cpu: PPC, bytes: bigEndianImage() },
+      { name: "arm64", cpu: CPU.arm64, bytes: machoImage({ cpu: CPU.arm64 }) },
+    ]);
+    expect(entries.map(({ path, byteOffset }) => [path, byteOffset])).toEqual([
+      ["slices/ppc", 4096],
+      ["slices/arm64", 8192],
+    ]);
+    expect(entries[0]?.limitations).toContain(
+      "Structural Mach-O facts were unsupported (big-endian Mach-O slices are not supported); slice range is based on lipo output.",
+    );
+  });
+
+  it("reports missing lipo ranges for an unindexed slice as unavailable support", async () => {
+    await expect(
+      readAll(
+        [
+          { name: "ppc", cpu: PPC, bytes: bigEndianImage() },
+          {
+            name: "arm64",
+            cpu: CPU.arm64,
+            bytes: machoImage({ cpu: CPU.arm64 }),
+          },
+        ],
+        false,
+      ),
+    ).rejects.toMatchObject({ reason: "unavailable" });
+  });
+
+  it.each([
+    ["before", true],
+    ["after", false],
+  ])(
+    "rejects a malformed slice %s a big-endian slice",
+    async (_order, malformedFirst) => {
+      const ppc = { name: "ppc", cpu: PPC, bytes: bigEndianImage() };
+      const broken = { name: "arm64", cpu: CPU.arm64, bytes: malformedImage() };
+      await expect(
+        readAll(malformedFirst ? [broken, ppc] : [ppc, broken]),
+      ).rejects.toMatchObject({ reason: "integrity" });
+    },
+  );
 });

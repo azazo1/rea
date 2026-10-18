@@ -1,3 +1,4 @@
+import type { JavaScriptSemanticProjectionCapacity } from "../../domain/javascript/javascriptSemanticFileProjection.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -27,10 +28,8 @@ import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
 import { ok, err, type Result } from "../../domain/result.js";
 import { javaScriptRuntime } from "../../domain/runtimeVersion.js";
-import {
-  PrivateRuntimeRoot,
-  PrivateRuntimeRootUnavailableError,
-} from "../../process/PrivateRuntimeRoot.js";
+import { PrivateRuntimeRoot } from "../../process/PrivateRuntimeRoot.js";
+import { PrivateRuntimeRootUnavailableError } from "../../process/PrivateRuntimeRootUnavailableError.js";
 import { javaScriptWorkerMemoryLimitBytes } from "../../process/JavaScriptWorkerMemoryLimit.js";
 import {
   ProviderProcessSupervisor,
@@ -85,6 +84,7 @@ export class JavaScriptAnalysisWorker {
   readonly #resultBudgetBytes: number;
   /** Null when the runtime enforces the V8 heap flags instead. */
   readonly #processMemoryLimitBytes: number | null;
+  readonly #onStdinError = (): void => {};
   readonly #onStdout = (chunk: Buffer | string): void => {
     try {
       this.#pending +=
@@ -155,7 +155,7 @@ export class JavaScriptAnalysisWorker {
   /** Analyze inert source; hard worker failure does not terminate this process. */
   async analyze(
     file: JavaScriptArtifactFile,
-    nodeBudget: number,
+    capacity: JavaScriptSemanticProjectionCapacity,
     signal?: AbortSignal,
   ): Promise<
     Result<JavaScriptAnalyzedSource, JavaScriptSourceAnalysisFailure>
@@ -204,7 +204,8 @@ export class JavaScriptAnalysisWorker {
       let offeredResultBudget = 0;
       const request = javaScriptWorkerRequestSchema.parse({
         id,
-        node_budget: nodeBudget,
+        node_budget: capacity.nodes,
+        unknown_budget: capacity.unknowns,
         text_sha256: createHash("sha256").update(file.text.value).digest("hex"),
         file: metadata,
       });
@@ -279,7 +280,7 @@ export class JavaScriptAnalysisWorker {
               error: new AnalysisResourceConstraintError(
                 OPERATION,
                 response.resource ?? "memory",
-                `${file.path}: ${response.message}`,
+                response.message,
                 { ...this.#limits(), ...response.limits },
               ),
             });
@@ -345,7 +346,7 @@ export class JavaScriptAnalysisWorker {
           descriptor,
           file,
           deadline.signal,
-          retainGraph,
+          retainGraph ? capacity : null,
         );
         module = decoded.module;
         projection = decoded.projection;
@@ -735,7 +736,7 @@ export class JavaScriptAnalysisWorker {
           PROVIDER,
           OPERATION,
           cause.message,
-          { cause },
+          { cause, retryable: cause.retryable },
         )
       : new ProviderAdapterError(PROVIDER, OPERATION, {
           cause,
@@ -786,20 +787,40 @@ export class JavaScriptAnalysisWorker {
     if (this.#supervisor !== undefined) {
       const supervisor = this.#supervisor;
       const stopped = await supervisor.stop();
+      supervisor.launch.process.stdout?.off("data", this.#onStdout);
       if (stopped.status === "incomplete") {
+        try {
+          const stdin = supervisor.launch.process.stdin;
+          if (
+            stdin !== undefined &&
+            stdin !== null &&
+            !stdin.destroyed &&
+            !stdin.writableEnded
+          ) {
+            stdin.off("error", this.#onStdinError);
+            stdin.once("error", this.#onStdinError);
+            stdin.end();
+          }
+        } catch {
+          // Cooperative protocol stdin may already be closed or broken.
+        }
+        this.#resetState();
         pendingCleanup.add(this);
         return this.#cleanupError(stopped.reason, original);
       }
-      supervisor.launch.process.stdout?.off("data", this.#onStdout);
       supervisor.dispose();
       this.#supervisor = undefined;
     }
+    this.#resetState();
+    return undefined;
+  }
+
+  #resetState(): void {
     this.#ready = false;
     this.#frames = [];
     this.#pending = "";
     this.#decoder = new StringDecoder("utf8");
     this.#protocolFailure = undefined;
-    return undefined;
   }
 }
 

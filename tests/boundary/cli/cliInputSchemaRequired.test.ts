@@ -4,6 +4,10 @@ import { describe, expect, it } from "vitest";
 
 import { createCli } from "../../../src/cli.js";
 import { createCliInventory } from "../../../scripts/lib/catalog-cli.mjs";
+import {
+  apktoolInputSchemas,
+  MAX_SELECTED_LOCALES,
+} from "../../../src/domain/apktool/apktoolResourceAnalysis.js";
 
 type CliInstance = ReturnType<typeof createCli>;
 type CommandMap = NonNullable<ReturnType<typeof Cli.toCommands.get>>;
@@ -198,6 +202,63 @@ describe("web module CLI advertised input schema", () => {
     expect(options({ importMapPath: "" })).toBe(false);
     expect(options({ importMapPath: "map\u0000.json" })).toBe(false);
     expect(options({ importMapBaseUrl: "" })).toBe(false);
+  });
+});
+
+describe("Apktool locale selection input schema", () => {
+  it("preserves the owner's array bounds through CLI advertisement and parsing", async () => {
+    const cli = createCli({});
+    const advertised = await advertisedSchema(cli, "decode-android-resources");
+    expect(advertised.options?.properties?.locales).toMatchObject({
+      type: "array",
+      minItems: 1,
+      maxItems: MAX_SELECTED_LOCALES,
+    });
+    const parser = parserSchema(cli, "decode-android-resources", "options");
+    const ajv = new Ajv2020({ strict: false });
+    const validate = ajv.compile({
+      ...advertised.options,
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+    });
+    for (const locales of [
+      undefined,
+      [],
+      ["de"],
+      Array<string>(MAX_SELECTED_LOCALES).fill("de"),
+      Array<string>(MAX_SELECTED_LOCALES + 1).fill("de"),
+      ["not a locale"],
+    ]) {
+      const input = locales === undefined ? {} : { locales };
+      const expected = apktoolInputSchemas.decode_android_resources.safeParse({
+        path: "/targets/app.apk",
+        ...input,
+      }).success;
+      expect(parser?.safeParse(input).success).toBe(expected);
+      expect(validate(input)).toBe(expected);
+    }
+  });
+});
+
+describe("reference-source outline-depth input schema", () => {
+  it("aligns advertised bounds with the parser's accepted values", async () => {
+    const cli = createCli({});
+    const advertised = await advertisedSchema(cli, "import-reference-source");
+    const outlineDepth = advertised.options?.properties?.outlineDepth;
+    expect(outlineDepth).toMatchObject({ type: "integer", minimum: 0 });
+
+    const parser = parserSchema(cli, "import-reference-source", "options");
+    expect(parser?.safeParse({ outlineDepth: -1 }).success).toBe(false);
+    expect(parser?.safeParse({ outlineDepth: 0 }).success).toBe(true);
+    expect(parser?.safeParse({ outlineDepth: 2 }).success).toBe(true);
+
+    const ajv = new Ajv2020({ strict: false });
+    const validate = ajv.compile({
+      ...advertised.options,
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+    });
+    expect(validate({ outlineDepth: -1 })).toBe(false);
+    expect(validate({ outlineDepth: 0 })).toBe(true);
+    expect(validate({ outlineDepth: 2 })).toBe(true);
   });
 });
 import { resolve } from "node:path";

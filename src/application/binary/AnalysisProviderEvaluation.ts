@@ -7,12 +7,15 @@ import {
   AnalysisCancelledError,
   AnalysisUnsupportedTargetError,
 } from "../../domain/analysisErrorCore.js";
-import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import { jsonObjectSchema, type JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
-import type { AnalysisProviderCandidate } from "../AnalysisProvider.js";
+import type {
+  AnalysisProfileResolutionOptions,
+  AnalysisProviderCandidate,
+} from "../AnalysisProvider.js";
 import type { AnalysisProviderCandidateStatus } from "./AnalysisProviderRegistry.js";
-import { ABORTED, waitForAbortable } from "./AbortablePromise.js";
+import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 
 /** Profile-resolution truth for one discovered provider candidate. */
 export interface AnalysisProviderCandidateEvaluation {
@@ -27,32 +30,32 @@ export const evaluateAnalysisProviderCandidate = async (
   candidate: AnalysisProviderCandidate,
   status: AnalysisProviderCandidateStatus,
   target: BinaryTarget,
-  signal: AbortSignal | undefined,
+  options: AnalysisProfileResolutionOptions = {},
 ): Promise<
   Result<AnalysisProviderCandidateEvaluation, AnalysisCancelledError>
 > => {
+  const { signal } = options;
   if (signalIsAborted(signal))
-    return err(new AnalysisCancelledError("open_binary"));
+    return err(
+      new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+    );
   let resolved: Awaited<ReturnType<typeof candidate.resolveAnalysisProfile>>;
   try {
-    const resolution = await waitForAbortable(
-      candidate.resolveAnalysisProfile(
-        target,
-        signal === undefined ? undefined : { signal },
-      ),
-      signal,
-    );
-    if (resolution === ABORTED)
-      return err(new AnalysisCancelledError("open_binary"));
-    resolved = resolution;
+    resolved = await candidate.resolveAnalysisProfile(target, options);
   } catch (cause: unknown) {
-    void cause;
-    return ok(
-      rejectedProfile(candidate, status, "Provider profile resolution threw"),
+    resolved = err(
+      cause instanceof AnalysisError
+        ? cause
+        : new ProviderAdapterError(
+            status.provider.id,
+            "resolve_analysis_profile",
+            {
+              cause,
+              diagnostics: { reason: "Provider profile resolution threw" },
+            },
+          ),
     );
   }
-  if (signalIsAborted(signal))
-    return err(new AnalysisCancelledError("open_binary"));
   if (!resolved.ok && resolved.error instanceof AnalysisCancelledError)
     return err(resolved.error);
   if (!resolved.ok) {
@@ -76,6 +79,10 @@ export const evaluateAnalysisProviderCandidate = async (
           });
     return ok({ ...rejection, profileError: error });
   }
+  if (signalIsAborted(signal))
+    return err(
+      new AnalysisCancelledError("open_binary", { cause: signal?.reason }),
+    );
   try {
     if (resolved.value.profile === null)
       return ok(

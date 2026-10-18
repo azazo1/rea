@@ -1,5 +1,16 @@
 import { err, ok, type Result } from "./result.js";
 
+/** The unsigned 16-bit page count bounds the initialized image, not overlays. */
+export const dosMzImageByteLength = (bytes: Buffer): Result<number, string> => {
+  if (bytes.length < 28 || bytes.toString("latin1", 0, 2) !== "MZ")
+    return err("invalid or truncated DOS MZ header");
+  const lastPageBytes = bytes.readUInt16LE(2);
+  const pages = bytes.readUInt16LE(4);
+  if (pages === 0 || lastPageBytes > 511)
+    return err("invalid DOS MZ page count or final-page size");
+  return ok((pages - 1) * 512 + (lastPageBytes === 0 ? 512 : lastPageBytes));
+};
+
 /** DOS load-module coordinates before applying the loader's segment relocation. */
 export interface DosMzHeader {
   readonly headerBytes: number;
@@ -72,13 +83,14 @@ const windowsHeaderSignature = (
   bytes: Buffer | undefined,
 ): "PE" | "NE" | "LE" | "LX" | "other" | "unobserved" => {
   if (bytes === undefined || bytes.length < 2) return "unobserved";
-  const prefix = bytes.toString("latin1", 0, 2);
-  if (prefix === "NE" || prefix === "LE" || prefix === "LX") return prefix;
-  if (prefix !== "PE") return "other";
+  const first = bytes[0];
+  const second = bytes[1];
+  if (first === 0x4e && second === 0x45) return "NE";
+  if (first === 0x4c && second === 0x45) return "LE";
+  if (first === 0x4c && second === 0x58) return "LX";
+  if (first !== 0x50 || second !== 0x45) return "other";
   if (bytes.length < 4) return "unobserved";
-  return bytes.subarray(0, 4).equals(Buffer.from("PE\0\0", "binary"))
-    ? "PE"
-    : "other";
+  return bytes[2] === 0 && bytes[3] === 0 ? "PE" : "other";
 };
 
 /**
@@ -104,12 +116,9 @@ export const parseDosMzHeader = (
     return err("MZ declares a Windows new header; it is not a DOS-only image");
   if (windowsHeader.state === "signature-needed")
     return err("MZ Windows new-header signature is outside the bounded prefix");
-  const lastPageBytes = bytes.readUInt16LE(2);
-  const pages = bytes.readUInt16LE(4);
-  if (pages === 0 || lastPageBytes > 511)
-    return err("invalid DOS MZ page count or final-page size");
-  const imageBytes =
-    (pages - 1) * 512 + (lastPageBytes === 0 ? 512 : lastPageBytes);
+  const extent = dosMzImageByteLength(bytes);
+  if (!extent.ok) return extent;
+  const imageBytes = extent.value;
   const headerBytes = bytes.readUInt16LE(8) * 16;
   if (headerBytes < 28 || headerBytes >= imageBytes)
     return err("invalid DOS MZ header size or empty load module");

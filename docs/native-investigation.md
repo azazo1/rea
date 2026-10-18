@@ -227,6 +227,10 @@ nodes and edges. Node payloads are bounded to 8 MiB and serialized results to
 32 MiB. Pagination returns edges whose source is on the node page and preserves
 stable IDs for endpoints outside that page.
 
+Within one value trace, each exact procedure selector is attempted at most once,
+including failed analyses. Failures remain unknown observations and do not
+establish canonical function identity. A new trace can retry those selectors.
+
 The raw Java `is_dead` flag can remain set after Ghidra decodes a live block;
 `block_membership` reports actual syntax-tree membership separately.
 
@@ -257,6 +261,23 @@ Mach-O fixtures check each case against source-owned return values.
 
 ## Static inspection
 
+`inspect_plist.format` describes the selected source, not plutil's conversion
+format. Sources explicitly identified as XML, binary or JSON retain those
+labels. For generic text, a bounded source-prefix probe recognizes leading XML
+markup, including UTF-8 and BOM-marked UTF-16 sources. Unidentified text and
+OpenStep plists, including a data-only value such as `<deadbeef>`, report
+`unknown` even when plutil decodes their values through an XML conversion.
+
+A plist explicitly selected through the path input or as the active plist target
+reports an unreadable or malformed selection as `invalid_request`. A missing or
+unreadable default plist of another target reports `capability_unavailable`.
+Permission failures remain `access_denied`; output and cleanup failures retain
+their own error categories.
+
+A plist decode refusal includes plutil's diagnostic from either output stream.
+`details.captured_output` retains bounded stdout/stderr excerpts, observed byte
+totals and exit status. `truncated: true` means those excerpts are incomplete.
+
 `inspect_macho.selected_architecture` identifies the exact selected lipo slice
 and its `container_file_offset` in the input file. A thin Mach-O has a known
 offset of zero; an unknown universal-slice offset stays null. The Evidence
@@ -266,7 +287,9 @@ Mach-O image. Architecture
 `file_offset` values are container-relative. Entrypoint, segment and section
 `file_offset` values retain their source meaning and are relative to the
 selected Mach-O slice. Raw load-command fields retain their original values.
-Evidence locations map the LC_MAIN entrypoint and nonempty file-backed segment
+A field otool prints more than once, such as each `LC_BUILD_VERSION` tool, is
+keyed `name #n` in print order. Each `LC_LINKER_OPTION` string is keyed
+`string #n` and checked against the declared `count`. Evidence locations map the LC_MAIN entrypoint and nonempty file-backed segment
 ranges to container offsets by adding the observed slice offset. Zero-fill
 segments do not produce file ranges. When the selected slice's container offset
 is unknown, those mapped locations are omitted with an explicit limitation;
@@ -311,15 +334,28 @@ complete observation.
   shared/cyclic references, class descriptors, raw serialized fields and
   malformed/unresolved/nil references. Missing fields stay absent; unknown
   classes are preserved. Select `root`, `offset` and `limit` explicitly.
+  Object `kind` describes the decoded archive value: data, dates and numbers
+  remain `scalar` when their JSON value uses a `$plist_type` wrapper. An actual
+  dictionary with the same fields remains `dictionary`.
   UID 0 cannot distinguish conditional nil from ordinary nil. Limits are
   64 MiB of input, 200,000 objects/references and 128 nesting levels.
   XML dictionary entries decoded as `__proto__` are omitted with an explicit
   count because REA results cannot represent that key. XML tag whitespace and
-  comments do not change that handling. Other values and the original archive
-  digest are preserved; key interpretation follows the pinned plist decoder.
+  comments do not change that handling. XML key names combine their text and
+  CDATA segments without trimming or expanding literal CDATA entities. Other
+  values and the original archive digest are preserved.
 - `decode_interface_builder` / `rea decode-interface-builder <app>` reads
   compiled storyboard and nib resources into objects, outlets, actions,
-  connections and controller/class names. `verify:interface-builder` compiles
+  connections and controller/class names. A full app graph is often several
+  megabytes (XLD.app: 6.7 MB, about 2M tokens, which also exceeds the default
+  MCP response budget), so MCP callers should pass `detail: "summary"`. The
+  summary keeps every decoded document and node/edge/coverage counts and
+  retains the complete Evidence; page rows with `inspect_analysis_view`
+  `view: {kind: "interface-builder", collection: "nodes", document:
+  "Contents/Resources/Base.lproj/MainMenu.nib", offset: 0, limit: 64}`.
+  `document` selects rows whose evidence names that exact
+  `documents[].relative_path` (nodes and edges only); `source_truncated` keeps
+  graph incompleteness visible on every page. `verify:interface-builder` compiles
   a source-owned AppKit XIB with `ibtool`. Storyboards require an installed
   iOS platform; unsupported archive forms remain explicit.
   XML plist archives accept UTF-8 and BOM-marked UTF-16 in either byte order.
@@ -365,7 +401,12 @@ complete observation.
   property: `N` means `nonatomic`; a complete typed attribute string without
   `N` means the Objective-C default `atomic`;
   missing or incomplete attribute metadata leaves `atomicity` and any
-  unestablished read-only value null. `is_meta_class`, `is_root_class`, and
+  unestablished read-only value null. A type attribute whose quoted class name
+  never closes is incomplete and marks `objc_properties_categories` partial
+  with `property_attributes_incomplete`. A property record that cannot be
+  decoded, such as one with an empty or unmapped name, is reported as
+  `property_decode_failed` at its entry address while sibling properties are
+  retained. `is_meta_class`, `is_root_class`, and
   `ivar_count` are also nullable when the selected provider exposes only symbol
   names. Class implementation methods have null `is_required` and `is_optional`
   fields because those facts apply to protocol declarations; decoded protocol
@@ -378,6 +419,10 @@ complete observation.
   coroutine tables, and inherited overrides, have explicit unsupported or
   partial coverage. Other providers retain the
   existing symbol-based inventory with its narrower coverage.
+  Symbols without a reported location remain in that inventory: Swift symbol
+  `address` and Objective-C `implementation_address` are null. An empty provider
+  address is retained as `reported_address` in the symbol's evidence, whose
+  location also remains unknown. Nonempty provider address syntax is preserved.
 
 ## Native desktop observation
 
@@ -394,7 +439,11 @@ decrement scrolling and text-value entry, or bounded waits. No global event
 injection is used. Unsupported AX actions fail explicitly. The result preserves
 ordered before/after captures and gaps; an action may have occurred before a
 post-action capture fails. Application state is left as-is; REA does not attempt
-to restore it.
+to restore it. Failed or cancelled scenarios return a typed error with the
+collected report in `partial_observation`, including ordered step outcomes.
+Cancellation preserves the caller's reason and remains observable through helper
+cleanup. A later abort does not replace an earlier helper or output failure.
+Cleanup failures retain their runtime owner until a confirmed cleanup retry.
 
 Scenarios accept caller-selected action lists and accessibility node counts.
 Individual waits cannot exceed the operation's 180-second deadline, and the
@@ -431,6 +480,11 @@ The run ends when the process exits, `max_events` entries are recorded,
 Bounded termination reports partial coverage. REA checks process termination
 using a launch-time OS start identity; if ownership or cleanup cannot be
 verified, the result or error preserves that uncertainty. The result reports:
+Launch errors keep the fact that LLDB created a process separate from whether
+it remains alive. An exited `SBProcess` is reported as exited only after LLDB
+confirms that state; unresolved ownership remains retained for cleanup retry.
+Cancellation observed while output and Evidence are finalized returns partial
+cancellation Evidence, even if the target has already exited.
 
 - the outcome, exit status and captured stdout/stderr (1 MiB kept per stream
   while excess bytes are drained and counted without growing capture files).
@@ -461,6 +515,11 @@ with partial coverage. Available output prefixes remain inline; their byte
 counts are observed lower bounds when final drain counters are unavailable.
 The original failure classification and cleanup uncertainty remain separate.
 An interrupted journal row is ignored with an explicit limitation.
+If the trace completed before cancellation or runtime-directory cleanup failed,
+the retained observation also keeps its exit status, termination proof, launch
+identity, breakpoint results and final stream counters. Those fields remain
+absent when the interrupted producer did not report them; partial coverage alone
+does not mean that every retained fact is incomplete.
 
 Only entries are observed: return values, floating-point and stack arguments,
 and inlined or `objc_direct` calls are not. The target runs with the current
@@ -468,16 +527,20 @@ user's permissions and may change files, show UI or use the network.
 
 Debugging must be allowed for the user (Developer Tools access). A
 hardened-runtime target without `com.apple.security.get-task-allow` cannot be
-debugged; `inspect_signature` reports this as the debugger-attach facet, and
-the tool fails with a `debugger-attach-denied` reason.
+debugged; `inspect_signature` reports the signature's `hardened_runtime` value
+and its `entitlements`, including `com.apple.security.get-task-allow` when it
+is present. A denied trace reports the `debugger-attach-denied` reason.
 
 ## Provider and verification boundaries
 
 Install a Ghidra 12.1.x release and the 64-bit full JDK it declares, then configure REA to
 use them. Ghidra analysis supports Linux x64/arm64 and macOS x64/arm64; each installation requires
 the matching native decompiler. Experimental Windows x64 P0 admits native
-x86 and x86-64 PE applications and DLLs on local NTFS using bundled Job Object ownership,
-protected runtime DACLs, and handle-based path admission. See [Windows Ghidra P0](windows-ghidra-p0.md) and
+x86, x86-64, ARMNT (Thumb-2) and ARM64 PE applications and DLLs, plus explicitly selected
+[raw NMOS 6502 images](raw-binary.md#nmos-6502) with a caller-supplied load address,
+on fixed local NTFS volumes. Other raw CPU families remain unsupported on Windows.
+The boundary uses bundled Job Object ownership, protected runtime DACLs, and
+handle-based path admission. See [Windows Ghidra P0](windows-ghidra-p0.md) and
 [issue #527](https://github.com/morluto/rea/issues/527).
 On Linux and macOS, `annotate_native_function` atomically edits a function name
 and entry comments in the ephemeral database, returning refreshed analysis
@@ -520,6 +583,12 @@ unresolved runtime/value semantics remain visible in results.
 
 ## Interface Builder hierarchy coverage
 
+A document's `hierarchy_complete` flag follows its own hierarchy coverage.
+If graph limits omit a hierarchy source or destination, or prevent a hierarchy
+edge or traversal from being retained, that document reports partial hierarchy
+coverage. Retained unresolved edges remain in the graph and do not add to the
+omitted-edge count. Coverage is evaluated separately for each document.
+
 A keyed-archive hierarchy UID without an object-table entry marks the hierarchy
 as partial while preserving decoded objects and known links. UID 0 remains
 archived nil and does not count as a missing reference. Archive and evidence
@@ -528,6 +597,10 @@ digests identify the original serialized bytes.
 ## Keyed archive integer precision
 
 The archive reader observes XML number element types and binary number markers.
+XML values and their number facts are interpreted together from the validated
+DOM. Hexadecimal `<integer>` text, including an optional sign, retains its value;
+`<real>` text and CDATA segments are combined without inferring text from nested
+elements. The XML path does not serialize or reparse character references.
 Integers beyond the exact range of a JSON number are reported with the original
 decimal text as `{ "$plist_type": "integer", "decimal": "<exact digits>" }` when
 that source value can be associated unambiguously. Integral real values remain
@@ -546,3 +619,59 @@ Value projection preserves serialized node kinds, IDs, references and pagination
 Exact and ambiguous value counts describe emitted root/object value instances;
 a root and an object may contain the same value. Archive digests identify the
 original bytes.
+
+Interface Builder's XML and binary plist archives use the same number metadata
+and exact-decimal representation for emitted node attributes. Projection follows
+object and connection classification, so archive IDs, UID links and graph counts
+keep their meaning. Precision limitations name the source document. Unsafe
+integer-literal counts cover the archive, including fields not emitted as node
+attributes; exact and ambiguous projection counts cover emitted attribute values.
+Integral reals stay numbers, and ambiguous or incompletely observed values retain
+explicit precision limitations. Before plist decoding, the existing aggregate
+decode budget reserves estimated room for number metadata and attribute
+projection; these estimates are not a hard process-memory bound. Native
+NIBArchive decoding is unchanged by this plist-specific representation.
+
+Dates are reported as `{ "$plist_type": "date", "iso8601": "<timestamp>" }`. A
+date the decoder cannot represent, such as an XML date with a year beyond 9999
+or a negative year, is reported as `{ "$plist_type": "date", "iso8601": null }`
+with a counted limitation; the rest of the plist or archive is still decoded.
+`inspect_plist` and Interface Builder decoding use the same projection.
+
+A negative-zero real is reported as `{ "$plist_type": "real", "value": "-0" }`
+because a JSON number cannot carry the sign of zero. `inspect_plist` and
+`inspect_keyed_archive` count these values in a limitation, and Interface
+Builder node attributes use the same value. Positive zero and integer zero,
+including an `<integer>-0</integer>` literal, remain the number `0`.
+
+Known non-finite reals are reported as
+`{ "$plist_type": "real", "value": "nan" | "+infinity" | "-infinity" }`.
+These are canonical numeric labels, not a claim about original source spelling.
+Binary IEEE reals retain NaN versus signed infinity; NaN payload bits and sign
+are not represented in the JSON value, and the original bytes remain the source
+for those details. XML CFPropertyList literals (`nan`, `+infinity`, `-infinity`,
+`infinity`, `inf`, `+inf`, `-inf`, case-insensitively) decode to the same known
+values. Case and aliases normalize; original archive bytes retain source text.
+
+XML numeric text whose identity the decoder cannot establish, including
+unrecognized non-finite text and finite literals that overflow the numeric
+representation, remains `{ "$plist_type": "real", "value": null }` with a
+counted limitation. The XML decoder marks these values explicitly before shared
+projection, so they cannot be confused with known binary IEEE values.
+Incomplete numeric markup retains its existing compatibility behavior described
+above. Known non-finite and unresolved numeric values have separate counts.
+Native `inspect_plist` uses these same labels for plutil's XML conversion.
+
+## Locate a byte signature
+
+Use `search_bytes` after opening a target with Ghidra to locate a known constant
+or instruction sequence. For example, `{"pattern":"48 8B ?? ?? 89","limit":100}`
+returns ordered addresses with segments, source file offsets and containing
+procedures. The CLI equivalent is
+`rea search-bytes ./program '48 8B ?? ?? 89' --provider ghidra`.
+Use `start`/`end` to constrain the inclusive address window, and continue with
+`next_cursor` until `complete` is true. Inspect `searched` for page coverage and
+skipped uninitialized blocks. A missing match does not establish absence from
+uninitialized memory or across block boundaries. See
+[Ghidra byte search](ghidra-provider.md#masked-byte-search) for mask and coverage
+semantics. This query never executes or modifies target bytes.

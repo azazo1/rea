@@ -101,6 +101,45 @@ it("distinguishes unavailable content hashes from completed path enumeration", a
 });
 
 it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "retains readable entries and marks an unreadable directory subtree unknown",
+  async () => {
+    const root = await createTestTempDirectory("rea-fs-unreadable-directory-");
+    const visible = join(root, "a-visible.txt");
+    const blocked = join(root, "z-blocked");
+    await writeFile(visible, "visible");
+    await mkdir(blocked);
+    await chmod(blocked, 0);
+    const scenario = parseProcessScenario({
+      executable: process.execPath,
+      working_directory: root,
+      filesystem_observation_paths: [root],
+    });
+
+    try {
+      const snapshot = await snapshotRoots(scenario);
+      expect(snapshot.files.map(({ path }) => path)).toContain(
+        "root_0:a-visible.txt",
+      );
+      expect(snapshot.files.map(({ path }) => path)).toContain(
+        "root_0:z-blocked",
+      );
+      expect(snapshot.completeRoots).toEqual([]);
+      expect(snapshot.coverage.enumeration_omissions).toEqual([
+        {
+          path: "root_0:z-blocked",
+          reason: "directory_unavailable",
+          system_code: "EACCES",
+        },
+      ]);
+      expect(snapshot.truncated).toBe(true);
+    } finally {
+      await chmod(blocked, 0o700);
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
   "retains unreadable-file and sibling observations in a complete snapshot",
   async () => {
     const root = await createTestTempDirectory("rea-fs-unreadable-file-");
@@ -296,6 +335,38 @@ it.skipIf(process.platform === "win32")(
       ).toBe("unchanged");
     expect(
       effects.find(({ path }) => path === "root_0:moved-link")?.status,
+    ).toBe("modified");
+  },
+);
+
+it.skipIf(process.platform === "win32")(
+  "keeps the observed symlink target when dot segments resolve to the same path",
+  async () => {
+    const root = await createTestTempDirectory("rea-fs-symlink-spelling-");
+    await mkdir(join(root, "aaa"));
+    await writeFile(join(root, "target"), "content");
+    // Equal length, so only the target spelling distinguishes the links;
+    // "bbb" does not exist, so the replacement link is broken.
+    await symlink("aaa/../target", join(root, "link"));
+    const scenario = parseProcessScenario({
+      executable: process.execPath,
+      working_directory: root,
+      filesystem_observation_paths: [root],
+      limits: { file_bytes: 1 },
+    });
+    const before = await snapshotRoots(scenario);
+    await rm(join(root, "link"));
+    await symlink("bbb/../target", join(root, "link"));
+    const after = await snapshotRoots(scenario);
+
+    const link = (snapshot: typeof before) =>
+      snapshot.files.find(({ path }) => path === "root_0:link");
+    expect(link(before)?.symlink_target).toBe("aaa/../target");
+    expect(link(after)?.symlink_target).toBe("bbb/../target");
+    expect(
+      classifyFilesystemEffects(before, after).find(
+        ({ path }) => path === "root_0:link",
+      )?.status,
     ).toBe("modified");
   },
 );

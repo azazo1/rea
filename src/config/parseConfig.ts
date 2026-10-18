@@ -1,66 +1,56 @@
-import { accessSync, constants } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, statSync } from "node:fs";
 
-import { ConfigurationError } from "../domain/configurationErrors.js";
-import { err, ok, type Result } from "../domain/result.js";
+import type { ConfigurationError } from "../domain/configurationErrors.js";
+import { ok, type Result } from "../domain/result.js";
 import { parseEnvironment } from "./environment.js";
 import { homeDirectoryFromEnvironment } from "./homeDirectory.js";
-import { parseStringArray, parseLoaderArgs } from "./parsers.js";
 import type { AppConfig } from "./types.js";
-
-const DEFAULT_HOPPER_LAUNCHER_PATH =
-  "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
-const SYSTEM_LINUX_HOPPER = "/opt/hopper/bin/Hopper";
-
+import {
+  linuxHopperLauncherCandidates,
+  REA_MANAGED_LINUX_HOPPER_LAUNCHER,
+} from "../application/LinuxHopper.js";
+import {
+  MAC_HOPPER_SYSTEM_LAUNCHER,
+  macHopperLauncherCandidates,
+} from "../application/MacHopperPaths.js";
 const executableAvailable = (path: string): boolean => {
   try {
     accessSync(path, constants.X_OK);
-    return true;
+    return statSync(path).isFile();
   } catch {
     return false;
   }
 };
 
-const defaultHopperLauncherPath = (
+export const defaultHopperLauncherPath = (
   platform: NodeJS.Platform,
   homeDirectory: string,
   executable: (path: string) => boolean = executableAvailable,
 ): string => {
-  if (platform !== "linux") return DEFAULT_HOPPER_LAUNCHER_PATH;
-  if (executable(SYSTEM_LINUX_HOPPER)) return SYSTEM_LINUX_HOPPER;
-  const userLocal = join(homeDirectory, ".local/share/rea/hopper/bin/Hopper");
-  return executable(userLocal) ? userLocal : SYSTEM_LINUX_HOPPER;
+  if (platform === "darwin") {
+    for (const candidate of macHopperLauncherCandidates(homeDirectory))
+      if (executable(candidate)) return candidate;
+    return MAC_HOPPER_SYSTEM_LAUNCHER;
+  }
+  if (platform !== "linux") return MAC_HOPPER_SYSTEM_LAUNCHER;
+  return (
+    linuxHopperLauncherCandidates(homeDirectory).find(executable) ??
+    REA_MANAGED_LINUX_HOPPER_LAUNCHER
+  );
 };
 
 /** Parse provider configuration and runtime prerequisites at the composition root. */
 export const parseConfig = (
   environment: Readonly<Record<string, string | undefined>>,
 ): Result<AppConfig, ConfigurationError> => {
-  const parsed = parseEnvironment(environment);
+  // JEB validates its own timeout during optional provider composition. It is
+  // not an AppConfig setting and must not prevent unrelated CLI/MCP startup.
+  // Registration validation still checks the complete environment directly.
+  const { REA_JEB_MCP_TIMEOUT_MS: _jebTimeout, ...appEnvironment } =
+    environment;
+  const parsed = parseEnvironment(appEnvironment);
   if (!parsed.ok) return parsed;
   const env = parsed.value;
-  const loaderArgs = parseLoaderArgs(env.HOPPER_LOADER_ARGS_JSON);
-  if (!loaderArgs.ok) return loaderArgs;
-  const secretPatterns = parseStringArray(
-    env.REA_REFERENCE_SECRET_PATTERNS_JSON,
-    "REA_REFERENCE_SECRET_PATTERNS_JSON",
-  );
-  if (!secretPatterns.ok) return secretPatterns;
-  // Ghidra's analyzeHeadless accepts -cspec only together with -processor.
-  if (
-    env.REA_GHIDRA_COMPILER_SPEC_ID !== undefined &&
-    env.REA_GHIDRA_LANGUAGE_ID === undefined
-  )
-    return err(
-      new ConfigurationError("Invalid REA environment configuration", {
-        settings: [
-          {
-            setting: "REA_GHIDRA_COMPILER_SPEC_ID",
-            constraint: "requires REA_GHIDRA_LANGUAGE_ID",
-          },
-        ],
-      }),
-    );
   return ok({
     ...(env.REA_MCP_MAX_RESPONSE_BYTES === undefined
       ? {}
@@ -104,8 +94,10 @@ export const parseConfig = (
     hopperStartupTimeoutMs: env.REA_HOPPER_STARTUP_TIMEOUT_MS,
     hopperTargetPath: env.HOPPER_TARGET_PATH,
     hopperTargetKind: env.HOPPER_TARGET_KIND,
-    hopperLoaderArgs: loaderArgs.value,
+    hopperLoaderArgs: env.loaderArgs,
     logLevel: env.REA_LOG_LEVEL,
-    referenceSourcePolicy: { secretPatterns: secretPatterns.value },
+    referenceSourcePolicy: {
+      secretPatterns: env.referenceSecretPatterns,
+    },
   });
 };

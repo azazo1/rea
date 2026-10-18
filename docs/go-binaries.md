@@ -39,8 +39,8 @@ container format, architecture, word size and byte order. A recognized
 - `module.dependencies`, with the same fields and their original order;
 - `module.settings`, retaining ordered key/value entries and duplicate keys;
 - `module.unparsed_lines`, `module.unparsed_line_bytes_base64` and
-  `module.complete`, so unfamiliar, malformed, conflicting or undecodable records
-  do not disappear behind a complete result.
+  `module.complete`, which says whether every present module-text line was
+  parsed. It does not establish that the dependency inventory is complete.
 
 Missing checksums are `null`; empty fields and development/local replacement
 versions remain unchanged. Build settings such as `GOOS`, `GOARCH` or `vcs.revision`
@@ -50,6 +50,13 @@ base64 while other decodable module records are still reported; the reader does
 not insert replacement characters or reject the entire artifact for those
 strings.
 
+When no main-module (`mod`) record was decoded, `module.main` is `null` and
+dependency coverage is unknown. Successfully decoded dependency records remain
+visible. GOPATH-mode builds may contain only a package `path` and build settings;
+their empty dependency array does not establish the absence of dependencies.
+The result's limitations state this explicitly. A module-mode build with a main
+module record and no dependency records has an observed empty dependency list.
+
 ## Supported boundary
 
 The built-in TypeScript reader supports ELF, PE and thin Mach-O images with Go's
@@ -57,6 +64,12 @@ inline or historical pointer build-info encoding. Source ranges refer to the
 original stable file snapshot, including pointer-backed strings. It does not
 scan arbitrary byte strings as compiler metadata or interpret a fat Mach-O
 container as one selected architecture.
+
+For ELF images without a named build-info section, discovery checks each
+nonempty writable, non-executable load segment in program-header order. This
+includes sectionless PIE images with metadata in a later data segment. Named
+sections retain priority, and alignment, file mapping and record validation
+remain required.
 
 Historical moduleless Go binaries can store their empty module-string header in
 declared zero-initialized virtual memory rather than file-backed bytes. The reader
@@ -78,9 +91,17 @@ host permission denial, changed artifacts and cancellation retain distinct
 errors. The selected file is never modified; this inspection creates no
 temporary files, starts no subprocesses and accesses no network endpoint.
 
-Resource guards bound the selected file to 256 MiB, aggregate embedded strings
+An input above 256 MiB returns `resource_constraint` with resource `file-size`
+and `reported_limits.maximum_input_bytes`. Select a suitable input within that
+fixed allowance; changing an output-write or transport budget does not admit it.
+
+Resource guards bound the selected file and cumulative header searches to 256 MiB
+each, aggregate embedded strings
 to 1 MiB, structural table decoding to 16 MiB and the complete normalized metadata
-report to 8 MiB. Oversized results fail without partial success. MCP also applies
+report to 8 MiB. Identical search spans with the same virtual alignment are
+searched once; partially overlapping spans consume the cumulative search budget
+and fail with a CPU resource constraint when it is exhausted. Oversized results
+fail without partial success. MCP also applies
 its [response transport budget](mcp-contracts.md), which counts both text and
 structured content; a report within the metadata limit can still require export
 from retained Evidence. These limits are not operating-system memory or CPU

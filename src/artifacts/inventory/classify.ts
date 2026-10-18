@@ -5,7 +5,14 @@ import type { StableRegularFileDescriptor } from "../../filesystem/RegularFile.j
 import type { OwnedFileHandle } from "../../filesystem/OwnedFileHandle.js";
 
 import { classifyArtifactContent } from "./ArtifactGraphConstruction.js";
-import { ARTIFACT_CLASSIFICATION_PREFIX_BYTES } from "../ArtifactHash.js";
+import {
+  abortIfNeeded,
+  ARTIFACT_CLASSIFICATION_PREFIX_BYTES,
+} from "../ArtifactHash.js";
+import {
+  createXmlPlistSignatureProbe,
+  MAX_XML_PLIST_PROBE_BYTES,
+} from "../../domain/apple/appleArchiveFormat.js";
 import type { ArtifactOccurrence } from "../../domain/artifactGraph.js";
 import {
   hasZipSignature,
@@ -59,13 +66,9 @@ export const classifyAndHashRoot = async (
       };
       const cleanupAttempt = await options.resourceScope.release(owner);
       if (cleanupAttempt.kind === "failed")
-        throw ArtifactReaderFailure.withCleanup(
-          cleanupAttempt.cause,
-          ArtifactReaderFailure.cleanupObservation(
-            cleanupAttempt.cause,
-            owner.resource,
-          ),
-        );
+        throw options.resourceScope.cleanupFailure({ kind: "completed" }, [
+          cleanupAttempt,
+        ]);
     }
     return { format: result.format, digest: result.digest };
   });
@@ -104,7 +107,7 @@ export const classifyAndHashRootForInventory = async (
         "integrity",
         `Root artifact changed before inventory: ${path}`,
       );
-    const format = await classifyRootFormat(path, handle);
+    const format = await classifyRootFormat(path, handle, options.signal);
     const digest = await hashStableRootArtifactHandle(
       path,
       handle,
@@ -129,13 +132,7 @@ export const classifyAndHashRootForInventory = async (
   if (outcome.kind === "failed" || outcome.value.rootSource === undefined) {
     const cleanupAttempt = await options.resourceScope.release(owner);
     if (cleanupAttempt.kind === "failed")
-      throw ArtifactReaderFailure.withCleanup(
-        outcome.kind === "failed" ? outcome.cause : cleanupAttempt.cause,
-        ArtifactReaderFailure.cleanupObservation(
-          cleanupAttempt.cause,
-          owner.resource,
-        ),
-      );
+      throw options.resourceScope.cleanupFailure(outcome, [cleanupAttempt]);
   }
   if (outcome.kind === "failed") throw outcome.cause;
   return outcome.value;
@@ -144,10 +141,11 @@ export const classifyAndHashRootForInventory = async (
 const classifyRootFormat = async (
   path: string,
   handle: FileHandle,
+  signal?: AbortSignal,
 ): Promise<ArtifactOccurrence["artifact_format"]> => {
   const magic = Buffer.alloc(ARTIFACT_CLASSIFICATION_PREFIX_BYTES);
   const observed = await handle.read(magic, 0, magic.length, 0);
-  const prefix = magic.subarray(0, observed.bytesRead);
+  let prefix = magic.subarray(0, observed.bytesRead);
   const lower = path.toLowerCase();
   if (hasZipSignature(prefix)) return zipRootPackageFormat(lower);
   if (
@@ -156,6 +154,27 @@ const classifyRootFormat = async (
   )
     return "pkg";
   if (lower.endsWith(".dmg") && (await hasKolyTrailer(handle))) return "dmg";
+  const xmlProbe = createXmlPlistSignatureProbe();
+  xmlProbe.write(prefix);
+  const chunks = [prefix];
+  let prefixBytes = prefix.length;
+  while (
+    xmlProbe.state === "pending" &&
+    prefixBytes < MAX_XML_PLIST_PROBE_BYTES
+  ) {
+    abortIfNeeded(signal);
+    const chunk = Buffer.alloc(
+      Math.min(64 * 1024, MAX_XML_PLIST_PROBE_BYTES - prefixBytes),
+    );
+    const read = await handle.read(chunk, 0, chunk.length, prefixBytes);
+    abortIfNeeded(signal);
+    if (read.bytesRead === 0) break;
+    const selected = chunk.subarray(0, read.bytesRead);
+    chunks.push(selected);
+    prefixBytes += selected.length;
+    xmlProbe.write(selected);
+  }
+  prefix = Buffer.concat(chunks);
   // ASAR is chosen from its header pickle; any other suffix is a role hint.
   return classifyArtifactContent(path, prefix, (await handle.stat()).size)
     .format;

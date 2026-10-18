@@ -1,17 +1,17 @@
+import { analysisViewInputError } from "./analysisViewErrors.js";
 import { z } from "zod";
 import type { AnalysisError } from "../analysisErrorBase.js";
 import { uniqueSorted } from "../canonicalOrdering.js";
-import { analysisInputErrorFromIssues } from "../inputIssueProjection.js";
 import {
   managedArtifactInspectionSchema,
   managedMemberInspectionSchema,
 } from "../managed/managedArtifact.js";
 import { err, ok, type Result } from "../result.js";
-import {
-  analysisViewInputError,
-  type AnalysisViewParent,
-  type AnalysisViewRequest,
-  type UnsignedAnalysisView,
+import { parseAnalysisViewResult } from "./analysisViewParent.js";
+import type {
+  AnalysisViewParent,
+  AnalysisViewRequest,
+  UnsignedAnalysisView,
 } from "./analysisView.js";
 import {
   completeWithinViewCoverage,
@@ -51,6 +51,24 @@ export const managedViewContextSchema = z.strictObject({
   source_coverage: managedArtifactInspectionSchema.shape.coverage,
 });
 
+/** Token scope and identity limits shared by every managed metadata view. */
+export const managedViewIdentityUnknowns = (
+  parent: AnalysisViewParent,
+  mvid: string | null,
+): string[] => [
+  "Metadata tokens are build-local coordinates bound to the recorded artifact SHA-256 and module MVID; this view does not load or execute the assembly.",
+  ...(parent.subject == null
+    ? [
+        "The parent has no recorded subject; its normalized artifact identity cannot be cross-checked against a subject digest.",
+      ]
+    : []),
+  ...(mvid === null
+    ? [
+        "The module MVID is unknown; tokens cannot establish a cross-observation module match.",
+      ]
+    : []),
+];
+
 /** Project authenticated metadata without reading a path or invoking a provider. */
 export const projectManagedArtifactView = (
   parent: AnalysisViewParent,
@@ -67,22 +85,12 @@ export const projectManagedArtifactView = (
         },
       ]),
     );
-  const parsed = managedArtifactInspectionSchema.safeParse(
-    parent.normalizedResult,
+  const parsed = parseAnalysisViewResult(
+    managedArtifactInspectionSchema,
+    parent,
   );
-  if (!parsed.success)
-    return err(
-      analysisInputErrorFromIssues(
-        "inspect_analysis_view",
-        parsed.error.issues.map((issue) => ({
-          ...issue,
-          path: ["source", "normalized_result", ...issue.path],
-        })),
-        { source: { normalized_result: parent.normalizedResult } },
-        { cause: parsed.error },
-      ),
-    );
-  const report = parsed.data;
+  if (!parsed.ok) return parsed;
+  const report = parsed.value;
   const identity_scope = {
     token_identity: "build-local" as const,
     requires_artifact_sha256: report.artifact.sha256,
@@ -96,17 +104,7 @@ export const projectManagedArtifactView = (
     limitations: uniqueSorted([...parent.limitations, ...report.limitations]),
     unknowns: [
       "Collection counts and pages cover producer-returned rows; metadata completeness remains the original metadata status and coverage, not an absence claim about unreturned rows.",
-      "Metadata tokens are build-local coordinates bound to the recorded artifact SHA-256 and module MVID; this view does not load or execute the assembly.",
-      ...(parent.subject == null
-        ? [
-            "The parent has no recorded subject; its normalized artifact identity cannot be cross-checked against a subject digest.",
-          ]
-        : []),
-      ...(identity_scope.requires_mvid === null
-        ? [
-            "The module MVID is unknown; tokens cannot establish a cross-observation module match.",
-          ]
-        : []),
+      ...managedViewIdentityUnknowns(parent, identity_scope.requires_mvid),
     ],
   };
   if (view.kind === "summary") {

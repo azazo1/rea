@@ -25,11 +25,27 @@ LITERALS = {"REA", "Reverse Engineer Anything", "REA · Reverse Engineer Anythin
 FALLBACK_NOTICE = "Translation is being updated. Read this page in English for now."
 
 
+def readme_edition_paths(root):
+    """Return repo-relative README editions: root English plus docs/readme translations."""
+    editions = set()
+    if (root / "README.md").is_file():
+        editions.add("README.md")
+    folder = root / "docs" / "readme"
+    if folder.is_dir():
+        editions.update(
+            f"docs/readme/{path.name}"
+            for path in folder.glob("README_*.md")
+            if path.is_file()
+        )
+    return editions
+
+
 def languages(root):
     """Load the website language inventory and check it against README editions."""
     path = root / "website/locales/languages.json"
+    editions = readme_edition_paths(root)
     if not path.exists():
-        if any(root.glob("README_*.md")):
+        if any(edition != "README.md" for edition in editions):
             raise ValueError("Missing languages.json for the translated README editions")
         return [{"code": "en", "name": "English", "readme": "README.md", "dir": "ltr"}]
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -49,8 +65,7 @@ def languages(root):
             raise ValueError(f"Duplicate README edition: {item['readme']}")
         codes.add(item["code"])
         filenames.add(item["readme"])
-    readmes = {path.name for path in root.glob("README*.md")}
-    if readmes and ({item["readme"] for item in data} != readmes):
+    if editions and ({item["readme"] for item in data} != editions):
         raise ValueError("Website languages must match the README language editions")
     return data
 
@@ -530,7 +545,13 @@ def render_page(root, source_path, language, messages, available, figures, page_
     source = replace_language_markup(source, root, relative, code, page_languages)
     runtime = {text: messages[("runtime", text)] for text in read_runtime(root, source_path)}
     payload = json.dumps(runtime, ensure_ascii=False).replace("<", "\\u003c").replace("&", "\\u0026")
-    source = source.replace("</head>", f'<script id="website-messages" type="application/json">{payload}</script>\n  </head>')
+    # Only Korean editions request the font stylesheet; English fallbacks keep
+    # their system fonts. The variable face also supplies the site's 650 weight.
+    font_stylesheet = (
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@100..900&amp;display=swap" />\n  '
+        if code == "ko" else ""
+    )
+    source = source.replace("</head>", f'{font_stylesheet}<script id="website-messages" type="application/json">{payload}</script>\n  </head>')
     return source
 
 

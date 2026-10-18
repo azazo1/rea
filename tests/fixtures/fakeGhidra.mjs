@@ -32,13 +32,22 @@ if (mode === "silent") setInterval(() => undefined, 1_000);
 else {
   await rm(endpointPath, { force: true });
   const sockets = new Set();
+  let rejectedConnections = 0;
   const server = createServer((socket) => {
+    if (
+      mode === "reject_all_connections" ||
+      (mode === "reject_first_connection" && rejectedConnections++ === 0)
+    ) {
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     socket.setEncoding("utf8");
     const state = {
       buffer: { value: "" },
       pings: { value: 0 },
+      emittedOome: false,
       mode,
       token,
       runId,
@@ -100,6 +109,28 @@ const handleRequest = (socket, server, request, state) => {
     handlePing(socket, request, state);
     return;
   }
+  if (
+    state.mode === "old_oom_then_malformed" &&
+    request.method === "list_documents" &&
+    !state.emittedOome
+  ) {
+    state.emittedOome = true;
+    process.stderr.write(
+      "ERROR Abort due to Headless analyzer error: Java heap space (HeadlessAnalyzer) java.lang.OutOfMemoryError:\n",
+      () => setTimeout(() => handleRequest(socket, server, request, state), 10),
+    );
+    return;
+  }
+  if (
+    state.mode === "old_oom_then_malformed" &&
+    request.method === "list_procedures" &&
+    state.emittedOome
+  ) {
+    process.stderr.write("Current operation diagnostic: 雪\n", () =>
+      setTimeout(() => socket.write("{invalid\n"), 10),
+    );
+    return;
+  }
   if (state.mode === "remote_error" && request.method === "list_procedures") {
     socket.write(
       `${JSON.stringify({
@@ -121,7 +152,7 @@ const handleRequest = (socket, server, request, state) => {
       ? [stringItem("0x2000", "fixture 雪🦊")]
       : request.method === "list_strings" && state.mode === "oversized_result"
         ? [stringItem("0x2000", "x".repeat(64 * 1024 * 1024 + 1))]
-        : inventoryResultFor(request.method);
+        : inventoryResultFor(request.method, request.params);
   if (inventory !== undefined) {
     const response = `${JSON.stringify({ id: request.id, ok: true, result: inventory })}\n`;
     if (state.mode === "fragmented") {
@@ -224,10 +255,12 @@ const sessionInfo = ({
   analysis_complete: !timedOut,
   analysis_timed_out: timedOut,
   capabilities: [
+    "read_binary_inventory_summary",
     "ping",
     "shutdown",
     "inspect_native_load_image",
     "read_bytes",
+    "search_bytes",
     "address_to_file_offset",
     "address_name",
     "list_documents",
@@ -273,8 +306,49 @@ const sessionInfo = ({
   },
 });
 
-const inventoryResultFor = (method) => {
+const inventoryResultFor = (method, params) => {
   switch (method) {
+    case "read_binary_inventory_summary":
+      return {
+        document: "fixture",
+        segments: inventoryResultFor("list_segments", {}),
+        procedure_count: inventoryResultFor("list_procedures", {}).length,
+        string_count: inventoryResultFor("list_strings", {}).length,
+      };
+    case "search_bytes": {
+      const continued = params.cursor === "fixture-second-page";
+      const paged = params.limit === 1 && !continued;
+      const addresses = continued
+        ? ["0x1005"]
+        : paged
+          ? ["0x1000"]
+          : ["0x1000", "0x1005"];
+      return {
+        matches: addresses.map((address) => ({
+          address,
+          segment: ".text",
+          file_offset: address === "0x1000" ? 0 : 5,
+          procedure: { address: "0x1000", name: "fixture_main" },
+        })),
+        searched: {
+          blocks: [
+            {
+              segment: ".text",
+              start: continued ? "0x1005" : "0x1000",
+              end: "0x1009",
+              bytes: continued ? 5 : 10,
+            },
+          ],
+          bytes: continued ? 5 : 10,
+          skipped_uninitialized: [
+            { segment: ".bss", start: "0x2000", end: "0x200f", bytes: 16 },
+          ],
+          skipped_not_loaded: [],
+        },
+        complete: !paged,
+        next_cursor: paged ? "fixture-second-page" : null,
+      };
+    }
     case "address_name":
       return "fixture_main";
     case "list_documents":

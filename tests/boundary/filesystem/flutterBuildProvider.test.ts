@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { open, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { Uint8ArrayReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
@@ -13,7 +14,10 @@ import {
 } from "../../../src/flutter/FlutterBuild.fixture.js";
 import { snapshotSection } from "../../../src/flutter/FlutterBuild.fixture.js";
 import { FlutterBuildProvider } from "../../../src/flutter/FlutterBuildProvider.js";
+import { FlutterBuildAnalysisService } from "../../../src/application/flutter/FlutterBuildAnalysisService.js";
+import { finishAnalysisCommand } from "../../../src/cli/finishAnalysisCommand.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import { ProviderCleanupError } from "../../../src/domain/providerCleanupError.js";
 import {
   AnalysisCancelledError,
   AnalysisResourceConstraintError,
@@ -367,6 +371,48 @@ it.each(["close", "elf", "pool", "cleanup"] as const)(
   },
 );
 
+it.each(["identify_flutter_build", "inspect_dart_aot"] as const)(
+  "%s keeps completed Evidence when cancelled during successful snapshot removal",
+  async (operation) => {
+    const path = await buildApk("removal-cancellation.apk", [
+      { path: "lib/arm64-v8a/libapp.so", bytes: aotImage() },
+      { path: "lib/arm64-v8a/libflutter.so", bytes: libflutter() },
+    ]);
+    const controlProvider = new FlutterBuildProvider();
+    onTestFinished(() => controlProvider.close());
+    const control = await new FlutterBuildAnalysisService(
+      controlProvider,
+    ).execute(operation, { path });
+    if (!control.ok) throw control.error;
+
+    const controller = new AbortController();
+    const reason = new Error("caller interrupted snapshot removal");
+    const removedRoots: string[] = [];
+    const provider = new FlutterBuildProvider({
+      removeRoot: async (root) => {
+        await rm(root, { recursive: true, force: true });
+        removedRoots.push(root);
+        controller.abort(reason);
+      },
+    });
+    const result = await new FlutterBuildAnalysisService(provider).execute(
+      operation,
+      { path },
+      { signal: controller.signal },
+    );
+    if (result.ok) throw new Error("cancellation must prevent success");
+    expect(result.error).toBeInstanceOf(AnalysisCancelledError);
+    expect(result.error.cause).toBe(reason);
+    expect(result.error.partialObservation).toEqual(control.value);
+    expect(removedRoots).toHaveLength(1);
+    await expect(stat(removedRoots[0]!)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await provider.close();
+    expect(removedRoots).toHaveLength(1);
+  },
+);
+
 it("projects each payload shape through the owned snapshot", async () => {
   const hash = REFERENCE_HASH;
   const agreeBoth = await buildApk("agree.apk", [
@@ -616,24 +662,50 @@ it("retains failed snapshot cleanup and retries it on close", async () => {
       bytes: libapp(REFERENCE_HASH),
     },
   ]);
-  const spaces: string[] = [];
+  const roots: string[] = [];
   let failing = true;
   const provider = new FlutterBuildProvider({
     removeRoot: async (path) => {
+      roots.push(path);
       if (failing) throw new Error("cleanup refused");
-      spaces.push(path);
       await rm(path, { recursive: true, force: true });
     },
   });
-  const result = await provider.execute({
-    operation: "identify_flutter_build",
-    input: { path: apk },
+  onTestFinished(async () => {
+    failing = false;
+    await provider.close();
   });
-  expect(result.ok).toBe(true);
-  await expect(provider.close()).rejects.toThrow(/snapshot cleanup failed/u);
+  const service = new FlutterBuildAnalysisService(provider);
+  const result = await finishAnalysisCommand(
+    () =>
+      service.execute("identify_flutter_build", {
+        path: apk,
+      }),
+    { close: () => provider.close() },
+    "flutter",
+    "identify_flutter_build",
+    new AbortController().signal,
+  );
+  expect(result).toMatchObject({
+    code: "cleanup_incomplete",
+    details: {
+      resources: [expect.stringContaining("rea-flutter-")],
+      partial_observation: {
+        operation: "identify_flutter_build",
+        subject: { local_path: apk },
+        normalized_result: { flutter_detected: true },
+      },
+    },
+  });
+  expect(result).toMatchObject({
+    details: { resources: [roots[0]] },
+  });
+  expect(roots).toHaveLength(2);
+  expect(roots[1]).toBe(roots[0]);
   failing = false;
   await provider.close();
-  expect(spaces.length).toBeGreaterThanOrEqual(1);
+  expect(roots).toHaveLength(3);
+  expect(roots[2]).toBe(roots[0]);
 });
 
 it("cancels before creating any snapshot root", async () => {
@@ -1031,7 +1103,28 @@ it.each(["identify_flutter_build", "inspect_dart_aot"] as const)(
     const result = await provider.execute({ operation, input: { path } });
     if (!result.ok) throw result.error;
     expect(removeRoot).not.toHaveBeenCalled();
-    await expect(provider.close()).rejects.toThrow("snapshot cleanup failed");
+    let cleanupFailure: unknown;
+    try {
+      await provider.close();
+    } catch (cause) {
+      cleanupFailure = cause;
+    }
+    expect(cleanupFailure).toBeInstanceOf(ProviderCleanupError);
+    expect(cleanupFailure).toMatchObject({
+      operation: "close_flutter_build",
+      cleanupResources: [expect.stringContaining("rea-flutter-")],
+      diagnostics: {
+        reason: expect.stringContaining("file handle close refused"),
+        retained_roots: [
+          {
+            path: expect.stringContaining("rea-flutter-"),
+            failures: [
+              { message: expect.stringContaining("file handle close refused") },
+            ],
+          },
+        ],
+      },
+    });
     expect(removeRoot).not.toHaveBeenCalled();
     failClose = false;
     await provider.close();
@@ -1103,7 +1196,7 @@ it.each([0, 1, 2, 3])(
     });
     expect(result.ok).toBe(false);
     expect(removeRoot).not.toHaveBeenCalled();
-    await expect(provider.close()).rejects.toThrow("snapshot cleanup failed");
+    await expect(provider.close()).rejects.toBeInstanceOf(ProviderCleanupError);
     failing = false;
     await provider.close();
     expect(removeRoot).toHaveBeenCalledTimes(1);
@@ -1122,11 +1215,16 @@ it.each(["identify_flutter_build", "inspect_dart_aot"] as const)(
     if (result.ok) throw new Error("Duplicate libraries must be refused");
     expect(projectAnalysisError(result.error)).toMatchObject({
       code: "invalid_request",
+      details: {
+        issues: [
+          {
+            message: expect.stringContaining(
+              `duplicate Flutter library members: ${path}:`,
+            ),
+          },
+        ],
+      },
     });
-    expect(JSON.stringify(projectAnalysisError(result.error))).toContain(
-      "duplicate Flutter library members",
-    );
-    expect(JSON.stringify(projectAnalysisError(result.error))).toContain(path);
     expect(extract).not.toHaveBeenCalled();
   },
 );
@@ -1168,6 +1266,69 @@ it.each(["identify_flutter_build", "inspect_dart_aot"] as const)(
       details: { issues: [{ message: expect.stringContaining(path) }] },
     });
     expect(JSON.stringify(error)).not.toContain("input.apk");
+  },
+);
+
+const expectSelectionIssue = async (
+  provider: FlutterBuildProvider,
+  path: string,
+  message: string,
+): Promise<void> => {
+  for (const operation of [
+    "identify_flutter_build",
+    "inspect_dart_aot",
+  ] as const) {
+    const result = await provider.execute({ operation, input: { path } });
+    if (result.ok) throw new Error("A non-file APK selection must fail");
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      code: "invalid_request",
+      details: {
+        issues: [
+          {
+            path: ["path"],
+            reason: "invalid_format",
+            message: `${message}: ${path}`,
+          },
+        ],
+      },
+    });
+  }
+};
+
+it("names a missing or non-file APK selection instead of blaming package bytes", async () => {
+  const root = await createTestTempDirectory("rea-flutter-selection-");
+  const provider = new FlutterBuildProvider();
+  onTestFinished(() => provider.close());
+  await expectSelectionIssue(
+    provider,
+    join(root, "absent.apk"),
+    "Selected APK does not exist",
+  );
+  await expectSelectionIssue(
+    provider,
+    root,
+    "Selected APK is not a regular file",
+  );
+});
+
+// Windows listens on named pipes rather than filesystem sockets.
+it.skipIf(process.platform === "win32")(
+  "names an unopenable Unix socket APK selection as a non-file",
+  async () => {
+    const root = await createTestTempDirectory("rea-flutter-socket-");
+    const socketPath = join(root, "s.sock");
+    const socket = createServer();
+    await new Promise<void>((resolve) => socket.listen(socketPath, resolve));
+    onTestFinished(
+      () => new Promise<void>((resolve) => socket.close(() => resolve())),
+    );
+    const provider = new FlutterBuildProvider();
+    onTestFinished(() => provider.close());
+    await expectSelectionIssue(
+      provider,
+      socketPath,
+      "Selected APK is not a regular file",
+    );
   },
 );
 

@@ -10,13 +10,18 @@ import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
 import {
   delayWithCancellation,
-  numberValue,
+  resourceContentSize,
   recordValue,
-  recordsValue,
   requiredRecord,
   cdpStringValue,
 } from "./CdpCaptureValues.js";
-import { walkFrameTrees } from "./CdpCaptureDocuments.js";
+import {
+  frameTreeResources,
+  snapshotDocuments,
+  walkFrameTrees,
+} from "./CdpCaptureDocuments.js";
+import { snapshotDocumentNodes, snapshotNodeAt } from "./CdpSnapshotNodes.js";
+import { cdpSnapshotString } from "./CdpSnapshotStrings.js";
 import {
   ingestElectronScriptEvent,
   type ElectronScriptDraft,
@@ -188,7 +193,6 @@ const captureElectronContent = async (
     ...(context.signal === undefined ? {} : { signal: context.signal }),
     request: context.input,
     scripts: state.scripts,
-    executionContextFrames: state.executionContextFrames,
     frameIds,
     completeness: state.completeness,
   });
@@ -232,7 +236,7 @@ const navigatedFrameId = (event: CdpEvent): string | undefined => {
   return undefined;
 };
 
-const captureFrames = async (
+export const captureFrames = async (
   result: unknown,
   completeness: CdpCaptureCompleteness,
 ): Promise<ElectronPageInspection["frames"]> => {
@@ -245,8 +249,12 @@ const captureFrames = async (
   )) {
     const frame = recordValue(tree.frame);
     const frameId = cdpStringValue(frame?.id);
-    const path = await authorizedElectronFile(cdpStringValue(frame?.url) ?? "");
-    if (frameId === undefined || path === undefined) {
+    if (frame === undefined || frameId === undefined) {
+      completeness.exclude("frames", "invalid_protocol_value");
+      continue;
+    }
+    const path = await authorizedElectronFile(cdpStringValue(frame.url) ?? "");
+    if (path === undefined) {
       completeness.exclude("frames", "out_of_target_scope");
       continue;
     }
@@ -272,38 +280,34 @@ const captureResources = async (
   const root = recordValue(requiredRecord(result).frameTree);
   if (root === undefined)
     throw new BrowserObservationError("inspect_web_page", "protocol_error");
-  const pending = [root];
   const resources: ElectronPageInspection["resources"] = [];
   const seen = new Set<string>();
-  while (pending.length > 0) {
-    const tree = pending.shift();
-    if (tree === undefined) break;
-    for (const resource of recordsValue(tree.resources)) {
-      const path = await authorizedElectronFile(
-        cdpStringValue(resource.url) ?? "",
-      );
-      if (path === undefined) {
-        completeness.exclude("resources", "out_of_target_scope");
-        continue;
-      }
-      const item = {
-        file_path: path,
-        type: cdpStringValue(resource.type) ?? "Other",
-        mime_type: cdpStringValue(resource.mimeType) ?? "",
-        content_size:
-          numberValue(resource.contentSize) === undefined
-            ? null
-            : Math.max(0, numberValue(resource.contentSize) ?? 0),
-      };
-      const resourceKey = `electron_resource_${digestCanonicalValue(item, "CDP capture")}`;
-      if (seen.has(resourceKey)) continue;
-      seen.add(resourceKey);
-      resources.push({
-        resource_key: resourceKey,
-        ...item,
-      });
+  for (const resource of frameTreeResources(root, (count) =>
+    completeness.exclude("resources", "invalid_protocol_value", count),
+  )) {
+    const path = await authorizedElectronFile(
+      cdpStringValue(resource.url) ?? "",
+    );
+    if (path === undefined) {
+      completeness.exclude("resources", "out_of_target_scope");
+      continue;
     }
-    pending.push(...recordsValue(tree.childFrames));
+    const contentSize = resourceContentSize(resource.contentSize);
+    if (!contentSize.ok)
+      completeness.exclude("resources", "invalid_protocol_value");
+    const item = {
+      file_path: path,
+      type: cdpStringValue(resource.type) ?? "Other",
+      mime_type: cdpStringValue(resource.mimeType) ?? "",
+      content_size: contentSize.ok ? contentSize.value : null,
+    };
+    const resourceKey = `electron_resource_${digestCanonicalValue(item, "CDP capture")}`;
+    if (seen.has(resourceKey)) continue;
+    seen.add(resourceKey);
+    resources.push({
+      resource_key: resourceKey,
+      ...item,
+    });
   }
   return resources.sort((left, right) =>
     compareUnicodeCodePoints(left.resource_key, right.resource_key),
@@ -322,39 +326,50 @@ const captureDom = async (
       context.signal,
     ),
   );
-  const strings = Array.isArray(result.strings)
-    ? result.strings.map((value) => (typeof value === "string" ? value : ""))
-    : [];
+  const invalid = (count: number | null) =>
+    completeness.exclude("dom", "invalid_protocol_value", count);
+  if (!Array.isArray(result.strings)) {
+    invalid(null);
+    return { total_nodes: 0, nodes: [] };
+  }
+  const strings = result.strings.map(cdpStringValue);
   const nodes: ElectronPageInspection["dom"]["nodes"] = [];
   let total = 0;
-  for (const document of recordsValue(result.documents)) {
-    const documentUrl = stringAt(strings, document.documentURL);
+  for (const document of snapshotDocuments(result.documents, invalid)) {
+    const documentUrl = cdpSnapshotString(strings, document.documentURL);
+    if (documentUrl === undefined) {
+      invalid(1);
+      continue;
+    }
     if ((await authorizedElectronFile(documentUrl)) === undefined) {
       completeness.exclude("dom", "out_of_target_scope");
       continue;
     }
-    const nodeData = recordValue(document.nodes);
-    const nodeTypes = arrayValue(nodeData?.nodeType);
-    const nodeNames = arrayValue(nodeData?.nodeName);
-    const nodeValues = arrayValue(nodeData?.nodeValue);
-    const parents = arrayValue(nodeData?.parentIndex);
-    const attributes = arrayValue(nodeData?.attributes);
-    const baseIndex = nodes.length;
-    total += nodeTypes.length;
-    for (let index = 0; index < nodeTypes.length; index += 1) {
-      const attributeIndexes = arrayValue(attributes[index]);
-      const parent = integer(parents[index], -1);
+    // The shared snapshot owner validates the parallel node arrays.
+    const documentNodes = snapshotDocumentNodes(document.nodes, strings);
+    if (documentNodes === undefined) {
+      invalid(1);
+      continue;
+    }
+    if (documentNodes.excessAttributes > 0)
+      invalid(documentNodes.excessAttributes);
+    const baseIndex = total;
+    total += documentNodes.nodeTypes.length;
+    for (let index = 0; index < documentNodes.nodeTypes.length; index += 1) {
+      const admitted = snapshotNodeAt(documentNodes, index);
+      if (!admitted.ok) {
+        invalid(1);
+        continue;
+      }
+      const { nodeType, nodeName, nodeValue, parent, attributes } =
+        admitted.value;
       nodes.push({
-        index: nodes.length,
+        index: baseIndex + index,
         parent_index: parent < 0 ? -1 : baseIndex + parent,
-        node_type: integer(nodeTypes[index], 0),
-        node_name: stringAt(strings, nodeNames[index]),
-        node_value_length: Buffer.byteLength(
-          stringAt(strings, nodeValues[index]),
-        ),
-        attribute_names: attributeIndexes
-          .filter((_value, attributeIndex) => attributeIndex % 2 === 0)
-          .map((value) => stringAt(strings, value)),
+        node_type: nodeType,
+        node_name: nodeName,
+        node_value_length: Buffer.byteLength(nodeValue),
+        attribute_names: attributes.map(([name]) => name),
       });
     }
   }
@@ -365,17 +380,6 @@ const mainFilePath = async (result: unknown): Promise<string | undefined> => {
   const frameTree = recordValue(requiredRecord(result).frameTree);
   const frame = recordValue(frameTree?.frame);
   return await authorizedElectronFile(cdpStringValue(frame?.url) ?? "");
-};
-
-const arrayValue = (value: unknown): readonly unknown[] =>
-  Array.isArray(value) ? value : [];
-
-const stringAt = (strings: readonly string[], value: unknown): string =>
-  strings[integer(value, -1)] ?? "";
-
-const integer = (value: unknown, fallback: number): number => {
-  const number = numberValue(value);
-  return number === undefined ? fallback : Math.trunc(number);
 };
 
 const report = async (

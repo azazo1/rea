@@ -3,7 +3,7 @@ import { z } from "zod";
 import { browserCompletenessSchema } from "./browserCompleteness.js";
 import {
   browserAllowedOriginsSchema,
-  browserEndpointSchema,
+  browserObservationEndpointSchema,
 } from "./browserObservation.js";
 import { browserVersionSchema } from "./browserObservationSchemas.js";
 import { jsonValueSchema } from "./jsonValue.js";
@@ -11,7 +11,7 @@ import { digestSchema, prefixedDigestSchema } from "./../domain/digests.js";
 
 /** Input for passive discovery of page-registered WebMCP tools. */
 export const discoverWebMcpToolsInputSchema = z.strictObject({
-  cdp_endpoint: browserEndpointSchema,
+  cdp_endpoint: browserObservationEndpointSchema,
   allowed_origins: browserAllowedOriginsSchema,
   target_id: z.string().trim().min(1),
   observation_ms: z.number().int().min(0).default(100),
@@ -33,6 +33,9 @@ const webMcpToolSchema = z.object({
   annotations: z.object({
     read_only: z.boolean().nullable(),
     untrusted_content: z.boolean().nullable(),
+    // Absent when this annotation was not recorded or its protocol value was invalid; null
+    // distinguishes a declaration that omitted it from a declared false.
+    consequential: z.boolean().nullable().optional(),
     autosubmit: z.boolean().nullable(),
   }),
   registration_source: z

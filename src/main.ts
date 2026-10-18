@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { snapshotEnvironment } from "./process/snapshotEnvironment.js";
+import { CURRENT_ENTRYPOINT_PATH } from "./process/CurrentEntrypointPath.js";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
 
@@ -20,6 +21,7 @@ import {
 } from "./composition/optionalObservationProviders.js";
 import { createToolResultDelivery } from "./server/toolResult.js";
 import { createShutdown } from "./main/shutdown.js";
+import { registerProcessShutdown } from "./main/processShutdown.js";
 
 const runtimeDependencies = (): RuntimeDependencies => ({
   env: process.env,
@@ -28,18 +30,7 @@ const runtimeDependencies = (): RuntimeDependencies => ({
   setExitCode: (code) => {
     process.exitCode = code;
   },
-  registerShutdown: (handler) => {
-    process.once("SIGINT", handler);
-    process.once("SIGTERM", handler);
-    process.stdin.once("end", handler);
-    process.stdin.once("close", handler);
-    return () => {
-      process.off("SIGINT", handler);
-      process.off("SIGTERM", handler);
-      process.stdin.off("end", handler);
-      process.stdin.off("close", handler);
-    };
-  },
+  registerShutdown: registerProcessShutdown,
 });
 
 /**
@@ -109,10 +100,19 @@ export const runEntrypoint = async (
   }
 };
 
-const entryPath = process.argv[1];
-if (
-  entryPath !== undefined &&
-  pathToFileURL(realpathSync(entryPath)).href === import.meta.url
-) {
+/** Return false when the runtime's argv path is synthetic or no longer exists. */
+const isDirectEntrypoint = (
+  entryPath: string | undefined,
+  moduleUrl: string,
+): boolean => {
+  if (entryPath === undefined) return false;
+  try {
+    return pathToFileURL(realpathSync(entryPath)).href === moduleUrl;
+  } catch {
+    return false;
+  }
+};
+
+if (isDirectEntrypoint(CURRENT_ENTRYPOINT_PATH, import.meta.url)) {
   void runEntrypoint();
 }

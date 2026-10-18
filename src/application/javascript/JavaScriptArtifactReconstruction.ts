@@ -20,6 +20,10 @@ import type { ArtifactInventorySnapshot } from "../../domain/artifactInventorySn
 import type { ArtifactInventoryPartialObservation } from "../../domain/artifactPartialObservation.js";
 import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import { analyzeAndAdoptJavaScriptArtifactFiles } from "./JavaScriptArtifactAnalysis.js";
+import {
+  isSkippedJavaScriptAnalysis,
+  javascriptArtifactAnalysisScopes,
+} from "./JavaScriptArtifactAnalysisTypes.js";
 import { createJavaScriptSourceAnalysis } from "../../artifacts/javascript/JavaScriptSourceAnalysis.js";
 import { JAVASCRIPT_ANALYSIS_RESOURCE_DEFAULTS } from "../../domain/javascript/javascriptAnalysisResourceControls.js";
 import { createOwnedJavaScriptApplicationEvidenceCooperatively } from "./JavaScriptApplicationEvidence.js";
@@ -56,6 +60,7 @@ export interface JavaScriptArtifactReconstructionResult {
     readonly text_bytes_read: number;
     readonly invalid_utf8_files: number;
     readonly parsed_javascript_files: number;
+    readonly skipped_javascript_files: number;
     readonly visited_ast_nodes: number;
     readonly findings: number;
     readonly modules: number;
@@ -137,9 +142,15 @@ export const reconstructJavaScriptArtifact = async (
         );
       await reportPhase(
         "parse_javascript_sources",
-        `Parsing and projecting ${String(files.files.length - (files.source_selection?.unselected_files ?? 0))} selected application source files`,
+        `Processing ${String(files.files.length - (files.source_selection?.unselected_files ?? 0))} selected application files`,
       );
       const semanticProjection = createJavaScriptSemanticGraphProjection({
+        ...(input.max_semantic_unknowns === undefined
+          ? {}
+          : { totalUnknowns: input.max_semantic_unknowns }),
+        ...(input.max_semantic_unknowns_per_file === undefined
+          ? {}
+          : { fileUnknowns: input.max_semantic_unknowns_per_file }),
         ...(input.max_semantic_nodes === undefined
           ? {}
           : { totalNodes: input.max_semantic_nodes }),
@@ -168,11 +179,16 @@ export const reconstructJavaScriptArtifact = async (
           semanticProjection,
           async (file, completed, total) => {
             abortIfNeeded(signal);
+            const ast =
+              javascriptArtifactAnalysisScopes[file.kind]?.authority ===
+              "ast-static-analysis";
             await progress?.report({
-              phase: "parse_javascript_source",
+              phase: ast
+                ? "parse_javascript_source"
+                : "process_javascript_artifact_metadata",
               completed: 0,
               total: 1,
-              message: `Parsing and projecting ${file.path} (${String(completed + 1)}/${String(total)})`,
+              message: `${ast ? "Parsing and projecting" : "Processing metadata for"} ${file.path} (${String(completed + 1)}/${String(total)})`,
             });
             abortIfNeeded(signal);
           },
@@ -252,14 +268,25 @@ export const reconstructJavaScriptArtifact = async (
           : { source_selection: files.source_selection }),
         graph,
         semantic_graph: semanticGraph,
-        electron_summary: summarizeElectronBoundaries(analysis),
+        electron_summary: summarizeElectronBoundaries(
+          analysis,
+          new Set(
+            snapshot.occurrences
+              .filter(({ entry_kind }) => entry_kind === "directory")
+              .map(({ logical_path }) => logical_path),
+          ),
+        ),
         statistics: {
-          relevant_files: files.files.length,
+          relevant_files:
+            files.files.length + files.unavailable_relevant_files.length,
           nested_asar_containers: files.containers.length,
           text_bytes_read: files.text_bytes_read,
           invalid_utf8_files: files.invalid_utf8_files,
           parsed_javascript_files: analysis.files.filter(
             ({ javascript }) => javascript !== null,
+          ).length,
+          skipped_javascript_files: analysis.files.filter(
+            isSkippedJavaScriptAnalysis,
           ).length,
           visited_ast_nodes: analysis.visited_ast_nodes,
           findings: analysis.findings,
@@ -277,15 +304,9 @@ export const reconstructJavaScriptArtifact = async (
             limitations: completed.graph.limitations,
           }),
         );
-        const { max_heap_mb, analysis_timeout_ms, ...coreInput } = input;
-        const parameters = {
-          ...coreInput,
-          ...(max_heap_mb === undefined ? {} : { max_heap_mb }),
-          ...(analysis_timeout_ms === undefined ? {} : { analysis_timeout_ms }),
-        };
         const evidence =
           await createOwnedJavaScriptApplicationEvidenceCooperatively(
-            parameters,
+            input,
             partial,
           );
         throw interruption.retainPartialObservation(evidence);

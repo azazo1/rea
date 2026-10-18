@@ -8,7 +8,24 @@ import type { JsonValue } from "../domain/jsonValue.js";
 import { javascriptApplicationAnalysisResultSchema } from "../domain/javascript/javascriptApplicationAnalysis.js";
 import type { ApplicationNode } from "../domain/javascript/javascriptApplicationGraphSchemas.js";
 import { javaScriptExportShapeComparisonResultSchema } from "../domain/javascript/javascriptExportShapeComparisonSchemas.js";
-import type { FixtureClaimExpectation } from "./KnownAnswerEvaluation.js";
+import {
+  applicationFeatureTraceResultSchema,
+  featureSeedMatchMode,
+} from "../domain/javascript/javascriptFeatureTraceSchemas.js";
+import { javaScriptSemanticTraceResultSchema } from "../domain/javascript/javascriptSemanticTraceSchemas.js";
+import {
+  managedArtifactInspectionSchema,
+  managedMemberInspectionSchema,
+} from "../domain/managed/managedArtifact.js";
+import {
+  managedTokenScopesMatch,
+  parseManagedInspectionEvidence,
+} from "../domain/managed/managedInspectionEvidence.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+import type {
+  FixtureClaimContext,
+  FixtureClaimExpectation,
+} from "./KnownAnswerEvaluation.js";
 
 /** Source-owned artifact paths used by the configured known-answer benchmarks. */
 export interface AgentEvaluationFixtureTargets {
@@ -16,6 +33,10 @@ export interface AgentEvaluationFixtureTargets {
   readonly javascriptSha256: string;
   readonly javascriptShapeLeft: string;
   readonly javascriptShapeRight: string;
+  readonly notesElectron: string;
+  readonly notesElectronSha256: string;
+  readonly managed?: string;
+  readonly managedSha256?: string;
 }
 
 const desktopFixtureFiles = {
@@ -36,6 +57,8 @@ export const createAgentEvaluationFixtures = async (
   const javascript = join(root, "desktop-app.asar");
   const javascriptShapeLeft = join(root, "parser-v1");
   const javascriptShapeRight = join(root, "parser-v2");
+  const notesDirectory = join(root, "notes-electron");
+  const notesElectron = join(root, "notes-electron.asar");
   await Promise.all([
     mkdir(join(desktop, "renderer"), { recursive: true }),
     mkdir(javascriptShapeLeft, { recursive: true }),
@@ -53,8 +76,14 @@ export const createAgentEvaluationFixtures = async (
       join(repositoryRoot, "tests/fixtures/replay/parser-v2.mjs"),
       join(javascriptShapeRight, "parser.mjs"),
     ),
+    cp(
+      join(repositoryRoot, "website/public/examples/notes-electron"),
+      notesDirectory,
+      { recursive: true },
+    ),
   ]);
   await createPackage(desktop, javascript);
+  await createPackage(notesDirectory, notesElectron);
   return {
     javascript,
     javascriptSha256: createHash("sha256")
@@ -62,6 +91,10 @@ export const createAgentEvaluationFixtures = async (
       .digest("hex"),
     javascriptShapeLeft,
     javascriptShapeRight,
+    notesElectron,
+    notesElectronSha256: createHash("sha256")
+      .update(await readFile(notesElectron))
+      .digest("hex"),
   };
 };
 
@@ -175,21 +208,116 @@ const runtimeSemantics = (value: JsonValue): JsonValue | undefined => {
     : undefined;
 };
 
-const asarClaims = (
+const featureModules = (value: JsonValue): JsonValue | undefined => {
+  const result = applicationFeatureTraceResultSchema.safeParse(value);
+  if (!result.success || result.data.graph === null) return undefined;
+  if (
+    result.data.seed.kind !== "channel" ||
+    result.data.seed.value !== "notes:export" ||
+    featureSeedMatchMode(result.data.seed) !== "exact"
+  )
+    return undefined;
+  const paths = result.data.graph.nodes
+    .filter((node) => node.kind === "javascript-module")
+    .flatMap((node) => node.observations)
+    .filter(({ properties }) => properties.semantic_role === "source-module")
+    .map(({ properties }) => properties.path);
+  if (paths.length === 0 || !paths.every((path) => typeof path === "string"))
+    return undefined;
+  return {
+    paths: [...new Set(paths)].sort(compareUnicodeCodePoints),
+    coverage: result.data.coverage.status,
+  };
+};
+
+const semanticBoundary = (value: JsonValue): JsonValue | undefined => {
+  const result = javaScriptSemanticTraceResultSchema.safeParse(value);
+  if (!result.success) return undefined;
+  return {
+    status: result.data.status,
+    coverage: result.data.coverage.status,
+    relevant_unknowns: result.data.summary.relevant_unknowns,
+  };
+};
+
+const notesClaims = (
   targets: AgentEvaluationFixtureTargets,
+): readonly FixtureClaimExpectation[] => {
+  const subject = {
+    path: targets.notesElectron,
+    sha256: targets.notesElectronSha256,
+  };
+  const derived = {
+    authority: "analyst-inference",
+    confidence: "inferred",
+    linkedSubjects: [
+      { operation: "analyze_javascript_application", ...subject },
+    ],
+  } satisfies Pick<
+    FixtureClaimExpectation["source"],
+    "authority" | "confidence" | "linkedSubjects"
+  >;
+  // Fixture source establishes bridge/module facts; the semantic claim checks
+  // the bounded static-query contract, not execution or CSV formatter behavior.
+  return [
+    ...bridgeClaims(subject, "notes", ["exportCsv"], "notes:export"),
+    {
+      id: "feature_modules",
+      expectedValue: {
+        paths: ["csv.js", "main.js", "preload.js", "renderer.js"],
+        coverage: "complete-within-source",
+      },
+      source: {
+        ...derived,
+        operation: "trace_application_feature",
+        parameters: {
+          direction: "both",
+        },
+        select: featureModules,
+      },
+    },
+    {
+      id: "semantic_boundary",
+      expectedValue: {
+        status: "ambiguous",
+        coverage: "partial",
+        relevant_unknowns: 1,
+      },
+      source: {
+        ...derived,
+        operation: "trace_javascript_semantics",
+        parameters: {
+          query: {
+            seed: { kind: "property", name: "invoke" },
+            direction: "forward-influence",
+            include_ambiguous_dynamic_edges: false,
+            expected: null,
+          },
+        },
+        select: semanticBoundary,
+      },
+    },
+  ];
+};
+
+const bridgeClaims = (
+  subject: { readonly path: string; readonly sha256: string },
+  key: string,
+  members: readonly string[],
+  channel: string,
 ): readonly FixtureClaimExpectation[] => {
   const source = {
     operation: "analyze_javascript_application",
     authority: "shipped-artifact",
     confidence: "derived",
-    subject: { path: targets.javascript, sha256: targets.javascriptSha256 },
+    subject,
   } satisfies Omit<FixtureClaimExpectation["source"], "select">;
   return [
     {
       id: "renderer_api",
       expectedValue: {
-        key: "profileApi",
-        members: ["read"],
+        key,
+        members: [...members],
         world: "main",
         source: "preload.js",
       },
@@ -198,7 +326,7 @@ const asarClaims = (
     {
       id: "renderer_ipc",
       expectedValue: {
-        channel: "profile:read",
+        channel,
         operation: "invoke",
         source: "preload.js",
       },
@@ -207,7 +335,7 @@ const asarClaims = (
     {
       id: "main_ipc",
       expectedValue: {
-        channel: "profile:read",
+        channel,
         operation: "handle",
         source: "main.js",
       },
@@ -220,6 +348,16 @@ const asarClaims = (
     },
   ];
 };
+
+const asarClaims = (
+  targets: AgentEvaluationFixtureTargets,
+): readonly FixtureClaimExpectation[] =>
+  bridgeClaims(
+    { path: targets.javascript, sha256: targets.javascriptSha256 },
+    "profileApi",
+    ["read"],
+    "profile:read",
+  );
 
 const parserClaims = (
   targets: AgentEvaluationFixtureTargets,
@@ -277,27 +415,140 @@ const parserClaims = (
   ];
 };
 
+const managedMembers = ({ evidence }: FixtureClaimContext) => {
+  const { result } = parseManagedInspectionEvidence(
+    evidence,
+    "inspect_managed_members",
+    managedMemberInspectionSchema,
+  );
+  if (
+    result.coverage.state !== "complete" ||
+    result.metadata.status !== "complete" ||
+    !managedTokenScopesMatch(
+      result.identity_scope.requires_mvid,
+      result.module?.mvid ?? null,
+    )
+  )
+    return undefined;
+  return result;
+};
+
+const managedClaims = (
+  targets: AgentEvaluationFixtureTargets,
+): readonly FixtureClaimExpectation[] => {
+  if (targets.managed === undefined || targets.managedSha256 === undefined)
+    throw new TypeError(
+      "Managed fixture grading requires the built DLL path and SHA-256",
+    );
+  const source = {
+    operation: "inspect_managed_members",
+    authority: "shipped-artifact",
+    confidence: "observed",
+    subject: { path: targets.managed, sha256: targets.managedSha256 },
+  } satisfies Omit<FixtureClaimExpectation["source"], "select">;
+  return [
+    {
+      id: "public_types",
+      expectedValue: ["AgentEval.Profile", "AgentEval.Program"],
+      source: {
+        ...source,
+        select: (_value, context) => {
+          const members = managedMembers(context);
+          if (
+            members === undefined ||
+            members.selection !== null ||
+            Object.hasOwn(context.evidence.parameters, "type_names")
+          )
+            return undefined;
+          return members.types
+            .filter((type) => (type.flags & 7) === 1)
+            .map((type) => type.full_name)
+            .sort(compareUnicodeCodePoints);
+        },
+      },
+    },
+    {
+      id: "entry_point",
+      expectedValue: { declaring_type: "AgentEval.Program", name: "Main" },
+      source: {
+        ...source,
+        select: (_value, context) => {
+          const members = managedMembers(context);
+          if (members === undefined) return undefined;
+          const artifacts = context.deliveredEvidence.filter(
+            (evidence) =>
+              evidence.operation === "inspect_managed_artifact" &&
+              evidence.authority === source.authority &&
+              evidence.confidence === source.confidence &&
+              evidence.subject?.local_path === source.subject.path &&
+              evidence.subject.digest.sha256 === source.subject.sha256,
+          );
+          if (artifacts.length !== 1) return undefined;
+          const { result: artifact } = parseManagedInspectionEvidence(
+            artifacts[0],
+            "inspect_managed_artifact",
+            managedArtifactInspectionSchema,
+          );
+          if (
+            artifact.coverage.state !== "complete" ||
+            artifact.metadata.status !== "complete" ||
+            !managedTokenScopesMatch(
+              artifact.module?.mvid ?? null,
+              members.module?.mvid ?? null,
+            ) ||
+            artifact.pe.cli?.entry_point.kind !== "metadata-token"
+          )
+            return undefined;
+          const methods = members.methods.filter(
+            (method) => method.token === artifact.pe.cli?.entry_point.value,
+          );
+          const method = methods.length === 1 ? methods[0] : undefined;
+          return method === undefined
+            ? undefined
+            : {
+                declaring_type: method.declaring_type,
+                name: method.name,
+              };
+        },
+      },
+    },
+  ];
+};
+
 /** Return the closed known-answer rubric, or undefined for routing-only scenarios. */
 export const agentFixtureClaims = (
   scenarioId: string,
   targets: AgentEvaluationFixtureTargets,
 ): readonly FixtureClaimExpectation[] | undefined => {
   if (scenarioId === "asar") return asarClaims(targets);
+  if (scenarioId === "managed") return managedClaims(targets);
   if (scenarioId === "javascript-export-shape") return parserClaims(targets);
+  if (scenarioId === "notes-export") return notesClaims(targets);
   return undefined;
 };
 
+const bridgeAnswerDescriptions = [
+  'renderer_api: {"key": string, "members": string[], "world": string, "source": string}, describing the exposed bridge API, its members, world, and source file.',
+  'renderer_ipc: {"channel": string, "operation": string, "source": string}, describing the renderer-side IPC operation and its source file.',
+  'main_ipc: {"channel": string, "operation": string, "source": string}, describing the main-side IPC operation and its source file.',
+  'preload: {"path": string, "resolution_status": string}, describing the BrowserWindow-declared preload resolved within the shipped artifact.',
+];
+
 const answerValueDescriptions: Readonly<Record<string, readonly string[]>> = {
-  asar: [
-    'renderer_api: {"key": string, "members": string[], "world": string, "source": string}, describing the exposed bridge API, its members, world, and source file.',
-    'renderer_ipc: {"channel": string, "operation": string, "source": string}, describing the renderer-side IPC operation and its source file.',
-    'main_ipc: {"channel": string, "operation": string, "source": string}, describing the main-side IPC operation and its source file.',
-    'preload: {"path": string, "resolution_status": string}, describing the BrowserWindow-declared preload resolved within the shipped artifact.',
+  managed: [
+    "public_types: string[], listing the exact public top-level type full names in Unicode code-point order from unfiltered member Evidence (omit type_names).",
+    'entry_point: {"declaring_type": string, "name": string}, resolving the CLI metadata entry-point token against the member inventory from the same artifact SHA-256 and module MVID. Cite member Evidence; both artifact and member Evidence must be delivered.',
   ],
+  asar: bridgeAnswerDescriptions,
   "javascript-export-shape": [
     'heading_change: {"status": string, "path": string, "discriminant": object or null, "left": object, "right": object}, copying the exact heading-change fields from the comparison result.',
     'comparison_coverage: {"status": string, "paired_variants": number, "added": number, "removed": number, "changed": number, "unknown": number}, copying comparison coverage and summary counts.',
     'runtime_semantics: "established" or "not_established", stating whether the cited comparison establishes runtime behavior.',
+  ],
+  "notes-export": [
+    ...bridgeAnswerDescriptions,
+    'feature_modules: {"paths": string[], "coverage": string}, listing the unique source-module observation paths in the feature trace in Unicode code-point order, and its coverage status.',
+    'semantic_boundary: {"status": string, "coverage": string, "relevant_unknowns": number}, copying the semantic trace status, coverage status, and summary.relevant_unknowns. Static traces do not establish runtime execution.',
   ],
 };
 

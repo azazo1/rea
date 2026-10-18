@@ -1,5 +1,8 @@
 import { digestCanonicalValue } from "./canonicalDigest.js";
-import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "./unicodeCodePointOrder.js";
 import type { WebPageInspection } from "./browserObservationSchemas.js";
 import {
   webCaptureDiffSchema,
@@ -9,6 +12,7 @@ import {
   type WebCaptureDimension,
 } from "./webCaptureDiffSchemas.js";
 import type { WebMcpDiscovery } from "./webMcpDiscovery.js";
+import { fingerprintWebCaptureFrames } from "./webCaptureFrameComparison.js";
 
 type Dimension = WebCaptureDimension;
 type Change = WebCaptureChange;
@@ -70,9 +74,15 @@ const compareDimension = (
   after: ReadonlyMap<string, string>,
   complete: boolean,
   reason: string,
+  inventoryComplete: boolean | ((identity: string) => boolean) = complete,
 ): Dimension => {
+  // Membership evidence can be complete even when selected content is unknown.
   const all = compareIdentities(before, after).filter(
-    ({ change }) => complete || change === "modified",
+    ({ identity, change }) =>
+      change === "modified" ||
+      (typeof inventoryComplete === "boolean"
+        ? inventoryComplete
+        : inventoryComplete(identity)),
   );
   if (all.length > 0)
     return {
@@ -104,29 +114,30 @@ const accessibilityDimension = (
   const afterAccess = accessibilityComparable(after);
   const textComparable = beforeAccess.text && afterAccess.text;
   const nodesComparable = beforeAccess.nodes && afterAccess.nodes;
+  const reason =
+    "Accessibility tree or text capture was incomplete in at least one observation.";
+  if (!nodesComparable)
+    return {
+      status: "unknown",
+      total_changes: 0,
+      changes: [],
+      reason,
+    };
   return compareDimension(
     singleton(
       "accessibility_tree",
       digestCanonicalValue(
-        accessibilityProjection(
-          before.accessibility,
-          textComparable,
-          nodesComparable,
-        ),
+        accessibilityProjection(before.accessibility, textComparable),
       ),
     ),
     singleton(
       "accessibility_tree",
       digestCanonicalValue(
-        accessibilityProjection(
-          after.accessibility,
-          textComparable,
-          nodesComparable,
-        ),
+        accessibilityProjection(after.accessibility, textComparable),
       ),
     ),
     beforeAccess.complete && afterAccess.complete,
-    "Accessibility tree or text capture was incomplete in at least one observation.",
+    reason,
   );
 };
 
@@ -160,6 +171,7 @@ const storageDimension = (
     ),
     storageComparable(before, after, keysComplete, usageComplete),
     "Storage fingerprints, inventories, usage, or quota were unavailable or truncated in at least one observation.",
+    keysComplete,
   );
 };
 
@@ -169,13 +181,7 @@ const compareWebCaptureDimensions = (
   const before = input.before.inspection;
   const after = input.after.inspection;
   return {
-    dom_structure: compareDimension(
-      singleton("document", digestCanonicalValue(domProjection(before))),
-      singleton("document", digestCanonicalValue(domProjection(after))),
-      sectionsComplete(before, ["frames", "dom"]) &&
-        sectionsComplete(after, ["frames", "dom"]),
-      "DOM or frame capture was incomplete in at least one observation.",
-    ),
+    dom_structure: domDimension(before, after),
     scripts: compareDimension(
       keyed(
         before.scripts.items.map(scriptProjection),
@@ -197,19 +203,15 @@ const compareWebCaptureDimensions = (
       "Resource inventory was incomplete in at least one observation.",
     ),
     network: networkDimension(before, after),
-    metadata: compareDimension(
-      singleton("metadata", digestCanonicalValue(metadataProjection(before))),
-      singleton("metadata", digestCanonicalValue(metadataProjection(after))),
+    metadata: compareAggregate(
+      "metadata",
+      metadataProjection(before),
+      metadataProjection(after),
       sectionsComplete(before, ["metadata"]) &&
         sectionsComplete(after, ["metadata"]),
       "Safe metadata capture was incomplete in at least one observation.",
     ),
-    webmcp: compareDimension(
-      webMcpMap(input.before.webmcp),
-      webMcpMap(input.after.webmcp),
-      webMcpComplete(input.before.webmcp) && webMcpComplete(input.after.webmcp),
-      "WebMCP discovery was unavailable or incomplete in at least one capture.",
-    ),
+    webmcp: webMcpDimension(input.before.webmcp, input.after.webmcp),
     accessibility: accessibilityDimension(before, after),
     storage: storageDimension(before, after),
   };
@@ -249,40 +251,145 @@ const networkIdentity = (
 ): string =>
   `net_${digestCanonicalValue({ method: request.method, url: request.url, resource_type: request.resource_type })}`;
 
+/** An unknown request type can match any observed type at the same method/URL. */
+const networkIdentityCoverage = (
+  before: WebPageInspection,
+  after: WebPageInspection,
+): {
+  readonly complete: boolean;
+  readonly ambiguousIdentities: ReadonlySet<string>;
+} => {
+  const complete = [before, after].every((inspection) =>
+    inspection.network.requests.every(
+      ({ resource_type }) => resource_type !== null,
+    ),
+  );
+  const ambiguousIdentities = new Set<string>();
+  if (complete) return { complete, ambiguousIdentities };
+  type Request = WebPageInspection["network"]["requests"][number];
+  const matchKey = (request: Request): string =>
+    JSON.stringify([request.method, request.url]);
+  const unknownTypes = (
+    inspection: WebPageInspection,
+  ): ReadonlyMap<string, boolean> => {
+    const groups = new Map<string, boolean>();
+    for (const request of inspection.network.requests) {
+      const key = matchKey(request);
+      groups.set(
+        key,
+        groups.get(key) === true || request.resource_type === null,
+      );
+    }
+    return groups;
+  };
+  const retainPotentialMatches = (
+    inspection: WebPageInspection,
+    peer: ReadonlyMap<string, boolean>,
+  ): void => {
+    for (const request of inspection.network.requests) {
+      const peerUnknown = peer.get(matchKey(request));
+      if (
+        peerUnknown === true ||
+        (peerUnknown === false && request.resource_type === null)
+      )
+        ambiguousIdentities.add(networkIdentity(request));
+    }
+  };
+  retainPotentialMatches(before, unknownTypes(after));
+  retainPotentialMatches(after, unknownTypes(before));
+  return { complete, ambiguousIdentities };
+};
+
 const networkResponseFields = [
   "status",
   "mime_type",
   "encoded_data_length",
 ] as const;
-type NetworkResponseField = (typeof networkResponseFields)[number];
+const redirectMetadataFields = [
+  ...networkResponseFields,
+  "resource_type",
+] as const;
+type NetworkMetadataField = (typeof redirectMetadataFields)[number];
 
-const sharedNetworkResponseFields = (
+/** Own both comparable fields and completeness instead of deriving it from set sizes. */
+const sharedNetworkMetadata = (
   before: WebPageInspection,
   after: WebPageInspection,
-): ReadonlyMap<string, ReadonlySet<NetworkResponseField>> => {
-  const shared = new Map<string, Set<NetworkResponseField>>();
+): {
+  readonly fields: ReadonlyMap<string, ReadonlySet<NetworkMetadataField>>;
+  readonly complete: boolean;
+} => {
+  const shared = new Map<string, Set<NetworkMetadataField>>();
+  let complete = true;
+  const retainKnownFields = (
+    identity: string,
+    metadata: Pick<
+      WebPageInspection["network"]["requests"][number],
+      NetworkMetadataField
+    >,
+    required: readonly NetworkMetadataField[],
+  ): void => {
+    const fields = shared.get(identity) ?? new Set(required);
+    for (const field of required)
+      if (metadata[field] === null) {
+        fields.delete(field);
+        complete = false;
+      }
+    shared.set(identity, fields);
+  };
   for (const inspection of [before, after])
     for (const request of inspection.network.requests) {
       const identity = networkIdentity(request);
-      const fields = shared.get(identity) ?? new Set(networkResponseFields);
-      for (const field of networkResponseFields)
-        if (request[field] === null) fields.delete(field);
-      shared.set(identity, fields);
+      retainKnownFields(identity, request, networkResponseFields);
+      for (const [index, redirect] of (request.redirects ?? []).entries())
+        retainKnownFields(
+          redirectNetworkIdentity(identity, index),
+          redirect,
+          redirectMetadataFields,
+        );
     }
-  return shared;
+  return { fields: shared, complete };
 };
+
+const redirectNetworkIdentity = (identity: string, index: number): string =>
+  compositeKey([identity, "redirect", index]);
+/** Section lists and per-kind dropped counts independently limit absence evidence. */
+const networkInventoryComplete = (
+  inspection: WebPageInspection,
+  sections: readonly (
+    | "network_requests"
+    | "websocket_connections"
+    | "websocket_frames"
+  )[],
+): boolean =>
+  sectionsComplete(inspection, sections) &&
+  sections.every(
+    (section) => inspection.completeness.dropped_events[section] === 0,
+  );
 
 const networkDimension = (
   before: WebPageInspection,
   after: WebPageInspection,
 ): Dimension => {
-  const responseFields = sharedNetworkResponseFields(before, after);
-  const responseFieldsComplete = [...responseFields.values()].every(
-    (fields) => fields.size === networkResponseFields.length,
+  const requestsComplete = [before, after].every((inspection) =>
+    networkInventoryComplete(inspection, ["network_requests"]),
   );
+  const webSocketInventoryComplete = [before, after].every((inspection) =>
+    networkInventoryComplete(inspection, [
+      "websocket_connections",
+      "websocket_frames",
+    ]),
+  );
+  const requestIdentities = networkIdentityCoverage(before, after);
+  const metadata = sharedNetworkMetadata(before, after);
   const selected = bodyShapesSelected(before) && bodyShapesSelected(after);
   const webSocketShapes =
     webSocketShapesSelected(before) && webSocketShapesSelected(after);
+  const projection = {
+    metadataFields: metadata.fields,
+    ambiguousIdentities: requestIdentities.ambiguousIdentities,
+    inventoryComplete: requestsComplete,
+  };
   const sources = new Map<string, BodyShapeSources>();
   if (selected) {
     const observedSources = (inspection: WebPageInspection) => {
@@ -342,74 +449,118 @@ const networkDimension = (
   );
   const compared = compareDimension(
     new Map([
-      ...networkMap(before, sources, responseFields),
-      ...webSocketMetadataMap(beforeWebSockets),
+      ...networkMap(before, sources, projection),
+      ...(webSocketInventoryComplete
+        ? webSocketMetadataMap(beforeWebSockets)
+        : []),
       ...beforeWebSocketPayload,
     ]),
     new Map([
-      ...networkMap(after, sources, responseFields),
-      ...webSocketMetadataMap(afterWebSockets),
+      ...networkMap(after, sources, projection),
+      ...(webSocketInventoryComplete
+        ? webSocketMetadataMap(afterWebSockets)
+        : []),
       ...afterWebSocketPayload,
     ]),
-    [before, after].every((inspection) =>
-      sectionsComplete(inspection, [
-        "network_requests",
-        "websocket_connections",
-        "websocket_frames",
-      ]),
-    ) &&
+    requestsComplete &&
+      requestIdentities.complete &&
+      webSocketInventoryComplete &&
       shapesComplete &&
       webSocketPayloadBytesComplete &&
       webSocketShapesComplete,
-    "Network capture or selected HTTP/WebSocket payload-shape coverage is attach-window limited, unavailable, or incomplete.",
+    requestIdentities.complete
+      ? "Network capture or selected HTTP/WebSocket payload-shape coverage is limited, unavailable, incomplete, or includes dropped network events."
+      : "HTTP request identity is incomplete because a resource type is unavailable; potentially matching type groups cannot establish membership/content changes or complete network equality.",
+    // HTTP and WebSocket identities have independent inventory coverage. Shape
+    // selection can prevent equality without erasing proven membership changes.
+    (identity) =>
+      identity.startsWith("net_")
+        ? requestsComplete
+        : identity.startsWith("ws_") && webSocketInventoryComplete,
   );
-  return compared.status === "unchanged" && !responseFieldsComplete
-    ? {
-        ...compared,
-        status: "unknown",
-        reason:
-          "HTTP response status, MIME type, or byte-count evidence is incomplete.",
-      }
-    : compared;
+  if (metadata.complete) return compared;
+  const responseEvidenceReason =
+    "HTTP response or redirect status, MIME type, byte count, or resource-type evidence is incomplete.";
+  if (compared.status === "changed") return compared;
+  return {
+    status: "unknown",
+    total_changes: 0,
+    changes: [],
+    reason:
+      compared.reason === null
+        ? responseEvidenceReason
+        : `${responseEvidenceReason} ${compared.reason}`,
+  };
 };
 
 const networkMap = (
   inspection: WebPageInspection,
   sources: ReadonlyMap<string, BodyShapeSources>,
-  responseFields: ReadonlyMap<string, ReadonlySet<NetworkResponseField>>,
+  projection: {
+    readonly metadataFields: ReadonlyMap<
+      string,
+      ReadonlySet<NetworkMetadataField>
+    >;
+    readonly ambiguousIdentities: ReadonlySet<string>;
+    readonly inventoryComplete: boolean;
+  },
 ): ReadonlyMap<string, string> => {
-  const grouped = new Map<string, unknown[]>();
+  const grouped = new Map<string, string[]>();
   for (const request of inspection.network.requests) {
     const identity = networkIdentity(request);
+    // A missing type can move repeated requests between these buckets. Neither
+    // their counts nor fingerprints establish a change to that typed group.
+    if (projection.ambiguousIdentities.has(identity)) continue;
     const shapes = sources.get(identity);
     const values = grouped.get(identity) ?? [];
     const response: Record<string, unknown> = {};
-    for (const field of responseFields.get(identity) ?? [])
+    for (const field of projection.metadataFields.get(identity) ?? [])
       response[field] = request[field];
-    values.push({
-      ...response,
-      redirects: (request.redirects ?? []).map(
-        ({
-          request_timestamp: _requestTimestamp,
-          redirect_event_timestamp: _redirectEventTimestamp,
-          ...redirect
-        }) => redirect,
-      ),
-      initiator: request.initiator,
-      ...(shapes?.request === true
-        ? { request_shape: request.body_shapes.request }
-        : {}),
-      ...(shapes?.response === true
-        ? { response_shape: request.body_shapes.response }
-        : {}),
-    });
+    values.push(
+      digestCanonicalValue({
+        ...response,
+        redirects: (request.redirects ?? []).map(
+          (
+            {
+              request_timestamp: _requestTimestamp,
+              redirect_event_timestamp: _redirectEventTimestamp,
+              ...redirect
+            },
+            index,
+          ) => {
+            const response: Partial<
+              Record<NetworkMetadataField, number | string>
+            > = {};
+            for (const field of projection.metadataFields.get(
+              redirectNetworkIdentity(identity, index),
+            ) ?? [])
+              if (redirect[field] !== null) response[field] = redirect[field];
+            return {
+              url: redirect.url,
+              response_url: redirect.response_url,
+              method: redirect.method,
+              ...response,
+            };
+          },
+        ),
+        initiator: request.initiator,
+        ...(shapes?.request === true
+          ? { request_shape: request.body_shapes.request }
+          : {}),
+        ...(shapes?.response === true
+          ? { response_shape: request.body_shapes.response }
+          : {}),
+      }),
+    );
     grouped.set(identity, values);
   }
   return new Map(
     [...grouped].map(([identity, values]) => [
       identity,
       digestCanonicalValue(
-        values.map((value) => digestCanonicalValue(value)).sort(),
+        // Repeated samples do not establish multiplicity across omissions;
+        // keep their known content without interpreting missing rows as change.
+        (projection.inventoryComplete ? values : [...new Set(values)]).sort(),
       ),
     ]),
   );
@@ -529,12 +680,51 @@ const webSocketPayloadMaps = (
   return [left, right];
 };
 
-const webMcpMap = (
-  discovery: WebMcpDiscovery | null,
-): ReadonlyMap<string, string> =>
-  discovery === null
-    ? new Map()
-    : keyed(discovery.tools.items, (tool) => tool.tool_key);
+const webMcpDimension = (
+  before: WebMcpDiscovery | null,
+  after: WebMcpDiscovery | null,
+): Dimension => {
+  const afterTools = new Map(
+    after?.tools.items.map((tool) => [tool.tool_key, tool]),
+  );
+  const unknownHints = new Set(
+    (before?.tools.items ?? [])
+      .filter((tool) => {
+        const other = afterTools.get(tool.tool_key);
+        return (
+          other !== undefined &&
+          (tool.annotations.consequential === undefined ||
+            other.annotations.consequential === undefined)
+        );
+      })
+      .map((tool) => tool.tool_key),
+  );
+  const project = (
+    discovery: WebMcpDiscovery | null,
+  ): ReadonlyMap<string, string> =>
+    keyed(
+      (discovery?.tools.items ?? []).map((tool) => {
+        if (!unknownHints.has(tool.tool_key)) return tool;
+        const { consequential: _unknown, ...annotations } = tool.annotations;
+        return { ...tool, annotations };
+      }),
+      (tool) => tool.tool_key,
+    );
+  const result = compareDimension(
+    project(before),
+    project(after),
+    webMcpComplete(before) && webMcpComplete(after),
+    "WebMCP discovery was unavailable or incomplete in at least one capture.",
+  );
+  return result.status === "unchanged" && unknownHints.size > 0
+    ? {
+        ...result,
+        status: "unknown",
+        reason:
+          "Consequential annotations were not recorded or were invalid in at least one capture.",
+      }
+    : result;
+};
 
 const webMcpComplete = (discovery: WebMcpDiscovery | null): boolean =>
   discovery !== null &&
@@ -562,17 +752,64 @@ const incompleteSections = (completeness: {
     ...completeness.unavailable_sections,
   ]);
 
-const domProjection = (inspection: WebPageInspection) => ({
-  frames: inspection.frames
-    .map(({ url, origin }) => ({ url, origin }))
-    .sort(
-      (left, right) =>
-        compareUnicodeCodePoints(left.url, right.url) ||
-        compareUnicodeCodePoints(left.origin ?? "", right.origin ?? "") ||
-        Number(left.origin !== null) - Number(right.origin !== null),
-    ),
-  nodes: inspection.dom.nodes.map(({ index: _index, ...node }) => node),
-});
+/** Whole-collection digest differences cannot prove a change across omissions. */
+const compareAggregate = (
+  identity: string,
+  before: unknown,
+  after: unknown,
+  complete: boolean,
+  reason: string,
+): Dimension =>
+  compareDimension(
+    complete ? singleton(identity, digestCanonicalValue(before)) : new Map(),
+    complete ? singleton(identity, digestCanonicalValue(after)) : new Map(),
+    complete,
+    reason,
+  );
+
+const domDimension = (
+  before: WebPageInspection,
+  after: WebPageInspection,
+): Dimension => {
+  const beforeFrames = fingerprintWebCaptureFrames(before.frames);
+  const afterFrames = fingerprintWebCaptureFrames(after.frames);
+  const nodesComplete = [before, after].every(
+    (inspection) =>
+      sectionsComplete(inspection, ["dom"]) &&
+      inspection.dom.total_nodes === inspection.dom.nodes.length,
+  );
+  const framesComplete =
+    beforeFrames !== null &&
+    afterFrames !== null &&
+    [before, after].every((inspection) =>
+      sectionsComplete(inspection, ["frames"]),
+    );
+  const changes: Change[] = [];
+  if (
+    nodesComplete &&
+    digestCanonicalValue(before.dom.nodes) !==
+      digestCanonicalValue(after.dom.nodes)
+  )
+    changes.push({ identity: "document", change: "modified" });
+  if (framesComplete && beforeFrames !== afterFrames)
+    changes.push({ identity: "frames", change: "modified" });
+  if (changes.length > 0)
+    return {
+      status: "changed",
+      total_changes: changes.length,
+      changes,
+      reason: null,
+    };
+  return nodesComplete && framesComplete
+    ? { status: "unchanged", total_changes: 0, changes: [], reason: null }
+    : {
+        status: "unknown",
+        total_changes: 0,
+        changes: [],
+        reason:
+          "DOM or frame capture was incomplete, or frame ancestry was unresolved in at least one observation.",
+      };
+};
 
 const scriptProjection = (
   script: WebPageInspection["scripts"]["items"][number],
@@ -614,20 +851,32 @@ const accessibilityComparable = (
   const text =
     inspection.accessibility.text_capture.status === "included" &&
     inspection.accessibility.text_capture.excluded_fields === 0;
+  const { completeness } = inspection;
+  const exclusions = completeness.excluded.filter(
+    ({ section }) => section === "accessibility",
+  );
+  const textOnlyPolicyFilter =
+    inspection.accessibility.text_capture.status === "not_approved" &&
+    exclusions.length > 0 &&
+    exclusions.every(({ reason }) => reason === "not_approved");
   const nodes =
+    [
+      completeness.truncated_sections,
+      completeness.unavailable_sections,
+      completeness.attach_limited_sections,
+    ].every((sections) => !sections.includes("accessibility")) &&
+    (!completeness.policy_filtered_sections.includes("accessibility") ||
+      textOnlyPolicyFilter) &&
     inspection.accessibility.total_nodes ===
-    inspection.accessibility.nodes.length;
-  const complete =
-    text && nodes && sectionsComplete(inspection, ["accessibility"]);
+      inspection.accessibility.nodes.length;
+  const complete = text && nodes;
   return { text, nodes, complete };
 };
 
 const accessibilityProjection = (
   accessibility: WebPageInspection["accessibility"],
   includeText: boolean,
-  includeNodes: boolean,
 ): unknown => {
-  if (!includeNodes) return { total_nodes: accessibility.total_nodes };
   const nodeIndexes = new Map(
     accessibility.nodes.map((node, index) => [node.node_id, index]),
   );
@@ -683,16 +932,17 @@ const storageMap = (
       }),
     ],
   ]);
-  if (!includeKeys) return map;
   const add = (kind: string, keys: readonly string[]) => {
     for (const key of keys) {
       map.set(`storage:${kind}:${key}`, digestCanonicalValue(key));
     }
   };
-  add("local_storage", storage.local_storage_keys);
-  add("session_storage", storage.session_storage_keys);
-  add("indexed_db", storage.indexed_db_names);
-  add("cache", storage.cache_names);
+  if (includeKeys) {
+    add("local_storage", storage.local_storage_keys);
+    add("session_storage", storage.session_storage_keys);
+    add("indexed_db", storage.indexed_db_names);
+    add("cache", storage.cache_names);
+  }
   for (const fingerprint of storage.content_fingerprints) {
     const identity = `${fingerprint.scope}:${fingerprint.identity_sha256}`;
     if (!fingerprintIdentities.has(identity)) continue;

@@ -16,24 +16,21 @@ export const functionMatch = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
 ): FunctionComparisonResult["function_match"] => {
-  if (
-    !isAutoName(left.dossier.procedure.name) &&
-    left.dossier.procedure.name === right.dossier.procedure.name
-  )
+  const leftName = left.dossier.procedure.name;
+  const rightName = right.dossier.procedure.name;
+  const stableNames = !isAutoName(leftName) && !isAutoName(rightName);
+  if (stableNames && leftName === rightName)
     return {
       status: "matched",
       method: "symbol",
-      left_name: left.dossier.procedure.name,
-      right_name: right.dossier.procedure.name,
+      left_name: leftName,
+      right_name: rightName,
     };
   return {
-    status:
-      left.dossier.procedure.name === right.dossier.procedure.name
-        ? "ambiguous"
-        : "mismatched",
+    status: stableNames ? "mismatched" : "ambiguous",
     method: "explicit",
-    left_name: left.dossier.procedure.name,
-    right_name: right.dossier.procedure.name,
+    left_name: leftName,
+    right_name: rightName,
   };
 };
 
@@ -75,22 +72,52 @@ export const normalizeCfg = (
   return graph;
 };
 
-export const referenceProjection = (snapshot: FunctionSnapshot) =>
-  sorted([
-    ...snapshot.dossier.incoming_references.map((item) => ({
-      direction: "in",
-      source: item.source_procedure?.name ?? null,
-      target: item.target_procedure?.name ?? null,
+type ReferenceEdge = FunctionSnapshot["dossier"]["outgoing_references"][number];
+
+/**
+ * A named endpoint survives relocation. An unnamed endpoint is identified
+ * only by its address, which names one location only within one artifact;
+ * across artifacts it stays unknown (null).
+ */
+const referenceEndpoint = (
+  procedure: ReferenceEdge["source_procedure"],
+  address: string,
+  sameArtifact: boolean,
+): string | { readonly address: string } | null =>
+  procedure !== null ? procedure.name : sameArtifact ? { address } : null;
+
+export const referenceProjection = (
+  snapshot: FunctionSnapshot,
+  sameArtifact: boolean,
+) =>
+  sorted(
+    [
+      ...snapshot.dossier.incoming_references.map((item) => ({
+        direction: "in",
+        item,
+      })),
+      ...snapshot.dossier.outgoing_references.map((item) => ({
+        direction: "out",
+        item,
+      })),
+    ].map(({ direction, item }) => ({
+      direction,
+      source: referenceEndpoint(
+        item.source_procedure,
+        item.source_address,
+        sameArtifact,
+      ),
+      target: referenceEndpoint(
+        item.target_procedure,
+        item.target_address,
+        sameArtifact,
+      ),
     })),
-    ...snapshot.dossier.outgoing_references.map((item) => ({
-      direction: "out",
-      source: item.source_procedure?.name ?? null,
-      target: item.target_procedure?.name ?? null,
-    })),
-  ]);
+  );
 
 export const referenceKindProjection = (
   snapshot: FunctionSnapshot,
+  sameArtifact: boolean,
 ): readonly unknown[] | null => {
   const edges = [
     ...snapshot.dossier.incoming_references.map((edge) => ({
@@ -111,8 +138,16 @@ export const referenceKindProjection = (
         );
       return {
         direction,
-        source: edge.source_procedure?.name ?? null,
-        target: edge.target_procedure?.name ?? null,
+        source: referenceEndpoint(
+          edge.source_procedure,
+          edge.source_address,
+          sameArtifact,
+        ),
+        target: referenceEndpoint(
+          edge.target_procedure,
+          edge.target_address,
+          sameArtifact,
+        ),
         type: edge.kind.type,
         flow: edge.kind.flow,
         call: edge.kind.call,
@@ -145,6 +180,7 @@ export const commentProjection = (
 
 export const stringAndNameProjection = (
   snapshot: FunctionSnapshot,
+  includeSwiftLiterals = true,
 ): readonly unknown[] | null => {
   const values = [
     ...snapshot.dossier.referenced_strings.map(
@@ -167,10 +203,88 @@ export const stringAndNameProjection = (
         value,
       }),
     ),
+    ...(includeSwiftLiterals
+      ? (snapshot.dossier.swift_string_literals ?? [])
+      : []
+    ).map(
+      ({
+        source_address: sourceAddress,
+        value,
+        representation,
+        registers,
+      }) => ({
+        kind: "swift_string",
+        source_offset: relativeAddress(
+          sourceAddress,
+          snapshot.dossier.procedure.address,
+        ),
+        value,
+        representation,
+        registers,
+      }),
+    ),
   ];
   return values.some(({ source_offset: offset }) => offset === null)
     ? null
     : sorted(values);
+};
+
+/**
+ * A retained literal proves presence, not that every path through its site was examined.
+ * A differing retained fact proves a change only when the opposite dossier is complete
+ * and therefore establishes its absence.
+ */
+export const swiftLiteralSitesConflict = (
+  left: FunctionSnapshot,
+  right: FunctionSnapshot,
+): boolean => {
+  const leftSites = swiftLiteralSites(left);
+  const rightSites = swiftLiteralSites(right);
+  for (const site of new Set([
+    ...leftSites.values.keys(),
+    ...rightSites.values.keys(),
+  ])) {
+    const leftValues =
+      leftSites.values.get(site) ?? (leftSites.complete ? [] : undefined);
+    const rightValues =
+      rightSites.values.get(site) ?? (rightSites.complete ? [] : undefined);
+    if (leftValues === undefined || rightValues === undefined) continue;
+    const leftFacts = new Set(leftValues);
+    const rightFacts = new Set(rightValues);
+    if (
+      (rightSites.complete &&
+        leftValues.some((value) => !rightFacts.has(value))) ||
+      (leftSites.complete && rightValues.some((value) => !leftFacts.has(value)))
+    )
+      return true;
+  }
+  return false;
+};
+
+const swiftLiteralSites = (snapshot: FunctionSnapshot) => {
+  const base = snapshot.dossier.procedure.address;
+  const omissions = snapshot.dossier.swift_string_literal_omissions ?? [];
+  const site = (sourceAddress: string, registers: readonly string[]) => {
+    const offset = relativeAddress(sourceAddress, base);
+    return offset === null ? null : canonicalJson([offset, registers]);
+  };
+  // Keep the same literal facts the full strings_names projection compares.
+  const values = new Map<string, string[]>();
+  for (const literal of snapshot.dossier.swift_string_literals ?? []) {
+    const key = site(literal.source_address, literal.registers);
+    if (key === null) continue;
+    values.set(
+      key,
+      [
+        ...(values.get(key) ?? []),
+        canonicalJson([literal.value, literal.representation]),
+      ].sort(compareUnicodeCodePoints),
+    );
+  }
+  const complete =
+    snapshot.dossier.swift_string_literals !== undefined &&
+    omissions.length === 0;
+  return { values, complete };
 };
 
 export const sorted = (values: readonly unknown[]): readonly unknown[] =>

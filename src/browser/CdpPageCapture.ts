@@ -17,8 +17,10 @@ import {
   captureFrames,
   captureResources,
   type CapturedResource,
+  type DomCapture,
   mainFrameUrl,
 } from "./CdpCaptureDocuments.js";
+import { capturedSvgNodeKind } from "./CdpCaptureDomSvg.js";
 import {
   allowedSanitizedUrl,
   delayWithCancellation,
@@ -52,7 +54,7 @@ interface CaptureState {
 interface CapturedSections {
   readonly attachedUrl: string;
   readonly frames: WebPageInspection["frames"];
-  readonly dom: ReturnType<typeof captureDom>;
+  readonly dom: DomCapture;
   readonly accessibility: ReturnType<typeof captureAccessibility>;
   readonly scripts: WebPageInspection["scripts"];
   readonly resources: WebPageInspection["resources"];
@@ -153,6 +155,12 @@ const captureAuthorizedPage = async (
   );
   if (!input.include_storage_keys)
     state.events.completeness.exclude("storage_keys", "not_approved", null);
+  else if (storageCapture.keysExclusion !== undefined)
+    state.events.completeness.exclude(
+      "storage_keys",
+      storageCapture.keysExclusion,
+      null,
+    );
   await report(context.progress, 3, "Normalizing browser evidence");
   const completedFrameResult = await authorizedMainFrame({
     connection: context.connection,
@@ -260,9 +268,7 @@ const authorizeObservationWindow = async (
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
 };
 
-const capturePageDom = async (
-  state: CaptureState,
-): Promise<ReturnType<typeof captureDom>> => {
+const capturePageDom = async (state: CaptureState): Promise<DomCapture> => {
   const { context, allowedOrigins } = state;
   const result = await context.connection.send(
     "DOMSnapshot.captureSnapshot",
@@ -274,12 +280,56 @@ const capturePageDom = async (
     context.sessionId,
     context.signal,
   );
-  return captureDom(
+  const capture = captureDom(
     result,
     allowedOrigins,
     context.input,
     state.events.completeness,
   );
+  let step = capture.next();
+  let descriptionUnavailable = false;
+  const pendingController = new AbortController();
+  const signal =
+    context.signal === undefined
+      ? pendingController.signal
+      : AbortSignal.any([context.signal, pendingController.signal]);
+  while (!step.done) {
+    const pending = step.value.map(async (query) => {
+      if (descriptionUnavailable) return undefined;
+      try {
+        return capturedSvgNodeKind(
+          query,
+          await context.connection.send(
+            "DOM.describeNode",
+            { backendNodeId: query.backendNodeId, depth: 0 },
+            context.sessionId,
+            signal,
+          ),
+        );
+      } catch (cause: unknown) {
+        // A detached node can disappear between snapshot and description.
+        // Preserve partial metadata, but propagate transport/cancellation errors.
+        if (!(cause instanceof CdpCommandRejection)) throw cause;
+        if (cause.code === -32_601) descriptionUnavailable = true;
+        else if (cause.code !== -32_000) throw cause;
+        return undefined;
+      }
+    });
+    try {
+      // Promise.all preserves snapshot order even when CDP replies out of order.
+      step = capture.next(await Promise.all(pending));
+    } catch (cause: unknown) {
+      // Stop and settle this bounded batch before the session can be detached.
+      pendingController.abort();
+      await Promise.allSettled(pending);
+      throw cause;
+    }
+  }
+  if (step.value.unresolvedSvgNodes > 0)
+    state.limitations.push(
+      `SVG identity was unavailable for ${String(step.value.unresolvedSvgNodes)} snapshotted XLink candidate nodes; their URL destinations remain unknown.`,
+    );
+  return step.value;
 };
 
 const normalizedInspection = (
@@ -364,6 +414,7 @@ const accessibilityForFrames = async (
   const capture = captureAccessibility(results, {
     includeText: context.input.include_accessibility_text,
     ...(results.length === 0 && unavailable ? { unavailable: true } : {}),
+    completeness: events.completeness,
   });
   if (!context.input.include_accessibility_text)
     events.completeness.exclude(
@@ -371,7 +422,8 @@ const accessibilityForFrames = async (
       "not_approved",
       capture.textCapture.excluded_fields,
     );
-  if (capture.treeIncomplete) events.completeness.truncate("accessibility");
+  if (capture.hasUnobservedChildren)
+    events.completeness.truncate("accessibility");
   return capture;
 };
 

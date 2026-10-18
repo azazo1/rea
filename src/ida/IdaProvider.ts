@@ -68,13 +68,17 @@ export class IdaProvider implements AnalysisProviderCandidate {
       if (!privacy.available)
         return {
           status: "unavailable",
-          code: "unsupported_host",
+          code: privacy.code,
           reason: privacy.reason,
           diagnostics: {
             configured: true,
             mode: "headless",
             live_connection_probed: false,
             private_workspace_available: false,
+            windows_native_failure: {
+              stage: privacy.failureStage,
+              remediation: privacy.remediation,
+            },
           },
         };
     }
@@ -107,13 +111,20 @@ export class IdaProvider implements AnalysisProviderCandidate {
     };
     if (
       target.kind === "executable" &&
-      isElfMetadataArchitecture(target.architecture)
+      (isElfMetadataArchitecture(target.architecture) ||
+        target.architecture === "hexagon")
     )
       return {
         status: "unsupported",
         code: "architecture_unsupported",
         reason: `REA's IDA adapter has no verified ${
-          target.architecture === "mips" ? "MIPS" : "RISC-V"
+          target.architecture === "mips"
+            ? "MIPS"
+            : target.architecture === "riscv"
+              ? "RISC-V"
+              : target.architecture === "powerpc"
+                ? "PowerPC"
+                : "Hexagon"
         } lane. Select a supported Ghidra profile instead.`,
         diagnostics,
       };
@@ -132,6 +143,21 @@ export class IdaProvider implements AnalysisProviderCandidate {
         reason:
           "IDA does not admit headerless raw binaries. Open the target with Ghidra and supply architecture and entry_point.",
         diagnostics,
+      };
+    // Attached identity is the recorded whole-input digest, which every slice
+    // of a universal file shares, so it cannot prove the GUI loaded the slice
+    // admission selected. Headless mode thins that slice into its own input.
+    const config = this.#configuration();
+    if (
+      target.format === "mach-o-universal" &&
+      config.ok &&
+      config.value.mode === "attached"
+    )
+      return {
+        status: "unsupported",
+        code: "target_format_unsupported",
+        reason: `Attached IDA records only the whole-file digest of a universal Mach-O, so REA cannot verify that the open database is its ${target.architecture} slice. Extract that slice with lipo -thin and open the thin file in both IDA and REA, or use headless mode.`,
+        diagnostics: { ...diagnostics, mode: "attached" },
       };
     return { status: "supported", code: null, reason: null, diagnostics };
   }

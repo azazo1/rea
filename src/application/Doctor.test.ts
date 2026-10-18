@@ -4,6 +4,8 @@ import { SUPPORTED_NODE_VERSION_PROSE } from "../domain/runtimeVersion.js";
 import type { ClientRegistrationStatus } from "./ClientRegistrationStatus.js";
 import { createDoctorHostFixture as host } from "./Doctor.fixture.js";
 import { runDoctor } from "./Doctor.js";
+import { err } from "../domain/result.js";
+import { HopperReleaseError } from "./HopperReleaseFeed.js";
 
 describe("doctor runtime check", () => {
   it("reports Node 25 as unsupported", async () => {
@@ -74,7 +76,7 @@ describe("doctor", () => {
       ),
     ).toEqual({
       node: `Install ${SUPPORTED_NODE_VERSION_PROSE}.`,
-      host: "REA supports macOS 12+, Ubuntu 24.04+, Fedora 41+, Nobara 44+, 64-bit Arch Linux, CachyOS, Omarchy, and the experimental Windows x64 Ghidra P0 boundary.",
+      host: "REA supports macOS 12+, Linux distributions with a recognized apt, dnf, or pacman package family, and the experimental Windows x64 Ghidra P0 boundary; automated Hopper setup additionally requires Ubuntu 24.04+, Fedora 41+, Nobara 44+, 64-bit Arch Linux, CachyOS, or Omarchy.",
       hopper: "Run rea setup to install Hopper, or set HOPPER_LAUNCHER_PATH.",
       target: "Supply a readable local app or program path.",
     });
@@ -330,7 +332,7 @@ describe("doctor scoped readiness", () => {
         client: "cursor",
         config_path: "/home/user/.cursor/mcp.json",
         command: ["/old/rea", "mcp"],
-        state: "stale",
+        state: "unknown",
         remediation: "Run rea setup to refresh this registration.",
       },
     ];
@@ -349,7 +351,11 @@ describe("doctor scoped readiness", () => {
       expect.objectContaining({ name: "registration:codex", ok: true }),
     );
     expect(scoped.informational_checks).toContainEqual(
-      expect.objectContaining({ name: "registration:cursor", ok: false }),
+      expect.objectContaining({
+        name: "registration:cursor",
+        ok: false,
+        classification: "unknown",
+      }),
     );
 
     const staleSelected = await runDoctor(
@@ -358,6 +364,38 @@ describe("doctor scoped readiness", () => {
       { clients: ["cursor"] },
     );
     expect(staleSelected.healthy).toBe(false);
+  });
+
+  it("keeps a caller-selected short timeout healthy and reports its advisory as informational", async () => {
+    const result = await runDoctor(
+      undefined,
+      host({
+        clientRegistrations: () =>
+          Promise.resolve([
+            {
+              client: "kimi",
+              config_path: "/home/user/.kimi-code/mcp.json",
+              command: ["/current/rea", "mcp"],
+              state: "aligned",
+              remediation: null,
+              advisory: "The configured toolTimeoutMs is shorter than startup.",
+            },
+          ]),
+      }),
+      { clients: ["kimi"] },
+    );
+
+    expect(result.healthy).toBe(true);
+    expect(result.scope_checks).toContainEqual(
+      expect.objectContaining({ name: "registration:kimi", ok: true }),
+    );
+    expect(result.informational_checks).toContainEqual(
+      expect.objectContaining({
+        name: "registration_timeout:kimi",
+        ok: true,
+        detail: "The configured toolTimeoutMs is shorter than startup.",
+      }),
+    );
   });
 });
 
@@ -418,10 +456,9 @@ describe("doctor scoped readiness", () => {
         platform: "linux",
         linuxDistribution: () =>
           Promise.resolve({
-            id: "debian",
-            versionId: "13",
-            packageFamily: "deb",
-            supported: false,
+            id: "nixos",
+            packageFamily: undefined,
+            hopperSetupSupported: false,
           }),
         clientRegistrations: () =>
           Promise.resolve([
@@ -448,6 +485,31 @@ describe("doctor scoped readiness", () => {
     ]);
     expect(result.informational_checks).toContainEqual(
       expect.objectContaining({ name: "host", ok: false }),
+    );
+  });
+
+  it("accepts a Debian-family host that has no tested Hopper package", async () => {
+    const result = await runDoctor(
+      undefined,
+      host({
+        platform: "linux",
+        macosVersion: () => Promise.resolve(undefined),
+        linuxDistribution: () =>
+          Promise.resolve({
+            id: "kali",
+            versionId: "2026.3",
+            packageFamily: "deb",
+            hopperSetupSupported: false,
+          }),
+      }),
+    );
+
+    expect(result.checks).toContainEqual(
+      expect.objectContaining({
+        name: "host",
+        ok: true,
+        detail: "kali 2026.3",
+      }),
     );
   });
 
@@ -502,7 +564,7 @@ describe("doctor Linux and Hopper discovery", () => {
             id: "ubuntu",
             versionId: "24.04",
             packageFamily: "deb",
-            supported: true,
+            hopperSetupSupported: true,
           }),
         configuredHopperPath: path,
         executable: (candidate) => Promise.resolve(candidate === path),
@@ -522,7 +584,7 @@ describe("doctor Linux and Hopper discovery", () => {
             id: "ubuntu",
             versionId: "24.04",
             packageFamily: "deb",
-            supported: true,
+            hopperSetupSupported: true,
           }),
         linuxDemoRuntimeCheck: () =>
           Promise.resolve({
@@ -554,16 +616,49 @@ describe("doctor Linux and Hopper discovery", () => {
             id: "ubuntu",
             versionId: "24.04",
             packageFamily: "deb",
-            supported: true,
+            hopperSetupSupported: true,
           }),
         executable: (candidate) => Promise.resolve(candidate === path),
-        supportedLinuxHopper: () => Promise.resolve(false),
+        inspectLinuxHopper: () =>
+          Promise.resolve(
+            err(
+              new HopperReleaseError(
+                "unsupported_hopper_build",
+                "Unverified fixture build",
+              ),
+            ),
+          ),
       }),
     );
     expect(
       result.checks.find(({ name }) => name === "hopper-version")?.remediation,
-    ).toContain("Unset or update HOPPER_LAUNCHER_PATH");
+    ).toContain("Check HOPPER_LAUNCHER_PATH");
   });
+});
+
+describe("doctor installed Hopper discovery", () => {
+  it("checks the canonical user install after the system launcher", async () => {
+    const userPath =
+      "/fixture/home/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+    const checked: string[] = [];
+    const result = await runDoctor(
+      undefined,
+      host({
+        homeDirectory: "/fixture/home",
+        executable: (candidate) => {
+          checked.push(candidate);
+          return Promise.resolve(candidate === userPath);
+        },
+      }),
+    );
+
+    expect(result.hopperPath).toBe(userPath);
+    expect(checked.slice(0, 2)).toEqual([
+      "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper",
+      userPath,
+    ]);
+  });
+
   it("detects a Homebrew cask installed outside /Applications", async () => {
     const path =
       "/opt/homebrew/Caskroom/hopper/Hopper Disassembler.app/Contents/MacOS/hopper";
@@ -588,7 +683,9 @@ describe("doctor Linux and Hopper discovery", () => {
     );
     expect(result.hopperPath).toBe(path);
   });
+});
 
+describe("doctor target admission on Linux", () => {
   it("uses shared app target validation when a target is supplied", async () => {
     const result = await runDoctor(
       "/Applications/Notes.app",
@@ -626,6 +723,30 @@ describe("doctor Linux and Hopper discovery", () => {
       }),
     );
   });
+});
+
+describe("doctor standard Linux Hopper paths", () => {
+  it.each(["/opt/hopper-v4/bin/hopper", "/usr/bin/hopper"])(
+    "detects Hopper at the standard path %s",
+    async (path) => {
+      const result = await runDoctor(
+        undefined,
+        host({
+          platform: "linux",
+          macosVersion: () => Promise.resolve(undefined),
+          linuxDistribution: () =>
+            Promise.resolve({
+              id: "ubuntu",
+              versionId: "24.04",
+              packageFamily: "deb",
+              hopperSetupSupported: true,
+            }),
+          executable: (candidate) => Promise.resolve(candidate === path),
+        }),
+      );
+      expect(result.hopperPath).toBe(path);
+    },
+  );
 });
 
 describe("doctor target admission diagnostics", () => {

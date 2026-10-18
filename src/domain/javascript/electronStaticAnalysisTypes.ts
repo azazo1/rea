@@ -38,6 +38,8 @@ export type ElectronBrowserWindowFinding = ElectronBrowserWindowPreload & {
   readonly options_status: "object-literal" | "dynamic" | "missing";
   readonly web_preferences_status: "object-literal" | "dynamic" | "missing";
   readonly web_preferences: readonly ElectronWebPreference[];
+  /** Object syntax supporting constant substitution, separate from construction. */
+  readonly resolution_sources?: readonly JavaScriptSourceRange[];
   readonly module_key: string | null;
   /** Recovered factory runtime; absent in older or unbundled findings. */
   readonly module_runtime?: string;
@@ -219,6 +221,8 @@ export interface ElectronCallPathStep {
 export interface ElectronCallPath {
   readonly entry_kind: "bridge-member" | "ipc-handler";
   readonly entry: string;
+  /** Exact bridge API and property segments; `entry` remains display text. */
+  readonly entry_path?: readonly string[];
   readonly channel: string | null;
   readonly terminal: string;
   readonly resolution: "candidate";

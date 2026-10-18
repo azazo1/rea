@@ -22,6 +22,10 @@ interface ServerContext {
   readonly loadOptionalProviders: () => Promise<OptionalProviderLoadResult>;
 }
 
+type ClosableOptionalProvider = {
+  readonly close?: () => Promise<void>;
+};
+
 export const startMcpTransport = async (
   dependencies: RuntimeDependencies,
   session: BinarySession,
@@ -76,8 +80,33 @@ export const startMcpTransport = async (
   };
   // Optional providers are shared by every server instance the SDK creates,
   // including a discarded discovery probe, so only process shutdown closes them.
+  const optionalProvidersToClose = new Set<ClosableOptionalProvider>(
+    [
+      optionalProviders.browserObservation,
+      optionalProviders.browserScenarioCapture,
+      optionalProviders.electronObservation,
+      optionalProviders.electronActiveObservation,
+    ].filter((provider) => provider !== undefined),
+  );
+  let optionalProviderClose: Promise<void> | undefined;
   const closeOptionalProviders = async (): Promise<void> => {
-    await optionalProviders.browserScenarioCapture?.close?.();
+    optionalProviderClose ??= (async () => {
+      const results = await Promise.allSettled(
+        [...optionalProvidersToClose].map(async (provider) => {
+          await provider.close?.();
+          optionalProvidersToClose.delete(provider);
+        }),
+      );
+      const failures = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (failures.length > 0)
+        throw new AggregateError(failures, "Optional provider cleanup failed");
+    })().catch((cause: unknown) => {
+      optionalProviderClose = undefined;
+      throw cause;
+    });
+    await optionalProviderClose;
   };
   let handle: StdioServerHandle;
   try {
@@ -95,6 +124,7 @@ export const startMcpTransport = async (
             environment: serverContext.environment,
             delivery: serverContext.delivery,
             ...optionalProviders,
+            optionalObservationProviderOwner: "caller",
             androidAnalysis: android,
           },
         );
@@ -115,12 +145,17 @@ export const startMcpTransport = async (
       },
     );
   } catch (cause: unknown) {
-    const [binaryCleanup, androidCleanup, serverCleanup] =
-      await Promise.allSettled([
-        session.close(),
-        closeAndroid(),
-        closeServers(),
-      ]);
+    const [
+      binaryCleanup,
+      androidCleanup,
+      serverCleanup,
+      optionalProviderCleanup,
+    ] = await Promise.allSettled([
+      session.close(),
+      closeAndroid(),
+      closeServers(),
+      closeOptionalProviders(),
+    ]);
     serverLogger.error(
       {
         error: cause instanceof Error ? cause.message : String(cause),
@@ -136,7 +171,12 @@ export const startMcpTransport = async (
       );
       dependencies.writeStderr(`${cleanupError.message}\n`);
     }
-    for (const cleanup of [binaryCleanup, androidCleanup, serverCleanup]) {
+    for (const cleanup of [
+      binaryCleanup,
+      androidCleanup,
+      serverCleanup,
+      optionalProviderCleanup,
+    ]) {
       if (cleanup.status === "rejected") {
         const reason =
           cleanup.reason instanceof Error
